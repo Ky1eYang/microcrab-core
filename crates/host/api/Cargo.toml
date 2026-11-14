@@ -1,0 +1,20 @@
+[package]
+name = "microcrab-host-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+microcrab-agent-types.workspace = true
+microcrab-protocol.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tokio-util.workspace = true
+tokio = { workspace = true, features = ["sync"] }
+bytes = "1"
+futures-util.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

@@ -1,0 +1,20 @@
+[package]
+name = "microcrab-agent-universal"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[package.metadata.microcrab]
+component-name = "universal"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+microcrab-agent-types.workspace = true
+microcrab-protocol.workspace = true
+serde_json.workspace = true
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wit-bindgen = "0.57.1"

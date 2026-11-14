@@ -1,0 +1,56 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/session",
+    "crates/storage",
+    "crates/creator",
+    "crates/xtask",
+    "crates/shared/protocol",
+    "crates/shared/permission",
+    "crates/auditor",
+    "crates/transport",
+    "crates/host/api",
+    "crates/host/local",
+    "crates/host/protocol",
+    "crates/host/remote",
+    "crates/host/frontend",
+    "crates/agent/wit",
+    "crates/agent/types",
+    "crates/agent/universal",
+    "crates/agent/coding",
+]
+
+[workspace.package]
+version = "0.1.16"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/Ky1eYang/microcrab-core"
+
+[workspace.dependencies]
+async-trait = "0.1"
+base64 = "0.22"
+tracing = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+pulldown-cmark = { version = "0.13", default-features = false }
+serde_yaml_ng = "0.10"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "io-util", "net"] }
+tokio-util = "0.7"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream"] }
+futures-util = "0.3"
+uuid = { version = "1", features = ["v4", "serde"] }
+jsonschema = { version = "0.33", default-features = false }
+libc = "0.2"
+windows-sys = "0.61"
+wasmtime = { version = "47.0.3", default-features = false, features = ["std", "runtime", "cranelift", "component-model"] }
+microcrab-protocol = { path = "crates/shared/protocol" }
+microcrab-permission = { path = "crates/shared/permission" }
+microcrab-auditor = { path = "crates/auditor" }
+microcrab-transport = { path = "crates/transport" }
+microcrab-host-api = { path = "crates/host/api" }
+microcrab-host-local = { path = "crates/host/local" }
+microcrab-agent-wit = { path = "crates/agent/wit" }
+
+microcrab-agent-types = { path = "crates/agent/types" }
+tera = { version = "2.4.0", default-features = false, features = ["preserve_order"] }

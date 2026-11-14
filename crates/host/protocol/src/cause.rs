@@ -1,0 +1,223 @@
+//! Closed, versioned diagnostic facts. No arbitrary wire text is promoted.
+use serde::{Deserialize, Serialize};
+macro_rules! causes {
+    ($($name:ident => $reason:literal,)+) => {
+        #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+        #[serde(rename_all = "snake_case")]
+        pub enum HostCause { $($name,)+ }
+        impl HostCause {
+            pub fn public_reason(self) -> &'static str { match self { $(Self::$name => $reason,)+ } }
+            /// Called only on already marked local metadata, never a wire message.
+            pub fn from_public_reason(reason: &str) -> Option<Self> { match reason { $($reason => Some(Self::$name),)+ _ => None } }
+        }
+    }
+}
+causes! {
+    FileMutationUnsupported => "host capability is unsupported: file_mutation",
+    MutationListBounds => "mutation list must contain 1..=128 operations",
+    MutationSourceNotUtf8 => "mutation source is not complete UTF-8 text",
+    MutationPathNotFile => "mutation path must name an ordinary file",
+    MutationParentMissing => "mutation parent directory is missing; create it explicitly before applying the patch",
+    MutationParentNotDirectory => "mutation parent must be an existing directory",
+    MutationPathsOverlap => "mutation paths alias, overlap, or form a move cycle",
+    MutationWorkerFailed => "Host mutation worker failed",
+    BridgeReadOnly => "read-only bridge: filesystem writes and cache-point creation are disabled",
+    BridgeShellDisabled => "bridge startup policy disables shell launch",
+    BridgeProcessDisabled => "bridge startup policy disables process spawn",
+    AdmissionCancelled => "Host admission cancelled",
+    AdmissionTimeout => "Host admission deadline exceeded",
+    ReceiptStoreUnavailable => "cannot persist durable receipt",
+    ReceiptCapacity => "durable receipt capacity reached",
+    UnreconciledMutation => "unresolved durable mutation fences new effects",
+    TargetProtected => "target path is protected by Host private-directory policy",
+    TargetSymlink => "target path contains a disallowed symlink or reparse point",
+    RootNotDirectory => "workspace root is not a directory",
+    RootSymlink => "workspace root is a disallowed symlink or reparse point",
+    RootNotCanonical => "workspace root is not canonical",
+    HostFileAdmissionClosed => "Host file admission closed",
+    HostFileWorkerFailed => "Host file worker failed",
+    HostKillOwnerStopped => "Host kill owner stopped",
+    HostOperationConflictsWithCurrentOwnerState => "Host operation conflicts with current owner state",
+    HostOperationContextDeadlineExceeded => "Host operation context deadline exceeded",
+    HostOwnerUnavailable => "Host owner unavailable",
+    HostPathIsNotUTF8 => "Host path is not UTF-8",
+    HostPipeChunkExceedsBound => "Host pipe chunk exceeds bound",
+    HostProcessPIDChanged => "Host process PID changed",
+    HostProcessAdmissionClosed => "Host process admission closed",
+    HostProcessExecutionWorkerFailed => "Host process execution worker failed",
+    HostProcessSupervisorReportedFailure => "Host process supervisor reported failure",
+    HostProcessWatchClosed => "Host process watch closed",
+    HostReleaseOwnerStopped => "Host release owner stopped",
+    BashMustBeInstalledInAnAbsolutePATHDirectory => "bash must be installed in an absolute PATH directory",
+    CachePointByteBudgetIsOutOfBounds => "cache point byte budget is out of bounds",
+    CachePointRequiresAFilePath => "cache point requires a file path",
+    CachePoint => "cache_point",
+    CannotDetermineHostPathSeparatorAndNewlineForThisOSFamily => "cannot determine Host path separator and newline for this OS family",
+    CannotReplaceWorkspaceRoot => "cannot replace workspace root",
+    ClosedFileHandle => "closed file handle",
+    ColumnIsBeyondCapturedOutput => "column is beyond captured output",
+    ColumnMustBeAUTF8ByteBoundaryWithinTheLine => "column must be a UTF-8 byte boundary within the line",
+    CwdMustBeADirectory => "cwd must be a directory",
+    DestinationAdmissionChanged => "destination admission changed",
+    DestinationHasNoParent => "destination has no parent",
+    DestinationIsReadOnly => "destination is read-only",
+    DirectoryNamesMustBeUnicode => "directory names must be Unicode",
+    DirectoryResultLimitExceeded => "directory result limit exceeded",
+    DirectoryScanEntryLimitExceeded => "directory scan entry limit exceeded",
+    ExpectedProcessAdmission => "expected process admission",
+    ExpectedVersionMustBeALowercaseSHA256Digest => "expected version must be a lowercase SHA-256 digest",
+    FileAdmissionLockPoisoned => "file admission lock poisoned",
+    FileByteBudgetMustBePositive => "file byte budget must be positive",
+    FileByteLimitExceeded => "file byte limit exceeded",
+    FileChangedSinceTheExpectedVersion => "file changed since the expected version",
+    FileCloseWorkerFailed => "file close worker failed",
+    FileHandleBelongsToAnotherPrincipal => "file handle belongs to another principal",
+    FilePathIsOutsideTheConfiguredRoot => "file path is outside the configured root",
+    FileReadRangeExceedsBackendLimit => "file read range exceeds backend limit",
+    FileResourceLockPoisoned => "file resource lock poisoned",
+    FilesystemAdmissionClosed => "filesystem admission closed",
+    FilesystemWorkerFailed => "filesystem worker failed",
+    Glob => "glob",
+    GlobPatternMustBeNonemptyAndAtMost1024Bytes => "glob pattern must be nonempty and at most 1024 bytes",
+    GlobResultBudgetMustBeBetween1And4096 => "glob result budget must be between 1 and 4096",
+    Grep => "grep",
+    GrepRequiresBoundedPositivePatternMatchAndByteBudgets => "grep requires bounded positive pattern, match and byte budgets",
+    HostDeadlineExceeded => "host deadline exceeded",
+    HostLimitsMustBePositiveConcurrency1024 => "host limits must be positive; concurrency <= 1024",
+    HostOperationCancelled => "host operation cancelled",
+    HostOperationIsUnsupported => "host operation is unsupported",
+    HostOutputByteLimitExceeded => "host output byte limit exceeded",
+    HostRootMustBeADirectory => "host root must be a directory",
+    IgnoreRulesMustBeUTF8 => "ignore rules must be UTF-8",
+    Info => "info",
+    InvalidHostStatKind => "invalid Host stat kind",
+    InvalidHostStatSize => "invalid Host stat size",
+    InvalidAtomicWriteProgress => "invalid atomic_write progress",
+    InvalidGlobPattern => "invalid glob pattern",
+    InvalidIgnoreRule => "invalid ignore rule",
+    InvalidIgnoreRules => "invalid ignore rules",
+    InvalidOrOversizedRegularExpression => "invalid or oversized regular expression",
+    LineMustBeAtLeast1 => "line must be at least 1",
+    NormalizeResource => "normalize_resource",
+    OutputBytesMustBePositiveAndWithinTheHostCaptureBudget => "output_bytes must be positive and within the Host capture budget",
+    PathMustBeUnicode => "path must be Unicode",
+    PositionIsBeyondCapturedOutput => "position is beyond captured output",
+    PrimitiveFileHandleLimitExceeded => "primitive file handle limit exceeded",
+    PrimitiveFileTableLockPoisoned => "primitive file table lock poisoned",
+    PrimitiveResourceIDsExhausted => "primitive resource IDs exhausted",
+    PrivatePathMustBeAnOrdinaryFileOrDirectory => "private path must be an ordinary file or directory",
+    PrivatePathPolicyLockPoisoned => "private path policy lock poisoned",
+    ProcessHandleIdsExhausted => "process handle ids exhausted",
+    ProcessHasNoShellCapture => "process has no shell capture",
+    ProcessIsTerminal => "process is terminal",
+    ProcessNotificationClosed => "process notification closed",
+    ProcessOutputByteLimitExceeded => "process output byte limit exceeded",
+    ProcessPipeAlreadyTaken => "process pipe already taken",
+    ProcessProgramMustBeNonemptyAndArgumentsMustNotContainNUL => "process program must be nonempty and arguments must not contain NUL",
+    ProcessStderrPipeMissing => "process stderr pipe missing",
+    ProcessStdinIsClosed => "process stdin is closed",
+    ProcessStdinPipeMissing => "process stdin pipe missing",
+    ProcessStdoutPipeMissing => "process stdout pipe missing",
+    ProcessShellSpec => "process.shell-spec",
+    ProcessSpawn => "process.spawn",
+    PwshExeMustBeInstalledInAnAbsolutePATHDirectory => "pwsh.exe must be installed in an absolute PATH directory",
+    Read => "read",
+    ReadRequiresAOneBasedOffsetAndBoundedPositiveLineByteBudgets => "read requires a one-based offset and bounded positive line/byte budgets",
+    ReadFile => "read_file",
+    RequestedFilePageIsNotUTF8Text => "requested file page is not UTF-8 text",
+    RetainedShellOutputExceedsDrainByteBudget => "retained shell output exceeds drain byte budget",
+    SearchRootMustBeAnOrdinaryDirectoryOrFile => "search root must be an ordinary directory or file",
+    ShellCommandMustBeNonemptyBoundedAndWithoutNUL => "shell command must be nonempty, bounded, and without NUL",
+    ShellDrainByteBudgetExceedsRelayLimit => "shell drain byte budget exceeds relay limit",
+    ShellStdinWriteExceedsHostByteBudget => "shell stdin write exceeds Host byte budget",
+    ShellWorkingDirectoryIsOutsideTheConfiguredRoot => "shell working directory is outside the configured root",
+    SpawnedProcessHasNoPid => "spawned process has no pid",
+    StderrIsAlreadyTakenOrOwnedByShellCapture => "stderr is already taken or owned by shell capture",
+    StdoutIsAlreadyTakenOrOwnedByShellCapture => "stdout is already taken or owned by shell capture",
+    UnknownHostProcess => "unknown Host process",
+    UnknownOrClosedFileHandle => "unknown or closed file handle",
+    UnknownProcessHandle => "unknown process handle",
+    UnsupportedFilePath => "unsupported file path",
+    WorkspaceEntryIsNotAnOrdinaryFile => "workspace entry is not an ordinary file",
+    WorkspaceHardLinksAreUnsupported => "workspace hard links are unsupported",
+    Write => "write",
+    UnsupportedCachePoint => "host capability is unsupported: cache_point",
+    UnsupportedFilesystemClose => "host capability is unsupported: filesystem.close",
+    UnsupportedFilesystemCreateTemp => "host capability is unsupported: filesystem.create_temp",
+    UnsupportedFilesystemFsync => "host capability is unsupported: filesystem.fsync",
+    UnsupportedFilesystemList => "host capability is unsupported: filesystem.list",
+    UnsupportedFilesystemListRecursive => "host capability is unsupported: filesystem.list.recursive",
+    UnsupportedFilesystemMkdir => "host capability is unsupported: filesystem.mkdir",
+    UnsupportedFilesystemOpen => "host capability is unsupported: filesystem.open",
+    UnsupportedFilesystemOpenMutable => "host capability is unsupported: filesystem.open.mutable",
+    UnsupportedFilesystemRead => "host capability is unsupported: filesystem.read",
+    UnsupportedFilesystemRemove => "host capability is unsupported: filesystem.remove",
+    UnsupportedFilesystemRename => "host capability is unsupported: filesystem.rename",
+    UnsupportedFilesystemSpecialFile => "host capability is unsupported: filesystem.special-file",
+    UnsupportedFilesystemStat => "host capability is unsupported: filesystem.stat",
+    UnsupportedFilesystemWrite => "host capability is unsupported: filesystem.write",
+    UnsupportedGlob => "host capability is unsupported: glob",
+    UnsupportedGrep => "host capability is unsupported: grep",
+    UnsupportedInfo => "host capability is unsupported: info",
+    UnsupportedNetAccept => "host capability is unsupported: net.accept",
+    UnsupportedNetCloseListener => "host capability is unsupported: net.close_listener",
+    UnsupportedNetCloseSocket => "host capability is unsupported: net.close_socket",
+    UnsupportedNetConnectTcp => "host capability is unsupported: net.connect_tcp",
+    UnsupportedNetListenTcp => "host capability is unsupported: net.listen_tcp",
+    UnsupportedNetRead => "host capability is unsupported: net.read",
+    UnsupportedNetResolve => "host capability is unsupported: net.resolve",
+    UnsupportedNetWrite => "host capability is unsupported: net.write",
+    UnsupportedNormalizeResource => "host capability is unsupported: normalize_resource",
+    UnsupportedProcessCloseStdin => "host capability is unsupported: process.close_stdin",
+    UnsupportedProcessExec => "host capability is unsupported: process.exec",
+    UnsupportedProcessKillTree => "host capability is unsupported: process.kill_tree",
+    UnsupportedProcessPid => "host capability is unsupported: process.pid",
+    UnsupportedProcessPty => "host capability is unsupported: process.pty",
+    UnsupportedProcessRelease => "host capability is unsupported: process.release",
+    UnsupportedProcessResizePty => "host capability is unsupported: process.resize_pty",
+    UnsupportedProcessShellSpec => "host capability is unsupported: process.shell-spec",
+    UnsupportedProcessSignal => "host capability is unsupported: process.signal",
+    UnsupportedProcessSpawn => "host capability is unsupported: process.spawn",
+    UnsupportedProcessStatus => "host capability is unsupported: process.status",
+    UnsupportedProcessStderr => "host capability is unsupported: process.stderr",
+    UnsupportedProcessStdout => "host capability is unsupported: process.stdout",
+    UnsupportedProcessWait => "host capability is unsupported: process.wait",
+    UnsupportedProcessWatch => "host capability is unsupported: process.watch",
+    UnsupportedProcessWriteStdin => "host capability is unsupported: process.write_stdin",
+    UnsupportedRead => "host capability is unsupported: read",
+    UnsupportedReadFile => "host capability is unsupported: read_file",
+    UnsupportedShellCaptureStatus => "host capability is unsupported: shell.capture-status",
+    UnsupportedShellDrain => "host capability is unsupported: shell.drain",
+    UnsupportedShellLaunch => "host capability is unsupported: shell.launch",
+    UnsupportedShellRead => "host capability is unsupported: shell.read",
+    UnsupportedShellWrite => "host capability is unsupported: shell.write",
+    UnsupportedWrite => "host capability is unsupported: write",
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{ErrorCode, WireError};
+    #[test]
+    fn absent_causes_keep_legacy_bytes_and_known_causes_roundtrip() {
+        let legacy = r#"{"code":"denied","message":"private-host-secret"}"#;
+        let wire: WireError = serde_json::from_str(legacy).unwrap();
+        assert_eq!(wire.cause, None);
+        assert_eq!(serde_json::to_string(&wire).unwrap(), legacy);
+        let wire = WireError::new(ErrorCode::Denied, "private-host-secret")
+            .with_cause(Some(HostCause::FilePathIsOutsideTheConfiguredRoot));
+        let decoded: WireError =
+            serde_json::from_str(&serde_json::to_string(&wire).unwrap()).unwrap();
+        assert_eq!(
+            decoded.cause.unwrap().public_reason(),
+            "file path is outside the configured root"
+        );
+        assert!(
+            serde_json::from_str::<WireError>(
+                r#"{"code":"denied","message":"body","cause":"private-host-secret"}"#
+            )
+            .is_err()
+        );
+        assert_eq!(HostCause::from_public_reason("private-host-secret"), None);
+    }
+}

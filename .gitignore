@@ -1,0 +1,16 @@
+# Build outputs and local runtime state
+/target/
+/.microcrab/
+/logs/
+*.log
+
+# Private configuration
+/config.toml
+/config.json
+/config.jsonc
+.env
+.env.*
+!.env.example
+
+# Local extraction metadata
+/split-project.json

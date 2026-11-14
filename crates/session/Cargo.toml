@@ -1,0 +1,61 @@
+[package]
+name = "microcrab-session"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+# Existing case files are modules of the explicit suites below, not separate binaries.
+autotests = false
+
+[[test]]
+name = "session_core"
+path = "tests/session_core.rs"
+
+[[test]]
+name = "session_context"
+path = "tests/session_context.rs"
+
+[[test]]
+name = "session_execution"
+path = "tests/session_execution.rs"
+
+[[test]]
+name = "session_wasm"
+path = "tests/session_wasm.rs"
+
+[features]
+default = ["wasm"]
+wasm = ["dep:wasmtime", "dep:microcrab-agent-wit"]
+
+[dependencies]
+microcrab-protocol.workspace = true
+microcrab-permission.workspace = true
+microcrab-auditor.workspace = true
+microcrab-transport.workspace = true
+microcrab-agent-types.workspace = true
+tera.workspace = true
+microcrab-host-api.workspace = true
+async-trait.workspace = true
+tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+pulldown-cmark.workspace = true
+serde_yaml_ng.workspace = true
+sha2 = "0.10"
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+reqwest.workspace = true
+futures-util.workspace = true
+base64.workspace = true
+jsonschema.workspace = true
+wasmtime = { workspace = true, optional = true }
+microcrab-agent-wit = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+async-trait.workspace = true
+microcrab-host-local.workspace = true
+tempfile = "3"
+wat = "1"

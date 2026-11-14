@@ -1,0 +1,37 @@
+[package]
+name = "microcrab-transport"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+microcrab-protocol.workspace = true
+microcrab-auditor.workspace = true
+base64.workspace = true
+futures-util.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2 = "0.10.9"
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+reqwest = { workspace = true, features = ["native-tls"] }
+
+[target.'cfg(not(windows))'.dependencies]
+reqwest = { workspace = true, features = ["rustls-tls"] }
+
+[target.'cfg(windows)'.dev-dependencies]
+native-tls = { version = "0.2", default-features = false }
+tokio-native-tls = "0.3"
+windows-sys = { workspace = true, features = ["Wdk_System_SystemServices", "Win32_System_SystemInformation", "Win32_Foundation"] }
+
+[target.'cfg(not(windows))'.dev-dependencies]
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }

@@ -1,0 +1,35 @@
+[package]
+name = "microcrab-creator"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = ["storage-file"]
+storage-file = ["microcrab-storage/storage-file"]
+storage-sqlite = ["microcrab-storage/storage-sqlite"]
+
+[dependencies]
+async-trait.workspace = true
+futures-util.workspace = true
+serde.workspace = true
+serde_json = { workspace = true, features = ["preserve_order"] }
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+microcrab-session = { path = "../session" }
+microcrab-storage = { path = "../storage", default-features = false }
+microcrab-protocol.workspace = true
+microcrab-permission.workspace = true
+microcrab-host-api.workspace = true
+microcrab-agent-types.workspace = true
+microcrab-auditor.workspace = true
+microcrab-transport.workspace = true
+sha2 = "0.10.9"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+microcrab-host-local.workspace = true
+tempfile = "3"

@@ -1,0 +1,16 @@
+[package]
+name = "microcrab-host-frontend"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[package.metadata.microcrab]
+artifact-kind = "frontend-host"
+wasmsh-version = "0.5.1"
+
+[lib]
+path = "src/lib.rs"
+# Resource-only facade: runtime contracts execute in the actual-source JS/browser gates.
+test = false
+doctest = false

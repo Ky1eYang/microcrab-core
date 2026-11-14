@@ -1,0 +1,87 @@
+# Copy selected provider settings into an ignored config.toml.
+# Keep actual credentials out of tracked files.
+# Startup first queries each gateway's model-list endpoint, then appends configured
+# models (including options.model). Explicit configured metadata overrides matching
+# discovered fields; omitted metadata keeps the discovered value.
+# Discovery failure is logged as a warning and does not prevent startup. A provider
+# with no discovered or configured models has an empty list and cannot be selected
+# for a model request until a real model is available. No fallback model is invented.
+# Route overrides match exact provider-local model IDs (id resolves an alias).
+# Model names, discovery metadata and public catalogs never infer protocols; no
+# wildcard matching or protocol probing is performed. All actual model routes are
+# validated at startup. Only openai-compatible supports reasoning-effort variants.
+# options.auth defaults to "native": Chat/Responses use Bearer, Messages uses
+# x-api-key plus anthropic-version, Google uses x-goog-api-key. Set "bearer" for
+# gateways requiring Bearer on any wire protocol; Messages keeps its version header.
+# A model inherits its provider's auth and credentials, including when its explicit
+# endpoint changes host. Model endpoints do not select another provider's secrets.
+# Discovery always uses provider defaults and never probes model endpoints.
+
+# 1. OpenAI Compatible Protocol (e.g. /v1/chat/completions, Grok, DeepSeek, Ollama, vLLM)
+[provider.example_provider_1]
+protocol = "openai-compatible"
+
+[provider.example_provider_1.options]
+baseURL = "https://example.com/v1"
+model = "gpt-4o-mini"
+apiKey = "replace-with-your-private-provider-key"
+timeoutMs = 30000
+
+# A baseURL preserves its configured version and gateway path. Recognized Chat,
+# Responses and Messages suffixes are replaced when selecting another protocol;
+# they are never blindly appended to each other. A fixed options.endpoint requires
+# an explicit model endpoint for a different protocol. Switching to/from Google
+# requires an explicit model endpoint because /v1 and /v1beta are not interchangeable.
+[provider.example_provider_1.models.messages_alias]
+id = "messages-model"
+protocol = "anthropic"
+auth = "bearer"
+
+[provider.example_provider_1.models.responses_alias]
+id = "responses-model"
+protocol = "openai"
+
+[provider.example_provider_1.models.google_alias]
+id = "gemini-model"
+protocol = "google"
+endpoint = "https://example.com/v1beta"
+auth = "bearer"
+
+# Same-protocol explicit endpoints are allowed as well.
+[provider.example_provider_1.models.chat_alias]
+id = "chat-model"
+endpoint = "https://example.com/custom/chat"
+variants = ["low", "high"]
+
+# 2. OpenAI Responses API Protocol (/v1/responses)
+# Supported protocol aliases: "openai", "openai-response", "openai-responses"
+[provider.example_provider_2]
+protocol = "openai"
+
+[provider.example_provider_2.options]
+baseURL = "https://example.com/v1"
+model = "gpt-4.5-preview"
+apiKey = "replace-with-your-private-provider-key"
+timeoutMs = 30000
+
+# 3. Anthropic Messages API Protocol (/v1/messages)
+# Supported protocol aliases: "anthropic", "claude"
+[provider.example_provider_3]
+protocol = "anthropic"
+
+[provider.example_provider_3.options]
+baseURL = "https://example.com/v1"
+model = "claude-3-7-sonnet"
+apiKey = "replace-with-your-private-provider-key"
+timeoutMs = 30000
+
+# 4. Google Gemini REST API Protocol (:generateContent / :streamGenerateContent)
+# Supported protocol aliases: "google", "gemini"
+[provider.example_provider_4]
+protocol = "google"
+
+[provider.example_provider_4.options]
+baseURL = "https://example.com/v1beta"
+model = "gemini-2.5-flash"
+apiKey = "replace-with-your-private-provider-key"
+timeoutMs = 30000

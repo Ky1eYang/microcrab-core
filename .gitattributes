@@ -1,0 +1,5 @@
+# Preserve existing CRLF source lines while checking actual whitespace errors.
+* whitespace=blank-at-eol,blank-at-eof,space-before-tab,cr-at-eol
+
+# Keep embedded prompt source bytes identical across native checkouts.
+/crates/session/templates/**/*.tmpl text eol=lf

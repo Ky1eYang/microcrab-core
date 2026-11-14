@@ -1,0 +1,128 @@
+syntax = "proto3";
+
+package microcrab.host.v1;
+
+// One native frame for the WebSocket relay and the gRPC direct carrier.
+// Routing fields and chunk bytes are protobuf. Method, descriptor, receipt,
+// diagnostic and success bodies keep their existing serde JSON encoding.
+service HostBridge {
+  rpc Control(stream HostFrame) returns (stream HostFrame);
+  rpc Execute(HostFrame) returns (stream HostFrame);
+}
+
+message HostFrame {
+  oneof body {
+    Pair pair = 1;
+    Resume resume = 2;
+    WorkspaceBound workspace_bound = 3;
+    Hello hello = 4;
+    Request request = 5;
+    Response response = 6;
+    Cancel cancel = 7;
+    Status status = 8;
+    Receipt receipt = 9;
+    Diagnostic diagnostic = 10;
+    ProcessChanged process_changed = 11;
+    Ping ping = 12;
+    Pong pong = 13;
+    TransferChunk transfer_chunk = 14;
+    Detach detach = 15;
+  }
+}
+
+message Pair {
+  string token = 1;
+  bytes scope_json = 2;
+  optional string directory = 3;
+  optional string expected_host_id = 4;
+  optional string expected_workspace_id = 5;
+}
+
+message Resume {
+  string credential = 1;
+  bytes scope_json = 2;
+  optional string directory = 3;
+  optional string expected_host_id = 4;
+  optional string expected_workspace_id = 5;
+}
+
+message WorkspaceBound {
+  bytes descriptor_json = 1;
+  string project_id = 2;
+  string backend_id = 3;
+}
+
+message Hello {
+  bytes descriptor_json = 1;
+  string credential = 2;
+  string lease_generation = 3;
+}
+
+message Request {
+  string request_id = 1;
+  string operation_id = 2;
+  string lease_generation = 3;
+  uint32 remaining_budget_ms = 4;
+  string method_name = 5;
+  bytes method_json = 6;
+}
+
+message Response {
+  string request_id = 1;
+  string operation_id = 2;
+  oneof result {
+    bytes ok_json = 3;
+    WireError error = 4;
+  }
+}
+
+message WireError {
+  string code = 1;
+  string message = 2;
+  optional string cause = 3;
+}
+
+message Cancel {
+  string request_id = 1;
+  string lease_generation = 2;
+}
+
+message Status {
+  string request_id = 1;
+  string operation_id = 2;
+  string lease_generation = 3;
+}
+
+message Receipt {
+  string request_id = 1;
+  optional bytes receipt_json = 2;
+}
+
+message Diagnostic {
+  bytes event_json = 1;
+}
+
+message ProcessChanged {
+  string lease_generation = 1;
+  uint64 handle = 2;
+  uint64 revision = 3;
+}
+
+message Ping {
+  string lease_generation = 1;
+}
+
+message Pong {
+  string lease_generation = 1;
+}
+
+message TransferChunk {
+  string transfer_id = 1;
+  uint32 sequence = 2;
+  bytes data = 3;
+  bool eof = 4;
+}
+
+message Detach {
+  string lease_generation = 1;
+}

@@ -1,0 +1,27 @@
+[package]
+name = "microcrab-host-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = ["ws"]
+ws = []
+grpc = ["dep:tonic", "dep:tokio-stream", "dep:tonic-build"]
+both = ["ws", "grpc"]
+
+[dependencies]
+microcrab-host-api.workspace = true
+microcrab-protocol.workspace = true
+prost = "0.13"
+serde.workspace = true
+serde_json.workspace = true
+sha2 = "0.10"
+tokio-stream = { version = "0.1", optional = true }
+tonic = { version = "0.13", optional = true }
+
+[build-dependencies]
+prost-build = "0.13"
+protoc-bin-vendored = "3"
+tonic-build = { version = "0.13", optional = true }

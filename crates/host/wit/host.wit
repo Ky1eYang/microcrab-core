@@ -1,0 +1,152 @@
+package microcrab:host@0.1.0;
+
+/// Host contracts contain resource identities, never Runtime policy context.
+interface types {
+  type handle-id = u64;
+  enum platform { linux, macos, windows, other }
+  enum error-category { not-found, permission, timeout, cancelled, conflict, unsupported, io }
+  record host-error { category: error-category, retryable: bool, message: string }
+  record capabilities {
+    process-pty: bool, process-kill-tree: bool, fs-watch: bool, fs-symlink: bool,
+    net-listen: bool, net-udp: bool,
+  }
+}
+
+interface process {
+  use types.{handle-id, host-error};
+  enum process-signal { term, kill, int, hup, usr1, usr2 }
+  record pty-size { rows: u16, cols: u16 }
+  record process-spec { program: string, args: list<string>, cwd: option<string>, env: list<tuple<string, string>>, pty: option<pty-size> }
+  record exit-status { code: option<s32>, signal: option<process-signal> }
+  /// The scoped handle remains authoritative when no native OS PID exists.
+  record process-handle { id: handle-id, pid: option<u32> }
+  variant process-state { running, exited(exit-status), failed(string) }
+  /// Native OS identity is absent for browser virtual executions.
+  record process-status { pid: option<u32>, state: process-state, elapsed-s: f64 }
+  spawn: func(spec: process-spec) -> result<process-handle, host-error>;
+  status: func(h: process-handle) -> result<process-status, host-error>;
+  /// Observe state for at most yield-ms; expiry returns running without killing it.
+  wait-for-state: func(h: process-handle, yield-ms: u64) -> result<process-status, host-error>;
+  wait: func(h: process-handle) -> result<exit-status, host-error>;
+  /// Release retained state only after the process has terminated and been reaped.
+  release: func(h: process-handle) -> result<_, host-error>;
+  signal: func(h: process-handle, sig: process-signal) -> result<_, host-error>;
+  kill-tree: func(h: process-handle, force: bool) -> result<_, host-error>;
+  read-stdout: func(h: process-handle, max: u32) -> result<option<list<u8>>, host-error>;
+  read-stderr: func(h: process-handle, max: u32) -> result<option<list<u8>>, host-error>;
+  write-stdin: func(h: process-handle, data: list<u8>) -> result<u32, host-error>;
+  close-stdin: func(h: process-handle) -> result<_, host-error>;
+  resize-pty: func(h: process-handle, rows: u16, cols: u16) -> result<_, host-error>;
+}
+
+interface filesystem {
+  use types.{handle-id, host-error};
+  enum file-kind { file, directory, symlink, other }
+  flags open-flags { read, write, create, truncate, append, exclusive }
+  record file-meta { kind: file-kind, size: u64, modified-ms: option<u64> }
+  record dir-entry { name: string, kind: file-kind }
+  record list-options { recursive: bool, include-hidden: bool }
+  record file-handle { id: handle-id }
+  stat: func(path: string) -> result<file-meta, host-error>;
+  %list: func(path: string, opts: list-options) -> result<list<dir-entry>, host-error>;
+  open: func(path: string, %flags: open-flags) -> result<file-handle, host-error>;
+  read: func(h: file-handle, offset: u64, len: u32) -> result<list<u8>, host-error>;
+  write: func(h: file-handle, offset: u64, data: list<u8>) -> result<u32, host-error>;
+  fsync: func(h: file-handle) -> result<_, host-error>;
+  close: func(h: file-handle) -> result<_, host-error>;
+  mkdir: func(path: string, recursive: bool) -> result<_, host-error>;
+  rename: func(%from: string, to: string) -> result<_, host-error>;
+  remove: func(path: string, recursive: bool) -> result<_, host-error>;
+  atomic-write: func(path: string, data: list<u8>) -> result<_, host-error>;
+}
+
+interface net {
+  use types.{handle-id, host-error};
+  record socket-handle { id: handle-id }
+  record listener-handle { id: handle-id }
+  record socket-addr { host: string, port: u16 }
+  resolve: func(name: string) -> result<list<string>, host-error>;
+  connect-tcp: func(addr: socket-addr) -> result<socket-handle, host-error>;
+  listen-tcp: func(addr: socket-addr) -> result<listener-handle, host-error>;
+  accept: func(l: listener-handle) -> result<tuple<socket-handle, socket-addr>, host-error>;
+  read: func(s: socket-handle, max: u32) -> result<list<u8>, host-error>;
+  write: func(s: socket-handle, data: list<u8>) -> result<u32, host-error>;
+  close-socket: func(s: socket-handle) -> result<_, host-error>;
+  close-listener: func(l: listener-handle) -> result<_, host-error>;
+}
+
+/// Existing tool error distinctions belong to the Host tool adapters.
+interface tool-types {
+  enum operation-error-code { denied, invalid-request, unsupported, conflict, limit, cancelled, timeout, io }
+  record operation-error { code: operation-error-code, message: string }
+}
+interface text-read {
+  use tool-types.{operation-error};
+  record read-request { path: string, offset-line: u64, max-lines: u64, max-bytes: u64 }
+  record read-output { content: string, start-line: u64, next-line: option<u64>, truncated: bool, version: string }
+  read: func(request: read-request) -> result<read-output, operation-error>;
+}
+/// Explicit controlled-write cache points are retained by Runtime, never returned to guests.
+interface cache-points {
+  use tool-types.{operation-error};
+  capture: func(path: string, max-bytes: u64) -> result<_, operation-error>;
+}
+interface text-write {
+  use tool-types.{operation-error};
+  variant write-precondition { missing, version(string) }
+  record write-request { path: string, content: string, precondition: write-precondition }
+  record write-output { version: string, bytes: u64 }
+  write: func(request: write-request) -> result<write-output, operation-error>;
+}
+/// Whole-call validation followed by individually conditional commits. The Host
+/// serializes cooperating writers; unrelated external writers are outside this guarantee.
+interface file-mutation {
+  use tool-types.{operation-error};
+  use text-write.{write-request};
+  record delete-request { path: string, expected-version: string }
+  record move-request { path: string, destination: string, expected-version: string, content: string }
+  variant file-mutation { write(write-request), delete(delete-request), %move(move-request) }
+  /// A move may publish the destination while retaining its source. The diagnostic
+  /// explains that committed partial effect; callers must never replay it.
+  record mutation-output { version: option<string>, bytes: u64, source-removed: bool, destination-written: bool, diagnostic: option<string> }
+  preflight: func(requests: list<file-mutation>) -> result<list<file-mutation>, operation-error>;
+  mutate: func(request: file-mutation) -> result<mutation-output, operation-error>;
+}
+interface glob {
+  use tool-types.{operation-error};
+  record glob-request { root: string, pattern: string, include-hidden: bool, include-ignored: bool, include-directories: bool, max-results: u64 }
+  enum glob-entry-kind { file, directory, symlink }
+  /// A symlink describes the link/junction node, never its target.
+  record glob-entry { path: string, kind: glob-entry-kind }
+  record glob-output { entries: list<glob-entry>, truncated: bool }
+  glob: func(request: glob-request) -> result<glob-output, operation-error>;
+}
+interface grep {
+  use tool-types.{operation-error};
+  record grep-request { root: string, pattern: string, include-glob: option<string>, case-sensitive: bool, literal: bool, max-matches: u64, max-bytes: u64 }
+  record grep-match { path: string, line: u64, text: string }
+  record grep-output { matches: list<grep-match>, truncated: bool }
+  grep: func(request: grep-request) -> result<grep-output, operation-error>;
+}
+/// Shell execution shares Process identities; Runtime injects retention budgets.
+interface shell {
+  use types.{host-error};
+  use process.{process-handle};
+  record shell-request { command: string, cwd: option<string> }
+  record shell-output { stdout: string, stderr: string, truncated: bool }
+  launch: func(request: shell-request) -> result<process-handle, host-error>;
+  /// Bounded nonconsuming observation; Runtime may clamp the requested byte budget.
+  read: func(h: process-handle, max-bytes: u64) -> result<shell-output, host-error>;
+  /// Consume returned bytes only. A smaller bound must never discard retained overflow.
+  drain: func(h: process-handle, max-bytes: u64) -> result<shell-output, host-error>;
+  /// Write bytes and optionally close stdin after the write completes.
+  write: func(h: process-handle, data: list<u8>, eof: bool) -> result<_, host-error>;
+}
+
+world host {
+  import types;
+  export process;
+  export filesystem;
+  export net;
+  export shell;
+}
