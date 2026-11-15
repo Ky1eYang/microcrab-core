@@ -164,7 +164,7 @@ pub fn describe(host: &HostInfo) -> Result<Vec<AgentInfo>, String> {
         }),&["patch","preconditions"]));
     }
     if linked(host, "glob") {
-        tools.push(tool("glob", "Find Host entries with a glob. Returns groups of kind (file, directory, symlink), each with a path array of workspace-relative paths. Empty kinds are omitted. Links are listed without reading or traversing targets. Results include a truncation flag; truncated output is incomplete.", json!({
+        tools.push(tool("glob", "Find Host entries with a glob. Returns groups of kind (file, directory, symlink), each with a path array. Paths are workspace-relative inside the workspace and absolute outside it when explicit Host filesystem policy permits external access. Empty kinds are omitted. Links are listed without reading or traversing targets. Results include a truncation flag; truncated output is incomplete.", json!({
             "root":root(),
             "pattern":search_pattern("Glob under root using Host syntax: nonempty, <=1024 UTF-8 bytes, no NUL; null is invalid."),
             "include_hidden":{"type":"boolean","default":false,"description":"Include hidden entries. Omission defaults to false; null is invalid."},

@@ -8,7 +8,7 @@ use tokio_util::sync::CancellationToken;
 
 pub(crate) fn read(
     root: &Path,
-    protected: &std::collections::BTreeSet<PathBuf>,
+    protected: &crate::paths::Policy,
     path: PathBuf,
     max_bytes: usize,
     token: &CancellationToken,

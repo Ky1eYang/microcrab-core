@@ -6,13 +6,12 @@ use microcrab_agent_types::{
 use microcrab_protocol::ToolDefinition;
 use serde_json::{Value, json};
 
-fn shell_tool(host: &HostInfo) -> Result<(&str, &'static str), String> {
-    for capability in ["shell", "process"] {
-        if !host.capabilities.iter().any(|linked| linked == capability) {
-            return Err(format!(
-                "universal execute requires the linked {capability} capability"
-            ));
-        }
+fn shell_tool(host: &HostInfo) -> Result<Option<(&str, &'static str)>, String> {
+    if !["shell", "process"]
+        .iter()
+        .all(|capability| host.capabilities.iter().any(|linked| linked == capability))
+    {
+        return Ok(None);
     }
     let name = host
         .shell_tool_name()
@@ -30,14 +29,16 @@ fn shell_tool(host: &HostInfo) -> Result<(&str, &'static str), String> {
             "Execute a command using the configured Host shell. Consult Host environment information for its syntax and limitations."
         }
     };
-    Ok((name, description))
+    Ok(Some((name, description)))
 }
 
+const SHELL_UNAVAILABLE: &str = "Shell execution is unavailable on this Host; linked shell and process capabilities are required.";
+
 pub fn describe(host: &HostInfo) -> Result<Vec<AgentInfo>, String> {
-    let (name, description) = shell_tool(host)?;
+    let shell = shell_tool(host)?;
     let execution = "Returns a complete result or a buffered receipt with id=session_id/execution_id and optional nonconsuming initial stdout/stderr.";
     let yield_description = "Initial wait, 0..=60000 ms; zero requests an immediate receipt. Omission defaults to 1000; null is invalid. Ending the wait does not terminate or restart the process.";
-    let tools = vec![ToolDefinition {
+    let tools = shell.into_iter().map(|(name, description)| ToolDefinition {
         name: name.into(),
         description: format!("{description} {execution}"),
         parameters: json!({
@@ -50,48 +51,51 @@ pub fn describe(host: &HostInfo) -> Result<Vec<AgentInfo>, String> {
             "required":["command"],
             "additionalProperties":false
         }),
-    }];
+    }).collect();
+    let (description, mode_description, prompt, rules, mut hints, permissions) = match shell {
+        Some((name, description)) => (
+            "Universal agent for executing commands on the configured Host.",
+            "Execute commands on the configured Host.",
+            "Use the advertised Host shell, respect its workspace and capabilities, and inspect execution output before claiming completion.",
+            vec![Rule { name: "host_scope".into(), description: "Use the advertised Host shell and keep the working directory within the configured root.".into() }],
+            vec![Hint { name: "shell_syntax".into(), description: description.into() }],
+            serde_json::from_value(json!([
+                {"tool":{"kind":"exact","value":name}, "args":[], "action":"allow"}
+            ])).map_err(|e| e.to_string())?,
+        ),
+        None => (
+            "Universal conversational agent. Shell execution is unavailable on this Host.",
+            "Assist without Host shell execution.",
+            "Assist using the available conversation context. Shell execution is unavailable on this Host; do not claim to run commands or inspect command output.",
+            vec![],
+            vec![Hint { name: "shell_unavailable".into(), description: SHELL_UNAVAILABLE.into() }],
+            vec![],
+        ),
+    };
     let mut variables = Variable::default();
     variables
-        .inject(
-            "description",
-            "Universal agent for executing commands on the configured Host.",
-        )
+        .inject("description", description)
         .map_err(|e| e.to_string())?;
-    variables.inject("rules", vec![Rule { name: "host_scope".into(), description: "Use the advertised Host shell and keep the working directory within the configured root.".into() }]).map_err(|e| e.to_string())?;
     variables
-        .inject(
-            "hints",
-            vec![Hint {
-                name: "shell_syntax".into(),
-                description: description.into(),
-            }],
-        )
+        .inject("rules", rules)
         .map_err(|e| e.to_string())?;
     if let Some(description) = &host.description {
-        let mut hints: Vec<Hint> = variables
-            .extract("hints")
-            .map_err(|e| e.to_string())?
-            .unwrap_or_default();
         hints.push(Hint {
             name: "host_environment".into(),
             description: description.clone(),
         });
-        variables
-            .inject("hints", hints)
-            .map_err(|e| e.to_string())?;
     }
+    variables
+        .inject("hints", hints)
+        .map_err(|e| e.to_string())?;
     Ok(vec![AgentInfo {
         name: "universal".into(),
         modes: vec![AgentMode {
-            description: "Execute commands on the configured Host.".into(),
-            prompt: "Use the advertised Host shell, respect its workspace and capabilities, and inspect execution output before claiming completion.".into(),
+            description: mode_description.into(),
+            prompt: prompt.into(),
             name: "execute".into(),
             role: AgentRole::Both,
-            permissions: serde_json::from_value(json!([
-                {"tool":{"kind":"exact","value":name}, "args":[], "action":"allow"}
-            ]))
-            .map_err(|e| e.to_string())?,
+            permissions,
         }],
         tools,
         variables,
@@ -105,7 +109,7 @@ pub fn invoke_with_shell(
     arguments: &str,
     shell: impl FnOnce(&str) -> Result<String, String>,
 ) -> Result<String, String> {
-    let (expected, _) = shell_tool(host)?;
+    let (expected, _) = shell_tool(host)?.ok_or(SHELL_UNAVAILABLE)?;
     if name != expected {
         return Err(format!("unknown tool for this Host: {name}"));
     }
@@ -210,6 +214,15 @@ mod component {
                 .map_err(|error| failure("host_info", error.message))?;
             let host = super::checked_host_info(&host_info, &imported)
                 .map_err(|e| failure("host_info", e))?;
+            if super::shell_tool(&host)
+                .map_err(|e| failure("invalid_argument", e))?
+                .is_none()
+            {
+                return Err(failure(
+                    "shell_unavailable",
+                    super::SHELL_UNAVAILABLE.into(),
+                ));
+            }
             super::invoke_with_shell(&host, &name, &arguments, |_| Ok(String::new()))
                 .map_err(|e| failure("invalid_argument", e))?;
             let args: serde_json::Value = serde_json::from_str(&arguments)
@@ -433,7 +446,7 @@ mod tests {
         for capabilities in [vec!["shell".into()], vec!["process".into()], vec![]] {
             host.capabilities = capabilities;
             host.description = Some("Descriptive text claims all operations are available.".into());
-            assert!(describe(&host).is_err());
+            assert!(describe(&host).unwrap()[0].tools.is_empty());
             assert!(
                 invoke_with_shell(&host, "custom-shell", arguments, |_| panic!(
                     "unlinked Host reached"
@@ -540,8 +553,12 @@ mod tests {
         }
     }
     #[test]
-    fn shell_must_be_linked_for_discovery_and_invocation() {
-        for (family, name) in [(OsFamily::Windows, "pwsh"), (OsFamily::Unix, "bash")] {
+    fn missing_shell_ports_degrade_catalog_and_never_invoke_host() {
+        for (family, name) in [
+            (OsFamily::Windows, "pwsh"),
+            (OsFamily::Unix, "bash"),
+            (OsFamily::Other, "fixture"),
+        ] {
             for capabilities in [
                 vec![],
                 vec!["host-info".into(), "variable-get".into()],
@@ -550,15 +567,65 @@ mod tests {
             ] {
                 let mut host = host(family);
                 host.capabilities = capabilities;
-                assert!(describe(&host).is_err());
+                host.description = Some("Opaque Host environment facts: λ.".into());
+                let agent = describe(&host).unwrap().remove(0);
+                assert_eq!(agent.name, "universal");
+                assert!(agent.tools.is_empty());
+                assert_eq!(agent.modes[0].name, "execute");
+                assert_eq!(agent.modes[0].role, AgentRole::Both);
+                assert!(agent.modes[0].permissions.is_empty());
                 assert!(
-                    invoke_with_shell(&host, name, r#"{"command":"ok"}"#, |_| {
-                        panic!("unlinked shell reached Host")
-                    })
-                    .is_err()
+                    agent.modes[0]
+                        .prompt
+                        .contains("Shell execution is unavailable")
                 );
+                assert!(
+                    !agent.modes[0]
+                        .prompt
+                        .contains("Use the advertised Host shell")
+                );
+                let rules: Vec<Rule> = agent.variables.extract("rules").unwrap().unwrap();
+                assert!(rules.is_empty());
+                let hints: Vec<Hint> = agent.variables.extract("hints").unwrap().unwrap();
+                assert!(hints.iter().any(|hint| hint.name == "shell_unavailable"));
+                assert!(!hints.iter().any(|hint| hint.name == "shell_syntax"));
+                assert!(hints.iter().any(|hint| hint.name == "host_environment"
+                    && Some(&hint.description) == host.description.as_ref()));
+                assert!(
+                    agent
+                        .variables
+                        .get("description")
+                        .unwrap()
+                        .as_str()
+                        .unwrap()
+                        .contains("Shell execution is unavailable")
+                );
+                for arguments in [r#"{"command":"ok"}"#, "not JSON"] {
+                    assert_eq!(
+                        invoke_with_shell(&host, name, arguments, |_| {
+                            panic!("unlinked shell reached Host")
+                        })
+                        .unwrap_err(),
+                        SHELL_UNAVAILABLE,
+                    );
+                }
             }
         }
+    }
+
+    #[test]
+    fn unavailable_shell_does_not_require_a_shell_identity() {
+        let mut host = host(OsFamily::Other);
+        host.shell.clear();
+        host.capabilities.clear();
+        assert!(describe(&host).unwrap()[0].tools.is_empty());
+        assert_eq!(
+            invoke_with_shell(&host, "bash", "{}", |_| {
+                panic!("unlinked shell reached Host")
+            })
+            .unwrap_err(),
+            SHELL_UNAVAILABLE
+        );
     }
 
     #[test]

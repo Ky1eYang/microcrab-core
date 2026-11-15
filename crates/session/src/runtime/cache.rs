@@ -42,15 +42,11 @@ fn point_bytes(call_id: &str, tool: &str, point: &FileCachePoint) -> Result<usiz
         MAX_ID_BYTES,
     )
     .map_err(|error| cache_label(error, "cache point identity byte budget"))?;
-    if point.path.is_empty()
-        || point.path.contains(['\\', ':', '\0'])
-        || point
-            .path
-            .split('/')
-            .any(|part| matches!(part, "" | "." | ".."))
-    {
+    // Retained observations are data, not authority to reopen paths. Host imports
+    // independently bind and admit the exact requested path before recording it.
+    if !microcrab_host_api::is_normalized_cache_path(&point.path, true) {
         return Err(Error::config(
-            "cache point path must be normalized and root-relative",
+            "cache point path must be normalized relative or portable absolute",
         ));
     }
     match (&point.data, &point.version) {
@@ -302,6 +298,85 @@ mod tests {
             data,
         }
     }
+    #[test]
+    fn frozen_relative_evidence_from_non_local_hosts_keeps_original_bytes() {
+        for path in [
+            "a?b",
+            "CON",
+            "trailing.",
+            "space ",
+            "nested/a?b",
+            "line\nbreak",
+        ] {
+            // Decode retained bytes directly: this never calls Host normalization
+            // or grants authority to open the historical path on this machine.
+            let bytes = serde_json::to_vec(&serde_json::json!({
+                "epoch_id": 1, "turn_id": 2, "round_id": 3,
+                "points": [{"call_id":"old-call", "tool":"write", "sequence":0,
+                    "path":path, "data":null, "version":null}]
+            }))
+            .unwrap();
+            let decoded: RoundCacheReport = serde_json::from_slice(&bytes).unwrap();
+            decoded.validate().unwrap();
+            assert_eq!(decoded.points[0].point.path, path);
+            let encoded = serde_json::to_vec(&decoded).unwrap();
+            let restored: RoundCacheReport = serde_json::from_slice(&encoded).unwrap();
+            restored.validate().unwrap();
+            assert_eq!(serde_json::to_vec(&restored).unwrap(), encoded);
+            assert!(!microcrab_host_api::is_normalized_file_path(path, false));
+        }
+    }
+
+    #[test]
+    fn portable_absolute_cache_evidence_preserves_identity_and_roundtrip() {
+        let collector = Collector::default();
+        collector.begin(1, 2, 3).unwrap();
+        for path in [
+            "selected.txt",
+            "/outside/file",
+            "C:/outside/file",
+            "//server/share/file",
+        ] {
+            let mut observation = point(Some(b"evidence".to_vec()));
+            observation.path = path.into();
+            collector
+                .record(collector.scope(), "call", "write", observation)
+                .unwrap();
+        }
+        for path in [
+            "../outside",
+            "C:relative",
+            "//server/share",
+            "/outside/../file",
+            "C:/file:ads",
+            "C:/NUL",
+            "C:\\outside\\file",
+        ] {
+            let mut observation = point(None);
+            observation.path = path.into();
+            assert!(
+                collector
+                    .record(collector.scope(), "call", "write", observation)
+                    .is_err()
+            );
+        }
+        let report = collector.finish().unwrap();
+        assert_eq!(report.points.len(), 4);
+        assert_eq!(report.points[2].point.path, "C:/outside/file");
+        let bytes = serde_json::to_vec(&report).unwrap();
+        let decoded: RoundCacheReport = serde_json::from_slice(&bytes).unwrap();
+        decoded.validate().unwrap();
+        assert_eq!(serde_json::to_vec(&decoded).unwrap(), bytes);
+        assert_eq!(
+            decoded
+                .points
+                .iter()
+                .map(|point| point.sequence)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2, 3]
+        );
+    }
+
     #[test]
     fn whole_patch_reservation_prevents_other_calls_from_stealing_capacity() {
         let collector = Collector::default();

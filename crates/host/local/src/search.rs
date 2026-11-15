@@ -47,7 +47,7 @@ fn glob(pattern: &str) -> Result<GlobMatcher, ToolError> {
 
 fn rules(
     directory: &Path,
-    protected: &std::collections::BTreeSet<PathBuf>,
+    protected: &crate::paths::Policy,
     remaining: &mut usize,
     token: &CancellationToken,
 ) -> Result<Gitignore, ToolError> {
@@ -104,7 +104,7 @@ struct WalkOptions {
 /// Only glob opts into directory/link nodes; grep retains ordinary files only.
 fn walk(
     root: &Path,
-    protected: &std::collections::BTreeSet<PathBuf>,
+    protected: &crate::paths::Policy,
     requested: &Path,
     options: WalkOptions,
     token: &CancellationToken,
@@ -116,9 +116,7 @@ fn walk(
     if metadata.is_file() {
         return Ok(!visit(
             &search,
-            search
-                .strip_prefix(root)
-                .map_err(|_| ToolError::PathOutsideRoot)?,
+            crate::paths::returned(root, &search),
             GlobEntryKind::File,
         )?);
     }
@@ -190,9 +188,7 @@ fn walk(
             if kind != GlobEntryKind::Symlink {
                 admit(root, &path, protected)?;
             }
-            let relative = path
-                .strip_prefix(root)
-                .map_err(|_| ToolError::PathOutsideRoot)?;
+            let relative = crate::paths::returned(root, &path);
             if (kind == GlobEntryKind::File || options.include_directories)
                 && !visit(&path, relative, kind)?
             {
@@ -211,7 +207,7 @@ fn walk(
 
 pub(crate) fn glob_files(
     root: &Path,
-    protected: &std::collections::BTreeSet<PathBuf>,
+    protected: &crate::paths::Policy,
     request: GlobRequest,
     token: &CancellationToken,
 ) -> Result<GlobOutput, ToolError> {
@@ -257,7 +253,7 @@ pub(crate) fn glob_files(
 
 pub(crate) fn grep_files(
     root: &Path,
-    protected: &std::collections::BTreeSet<PathBuf>,
+    protected: &crate::paths::Policy,
     request: GrepRequest,
     token: &CancellationToken,
 ) -> Result<GrepOutput, ToolError> {

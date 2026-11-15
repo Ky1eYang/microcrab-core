@@ -1,17 +1,12 @@
 //! Stateless bounded content evidence for one guest-selected controlled-write path.
 use microcrab_host_api::{CachePointRequest, FileCachePoint, MAX_CACHE_POINT_BYTES, ToolError};
 use sha2::{Digest, Sha256};
-use std::{
-    collections::BTreeSet,
-    fs,
-    io::Read,
-    path::{Path, PathBuf},
-};
+use std::{fs, io::Read, path::Path};
 use tokio_util::sync::CancellationToken;
 
 pub(crate) fn capture(
     root: &Path,
-    protected: &BTreeSet<PathBuf>,
+    protected: &crate::paths::Policy,
     request: CachePointRequest,
     token: &CancellationToken,
 ) -> Result<FileCachePoint, ToolError> {
@@ -22,18 +17,16 @@ pub(crate) fn capture(
         ));
     }
     let path = crate::paths::admit(root, &request.path, protected)?;
-    let relative = path
-        .strip_prefix(root)
-        .map_err(|_| ToolError::PathOutsideRoot)?;
+    let relative = crate::paths::returned(root, &path);
     if relative.as_os_str().is_empty() {
         return Err(ToolError::invalid_request(
             "cache point requires a file path",
         ));
     }
-    let normalized = relative
-        .to_str()
-        .ok_or_else(|| ToolError::invalid_request("path must be Unicode"))?
-        .replace('\\', "/");
+    let normalized = crate::paths::returned_text(root, &path)?;
+    if !microcrab_host_api::is_normalized_file_path(&normalized, protected.unrestricted) {
+        return Err(ToolError::invalid_request("invalid Host cache point path"));
+    }
     let mut file = match crate::workspace::open_regular(&path) {
         Ok(file) => file,
         Err(ToolError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {

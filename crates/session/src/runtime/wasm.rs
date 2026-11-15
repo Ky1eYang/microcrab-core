@@ -414,8 +414,10 @@ fn load_agent(bytes: &[u8], limits: WasmLimits, host: Arc<dyn Host>) -> Result<W
             }
         }
     }
-    if definitions.is_empty() || definitions.len() > 128 {
-        return Err(Error::wasm("catalog must contain 1..=128 tools"));
+    // A valid agent can expose no Host tools (for example Chat Only). External
+    // tools retain their own registration and admission; catalog limits still apply.
+    if definitions.len() > 128 {
+        return Err(Error::wasm("catalog must contain at most 128 tools"));
     }
     let mut names = HashSet::new();
     for definition in &definitions {
@@ -484,9 +486,6 @@ fn validate_agents(agents: &[AgentInfo]) -> Result<(), Error> {
                 .any(|mode| !valid_name(&mode.name) || !modes.insert(&mode.name))
         {
             return Err(Error::wasm("invalid or duplicate agent mode"));
-        }
-        if agent.tools.is_empty() {
-            return Err(Error::wasm("agent must advertise tools"));
         }
     }
     Ok(())

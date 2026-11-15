@@ -15,6 +15,9 @@ pub struct CachePointRequest {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct FileCachePoint {
+    /// Normalized portable file identity: workspace-relative by default, or
+    /// absolute outside the workspace under explicit unrestricted Host scope.
+    /// Evidence never grants authority to reopen or restore this file.
     pub path: String,
     pub data: Option<Vec<u8>>,
     pub version: Option<String>,

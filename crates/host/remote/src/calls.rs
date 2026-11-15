@@ -970,14 +970,20 @@ impl Host for RemoteHost {
             }
             _ => return Err(unavailable("invalid Host cache point content or digest")),
         }
-        if point.path.is_empty()
-            || point.path.len() > 32768
-            || point.path.contains('\\')
-            || point.path.contains(':')
-            || Path::new(&point.path)
+        let unrestricted = self.descriptor.info.description.as_deref()
+            == Some(microcrab_host_api::UNRESTRICTED_FILESYSTEM_DESCRIPTION);
+        // Preserve the existing carrier-relative syntax, including names from
+        // non-Local Hosts. This is evidence validation, not LocalHost admission.
+        let legacy_relative = !point.path.is_empty()
+            && point.path.len() <= 32768
+            && !point.path.contains(['\\', ':'])
+            && Path::new(&point.path)
                 .components()
-                .any(|component| !matches!(component, std::path::Component::Normal(_)))
-        {
+                .all(|component| matches!(component, std::path::Component::Normal(_)));
+        let absolute = unrestricted
+            && (point.path.starts_with('/') || point.path.as_bytes().get(1) == Some(&b':'))
+            && microcrab_host_api::is_normalized_file_path(&point.path, true);
+        if !legacy_relative && !absolute {
             return Err(unavailable("invalid Host cache point path"));
         }
         Ok(point)

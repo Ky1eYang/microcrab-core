@@ -89,7 +89,7 @@ pub(crate) fn run(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn 
         )
         .into());
     }
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../session/src");
+    let root = crate::workspace::root()?.join("crates/session/src");
     let mut sources = Vec::new();
     collect(&root, &root, &mut sources)?;
     sources.sort_by(|left, right| left.0.cmp(&right.0));

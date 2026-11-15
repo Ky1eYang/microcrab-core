@@ -11,7 +11,6 @@ use microcrab_host_api::{
     types::{ErrorCategory, HostError, OpContext, Result},
 };
 use std::{
-    collections::BTreeSet,
     fs,
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
@@ -27,7 +26,7 @@ fn failure(message: &'static str) -> HostError {
 fn tool_error(error: ToolError) -> HostError {
     error.into_host_error()
 }
-fn admitted(host: &LocalHost, protected: &BTreeSet<PathBuf>, path: &Path) -> Result<PathBuf> {
+fn admitted(host: &LocalHost, protected: &crate::paths::Policy, path: &Path) -> Result<PathBuf> {
     crate::paths::admit(&host.root, path, protected).map_err(tool_error)
 }
 fn metadata(path: &Path) -> Result<FileMeta> {
@@ -53,7 +52,7 @@ impl LocalHost {
         &self,
         ctx: &OpContext,
         exclusive: bool,
-        work: impl FnOnce(&LocalHost, &OpContext, &BTreeSet<PathBuf>) -> Result<T> + Send + 'static,
+        work: impl FnOnce(&LocalHost, &OpContext, &crate::paths::Policy) -> Result<T> + Send + 'static,
     ) -> Result<T> {
         ctx.check()?;
         let mut scoped = ctx.clone();

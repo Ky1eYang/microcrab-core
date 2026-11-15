@@ -42,26 +42,46 @@ pub struct LocalHost {
             std::collections::HashMap<PathBuf, std::sync::Weak<tokio::sync::Mutex<()>>>,
         >,
     >,
-    pub(crate) protected_paths: Arc<std::sync::RwLock<std::collections::BTreeSet<PathBuf>>>,
+    pub(crate) protected_paths: Arc<std::sync::RwLock<crate::paths::Policy>>,
     process_execution: Arc<std::sync::atomic::AtomicBool>,
     pub(crate) resources: Arc<crate::resources::HandleTable>,
 }
 
 impl LocalHost {
     pub fn new(root: impl AsRef<Path>, limits: ShellLimits) -> Result<Self, ToolError> {
-        Self::assemble(root, limits, true)
+        Self::new_with_filesystem_scope(root, limits, false)
     }
 
     /// Assemble a file-only backend without requiring an installed interpreter.
     /// Process execution remains disabled across every clone.
     pub fn new_filesystem(root: impl AsRef<Path>, limits: ShellLimits) -> Result<Self, ToolError> {
-        Self::assemble(root, limits, false)
+        Self::new_filesystem_with_scope(root, limits, false)
+    }
+
+    /// Explicit startup scope; private paths and ordinary-file safety remain enforced.
+    /// Shell and Process authorization are independent of this filesystem scope.
+    pub fn new_with_filesystem_scope(
+        root: impl AsRef<Path>,
+        limits: ShellLimits,
+        unrestricted_fs: bool,
+    ) -> Result<Self, ToolError> {
+        Self::assemble(root, limits, true, unrestricted_fs)
+    }
+
+    /// File-only equivalent of `new_with_filesystem_scope`; no interpreter required.
+    pub fn new_filesystem_with_scope(
+        root: impl AsRef<Path>,
+        limits: ShellLimits,
+        unrestricted_fs: bool,
+    ) -> Result<Self, ToolError> {
+        Self::assemble(root, limits, false, unrestricted_fs)
     }
 
     fn assemble(
         root: impl AsRef<Path>,
         limits: ShellLimits,
         processes: bool,
+        unrestricted_fs: bool,
     ) -> Result<Self, ToolError> {
         if limits.max_concurrent == 0
             || limits.max_concurrent > 1024
@@ -87,7 +107,9 @@ impl LocalHost {
             workspace: Arc::new(tokio::sync::RwLock::new(())),
             jobs: Arc::new(crate::jobs::ProcessStore::default()),
             file_writes: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-            protected_paths: Arc::new(std::sync::RwLock::new(std::collections::BTreeSet::new())),
+            protected_paths: Arc::new(std::sync::RwLock::new(crate::paths::Policy::new(
+                unrestricted_fs,
+            ))),
             process_execution: Arc::new(std::sync::atomic::AtomicBool::new(processes)),
             resources: Arc::new(crate::resources::HandleTable::default()),
             limits,
@@ -108,19 +130,16 @@ impl LocalHost {
                 "private path must be an ordinary file or directory",
             ));
         }
-        let protected = if self.root.starts_with(&canonical) {
-            Some(self.root.clone())
-        } else if canonical.starts_with(&self.root) {
-            Some(crate::paths::resolve(&self.root, &canonical)?)
-        } else {
-            None
-        };
-        if let Some(path) = protected {
-            self.protected_paths
-                .write()
-                .map_err(|_| ToolError::worker("private path policy lock poisoned"))?
-                .insert(path);
+        if canonical.starts_with(&self.root) {
+            crate::paths::resolve(&self.root, &canonical)?;
         }
+        // Keep external registrations too: unrestricted admission can reach them.
+        // Canonical identity prevents aliases from bypassing the private prefix.
+        self.protected_paths
+            .write()
+            .map_err(|_| ToolError::worker("private path policy lock poisoned"))?
+            .private
+            .insert(canonical);
         Ok(())
     }
 
@@ -183,14 +202,7 @@ impl Host for LocalHost {
             let _permit = permit;
             crate::paths::cancelled(&token)?;
             let path = crate::paths::admit(&root, &path, &protected)?;
-            let relative = path
-                .strip_prefix(&root)
-                .map_err(|_| ToolError::PathOutsideRoot)?;
-            let resource = relative
-                .components()
-                .map(|part| part.as_os_str().to_string_lossy())
-                .collect::<Vec<_>>()
-                .join("/");
+            let resource = crate::paths::returned_text(&root, &path)?;
             let resource = if resource.is_empty() {
                 ".".into()
             } else {
@@ -430,7 +442,12 @@ impl Host for LocalHost {
             capabilities: Vec::new(),
             resources: None,
             virtual_shell: None,
-            description: None,
+            description: self
+                .protected_paths
+                .read()
+                .map_err(|_| ToolError::worker("private path policy lock poisoned"))?
+                .unrestricted
+                .then(|| crate::paths::UNRESTRICTED_DESCRIPTION.into()),
         })
     }
 

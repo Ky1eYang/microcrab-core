@@ -49,7 +49,7 @@ fn version(version: &str) -> Result<(), ToolError> {
 
 fn source(
     root: &Path,
-    protected: &BTreeSet<PathBuf>,
+    protected: &crate::paths::Policy,
     path: &Path,
     expected: &str,
     token: &CancellationToken,
@@ -85,7 +85,7 @@ fn missing(path: &Path) -> Result<(), ToolError> {
 
 fn normalize(
     root: &Path,
-    protected: &BTreeSet<PathBuf>,
+    protected: &crate::paths::Policy,
     path: &Path,
 ) -> Result<PathBuf, ToolError> {
     let admitted = crate::paths::admit(root, path, protected)?;
@@ -105,9 +105,10 @@ fn normalize(
             "mutation parent must be an existing directory",
         ));
     }
-    let relative = admitted
-        .strip_prefix(root)
-        .map_err(|_| ToolError::PathOutsideRoot)?;
+    if !admitted.starts_with(root) {
+        return Ok(admitted);
+    }
+    let relative = crate::paths::returned(root, &admitted);
     let relative = relative
         .components()
         .map(|part| part.as_os_str().to_string_lossy())
@@ -118,7 +119,7 @@ fn normalize(
 
 pub(crate) fn preflight(
     root: &Path,
-    protected: &BTreeSet<PathBuf>,
+    protected: &crate::paths::Policy,
     mut mutations: Vec<FileMutation>,
     token: &CancellationToken,
 ) -> Result<Vec<FileMutation>, ToolError> {
@@ -233,7 +234,7 @@ fn finish_move(
 
 fn commit(
     root: &Path,
-    protected: &BTreeSet<PathBuf>,
+    protected: &crate::paths::Policy,
     mutation: FileMutation,
     token: &CancellationToken,
 ) -> Result<MutationOutput, ToolError> {

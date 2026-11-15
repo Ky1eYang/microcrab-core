@@ -2,6 +2,7 @@
 mod artifact_kind;
 mod build_wasm;
 mod check_session;
+mod workspace;
 use std::{error::Error, process::ExitCode};
 
 fn main() -> ExitCode {

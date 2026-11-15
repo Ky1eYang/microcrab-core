@@ -2,6 +2,7 @@
 //! retains its own fixtures; adding a leaf here avoids another native link target.
 mod cache;
 mod file;
+mod filesystem_scope;
 mod info;
 mod jobs;
 mod mutations;

@@ -5,7 +5,12 @@ mod files;
 pub mod filesystem;
 mod mutation;
 pub mod net;
+mod paths;
 pub mod process;
+pub use paths::{
+    UNRESTRICTED_FILESYSTEM_DESCRIPTION, is_normalized_cache_path, is_normalized_file_path,
+    is_portable_file_name,
+};
 pub mod shell;
 mod tool;
 pub mod tool_api;

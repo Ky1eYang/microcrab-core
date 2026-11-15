@@ -1,6 +1,8 @@
 //! Typed, bounded file operations and non-following entry discovery. Paths are
-//! interpreted by the executing Host, relative to its configured root (absolute
-//! paths must remain within it).
+//! interpreted by the executing Host relative to its configured root. Default
+//! scope confines absolute and relative paths to that root. An explicit Host
+//! unrestricted filesystem policy permits external ordinary paths while retaining
+//! private-path and platform safety admission.
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -73,7 +75,8 @@ pub enum GlobEntryKind {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GlobEntry {
-    /// Path relative to the configured Host root, not the search root.
+    /// Path relative to the configured Host root, not the search root. When an
+    /// explicit unrestricted Host policy admits an external path, it is absolute.
     pub path: PathBuf,
     /// Describes this node; symlink targets are never inspected or traversed.
     pub kind: GlobEntryKind,

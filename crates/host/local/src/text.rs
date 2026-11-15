@@ -17,7 +17,7 @@ const PAGE_BYTES: usize = 1024 * 1024;
 
 pub(crate) fn read_text(
     root: &Path,
-    protected: &std::collections::BTreeSet<std::path::PathBuf>,
+    protected: &crate::paths::Policy,
     request: ReadRequest,
     token: &CancellationToken,
 ) -> Result<ReadOutput, ToolError> {
@@ -141,7 +141,7 @@ fn check(
 
 pub(crate) fn write(
     root: &Path,
-    protected: &std::collections::BTreeSet<std::path::PathBuf>,
+    protected: &crate::paths::Policy,
     request: WriteRequest,
     token: &CancellationToken,
 ) -> Result<WriteOutput, ToolError> {

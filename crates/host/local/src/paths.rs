@@ -6,6 +6,103 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
+/// Scope is frozen at construction; private registrations can only grow.
+#[derive(Default)]
+pub(crate) struct Policy {
+    pub(crate) unrestricted: bool,
+    pub(crate) private: std::collections::BTreeSet<PathBuf>,
+}
+impl Policy {
+    pub(crate) fn new(unrestricted: bool) -> Self {
+        Self {
+            unrestricted,
+            ..Self::default()
+        }
+    }
+}
+
+// This stable Host-authored fact participates in the descriptor fingerprint.
+pub(crate) use microcrab_host_api::UNRESTRICTED_FILESYSTEM_DESCRIPTION as UNRESTRICTED_DESCRIPTION;
+
+pub(crate) fn returned<'a>(root: &Path, path: &'a Path) -> &'a Path {
+    path.strip_prefix(root).unwrap_or(path)
+}
+
+pub(crate) fn returned_text(root: &Path, path: &Path) -> Result<String, ToolError> {
+    let text = returned(root, path)
+        .to_str()
+        .ok_or_else(|| ToolError::invalid_request("path must be Unicode"))?;
+    #[cfg(windows)]
+    let text = if let Some(unc) = text.strip_prefix(r"\\?\UNC\") {
+        format!("//{}", unc.replace('\\', "/"))
+    } else {
+        text.strip_prefix(r"\\?\")
+            .unwrap_or(text)
+            .replace('\\', "/")
+    };
+    #[cfg(not(windows))]
+    let text = text.to_owned();
+    Ok(text)
+}
+
+/// Admit components before parent traversal: link/../file and NUL/../file
+/// cannot erase safety violations. Reuse canonical confined resolution against
+/// the volume/share root rather than replacing it with lexical prefix checks.
+fn resolve_unrestricted(root: &Path, requested: &Path) -> Result<PathBuf, ToolError> {
+    let text = requested
+        .to_str()
+        .ok_or_else(|| ToolError::invalid_request("path must be Unicode"))?;
+    if text.is_empty() || text.len() > 32_768 || text.contains('\0') || text.starts_with(r"\\.\") {
+        return Err(ToolError::invalid_request("unsupported file path"));
+    }
+    let mut components = requested.components().peekable();
+    let mut path = if requested.is_absolute() {
+        let mut anchor = PathBuf::new();
+        if let Some(Component::Prefix(prefix)) = components.peek().copied() {
+            #[cfg(windows)]
+            if !matches!(
+                prefix.kind(),
+                std::path::Prefix::Disk(_)
+                    | std::path::Prefix::UNC(_, _)
+                    | std::path::Prefix::VerbatimDisk(_)
+                    | std::path::Prefix::VerbatimUNC(_, _)
+            ) {
+                return Err(ToolError::invalid_request("unsupported file path"));
+            }
+            anchor.push(prefix.as_os_str());
+            components.next();
+        }
+        if !matches!(components.next(), Some(Component::RootDir)) {
+            return Err(ToolError::PathOutsideRoot);
+        }
+        anchor.push(std::path::MAIN_SEPARATOR_STR);
+        fs::canonicalize(anchor)?
+    } else {
+        resolve(root, Path::new("."))?
+    };
+    let anchor: PathBuf = path
+        .components()
+        .take_while(|part| matches!(part, Component::Prefix(_) | Component::RootDir))
+        .collect();
+    let anchor = fs::canonicalize(anchor)?;
+    for component in components {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !path.pop() {
+                    return Err(ToolError::PathOutsideRoot);
+                }
+            }
+            Component::Normal(name) => {
+                validate_name(name)?;
+                path = resolve(&anchor, &path.join(name))?;
+            }
+            _ => return Err(ToolError::invalid_request("unsupported file path")),
+        }
+    }
+    resolve(&anchor, &path)
+}
+
 pub(crate) fn reparse(metadata: &fs::Metadata) -> bool {
     #[cfg(windows)]
     {
@@ -99,21 +196,7 @@ fn validate_name(name: &std::ffi::OsStr) -> Result<(), ToolError> {
     let name = name
         .to_str()
         .ok_or_else(|| ToolError::invalid_request("path must be Unicode"))?;
-    let stem = name.split('.').next().unwrap_or("").to_ascii_uppercase();
-    if name.ends_with(['.', ' '])
-        || name
-            .chars()
-            .any(|c| c.is_control() || "<>:\"/\\|?*".contains(c))
-        || matches!(
-            stem.as_str(),
-            "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
-        )
-        || ((stem.starts_with("COM") || stem.starts_with("LPT"))
-            && matches!(
-                &stem[3..],
-                "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
-            ))
-    {
+    if !microcrab_host_api::is_portable_file_name(name) {
         return Err(ToolError::invalid_request("unsupported file path"));
     }
     Ok(())
@@ -131,8 +214,16 @@ pub(crate) fn within(path: &Path, prefix: &Path) -> bool {
     }
 }
 
-pub(crate) fn protected(path: &Path, paths: &std::collections::BTreeSet<PathBuf>) -> bool {
-    paths.iter().any(|prefix| within(path, prefix))
+pub(crate) fn protected(path: &Path, paths: &crate::paths::Policy) -> bool {
+    (paths.unrestricted
+        && path.components().any(|part| {
+            [".microcrab", ".micro-crab"].iter().any(|name| {
+                part.as_os_str()
+                    .to_string_lossy()
+                    .eq_ignore_ascii_case(name)
+            })
+        }))
+        || paths.private.iter().any(|prefix| within(path, prefix))
 }
 
 /// Protection is a Host admission rule. Its caller holds the registration read
@@ -140,9 +231,13 @@ pub(crate) fn protected(path: &Path, paths: &std::collections::BTreeSet<PathBuf>
 pub(crate) fn admit(
     root: &Path,
     requested: &Path,
-    paths: &std::collections::BTreeSet<PathBuf>,
+    paths: &crate::paths::Policy,
 ) -> Result<PathBuf, ToolError> {
-    let path = resolve(root, requested)?;
+    let path = if paths.unrestricted {
+        resolve_unrestricted(root, requested)?
+    } else {
+        resolve(root, requested)?
+    };
     if protected(&path, paths) {
         return Err(microcrab_host_api::HostError::known(
             microcrab_host_api::ErrorCategory::Permission,
@@ -159,7 +254,7 @@ pub(crate) fn admit(
 pub(crate) fn admit_link_node(
     root: &Path,
     requested: &Path,
-    paths: &std::collections::BTreeSet<PathBuf>,
+    paths: &crate::paths::Policy,
 ) -> Result<PathBuf, ToolError> {
     if requested.as_os_str().len() > 32_768 {
         return Err(ToolError::invalid_request("unsupported file path"));
@@ -263,7 +358,10 @@ mod tests {
             resolve(&root, Path::new("../outside")),
             Err(ToolError::PathOutsideRoot)
         ));
-        let protected = [root.join("private")].into_iter().collect();
+        let protected = Policy {
+            private: [root.join("private")].into_iter().collect(),
+            ..Policy::default()
+        };
         let error = admit(&root, Path::new("private/missing"), &protected).unwrap_err();
         assert_eq!(
             error.public_reason(),

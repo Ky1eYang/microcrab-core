@@ -38,7 +38,8 @@ microcrab-host-api.workspace = true
 async-trait.workspace = true
 tracing.workspace = true
 serde.workspace = true
-serde_json.workspace = true
+# Frozen JSON object order must not depend on an embedder's feature union.
+serde_json = { workspace = true, features = ["preserve_order"] }
 uuid.workspace = true
 pulldown-cmark.workspace = true
 serde_yaml_ng.workspace = true

@@ -698,6 +698,71 @@ async fn pending_admission_rejects_detached_and_replaced_route_snapshots() {
 }
 
 #[tokio::test]
+async fn cache_point_absolute_identity_requires_authenticated_unrestricted_scope() {
+    for unrestricted in [false, true] {
+        let mut descriptor = descriptor();
+        if unrestricted {
+            descriptor.info.description =
+                Some(microcrab_host_api::UNRESTRICTED_FILESYSTEM_DESCRIPTION.into());
+            descriptor.descriptor_digest =
+                microcrab_host_protocol::descriptor_fingerprint(&descriptor).unwrap();
+        }
+        let host = RemoteHost::new(descriptor).unwrap();
+        let mut receiver = ready(&host, 1).await;
+        for path in [
+            "selected",
+            "a?b",
+            "CON",
+            "trailing.",
+            "space ",
+            "/outside/file",
+            "C:/outside/file",
+            "//server/share/file",
+            "C:relative",
+            "C:/file:ads",
+            "/outside/../file",
+        ] {
+            let task = {
+                let host = host.clone();
+                let path = path.to_owned();
+                tokio::spawn(async move {
+                    host.cache_point(
+                        microcrab_host_api::CachePointRequest {
+                            path: path.into(),
+                            max_bytes: 16,
+                        },
+                        CancellationToken::new(),
+                    )
+                    .await
+                })
+            };
+            let HostFrame::Request {
+                request_id,
+                operation_id,
+                method: HostRequest::CachePoint(_),
+                ..
+            } = next_request(&mut receiver).await
+            else {
+                panic!("expected selected capture")
+            };
+            host.receive(
+                1,
+                HostFrame::Response {
+                    request_id,
+                    operation_id,
+                    result: Ok(json!({"path":path,"data":null,"version":null})),
+                },
+            )
+            .unwrap();
+            let result = task.await.unwrap();
+            let valid = microcrab_host_api::is_normalized_cache_path(path, unrestricted);
+            assert_eq!(result.is_ok(), valid, "scope={unrestricted} path={path}");
+        }
+        host.detach(1);
+    }
+}
+
+#[tokio::test]
 async fn cache_points_validate_fresh_content_and_do_not_request_workspace_scans() {
     let host = RemoteHost::new(descriptor()).unwrap();
     let mut receiver = ready(&host, 1).await;

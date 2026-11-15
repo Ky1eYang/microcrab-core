@@ -6,6 +6,8 @@
 #[path = "support/typed_agent_fixture.rs"]
 mod typed_agent_fixture;
 
+#[path = "wasm_hostless.rs"]
+mod wasm_hostless;
 #[path = "wasm_init.rs"]
 mod wasm_init;
 
