@@ -3,7 +3,6 @@ use super::{Builtin, ContextMode, Source};
 use crate::Client;
 use crate::Error;
 use crate::context::Content;
-use crate::state::Limits;
 use microcrab_auditor::Auditor;
 use microcrab_auditor::VariableView;
 use microcrab_protocol::Response;
@@ -24,14 +23,14 @@ pub(crate) async fn run(
     variables: std::sync::Arc<dyn VariableView>,
     issuer: &Content,
     user_input: &str,
-    _limits: &Limits,
     cancellation: &CancellationToken,
 ) -> Result<Response, Error> {
-    let request = super::prepare(
+    let request = super::prepare_configured(
         BUILTIN.name,
         BUILTIN.source,
         issuer,
         &[("user_input", user_input)],
+        &executor.prompt_config(),
     )?;
     let mut response = tokio::select! {
         biased;

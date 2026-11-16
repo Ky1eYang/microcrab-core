@@ -9,6 +9,7 @@ use microcrab_auditor::VariableView;
 #[derive(Default)]
 pub(crate) struct SessionOneShot {
     pub(crate) children: crate::Children,
+    pub(crate) prompt_config: crate::context::system::PromptConfig,
 }
 
 // Issuer values are read-only inputs. Child framework facts and hook mutations
@@ -74,6 +75,9 @@ impl Auditor for FunctionalAudit {
 
 #[async_trait::async_trait]
 impl OneShotExecutor for SessionOneShot {
+    fn prompt_config(&self) -> crate::context::system::PromptConfig {
+        self.prompt_config.clone()
+    }
     async fn close(&self) -> Result<(), Error> {
         self.children.close().await
     }
@@ -98,6 +102,7 @@ impl OneShotExecutor for SessionOneShot {
         let output_tokens = request.max_output_tokens;
         // A dropped review waiter cancels its operation, while this worker retains
         // actual Context/State and observation until acknowledged cleanup completes.
+        let prompt_config = self.prompt_config.clone();
         tokio::spawn(async move {
             let runtime = Runtime::new(vec![], Arc::new(crate::runtime::tool::DenyAll))?;
             let mut limits = Limits::default();
@@ -105,6 +110,8 @@ impl OneShotExecutor for SessionOneShot {
             limits.max_output_tokens = output_tokens;
             let session = crate::Session::builder_arc(client, runtime)
                 .kind(crate::SessionKind::OneShot)
+                .prompt_config(prompt_config)
+                .materialized_system(context.system().to_owned())
                 .limits(limits)
                 .auditor(FunctionalAudit {
                     raw: auditor,

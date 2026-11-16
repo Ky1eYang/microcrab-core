@@ -7,6 +7,10 @@ use serde::{Deserialize, Serialize};
 /// The child owns RoundCompleted hooks; callers validate the functional result.
 #[async_trait::async_trait]
 pub trait OneShotExecutor: Send + Sync {
+    /// The issuing Session supplies a frozen helper configuration.
+    fn prompt_config(&self) -> crate::context::system::PromptConfig {
+        Default::default()
+    }
     /// Seal operation admission, cancel outstanding work and await cleanup ACKs.
     async fn close(&self) -> Result<(), Error> {
         Ok(())
@@ -26,6 +30,48 @@ pub(crate) mod auto_compact;
 pub(crate) mod compact;
 mod prompt;
 pub(crate) mod rename;
+
+pub(crate) fn validate_template(
+    template: &str,
+    names: &[&str],
+    maximum: usize,
+) -> Result<(), Error> {
+    let bindings: Vec<_> = names.iter().map(|name| (*name, "binding")).collect();
+    let rendered = prompt::interpolate(template, &bindings, maximum)?;
+    if rendered.trim().is_empty() {
+        return Err(Error::config("functional prompt must be nonempty"));
+    }
+    Ok(())
+}
+
+pub(crate) fn prepare_configured(
+    name: &str,
+    source: Source,
+    issuer: &Content,
+    bindings: &[(&str, &str)],
+    config: &crate::context::system::PromptConfig,
+) -> Result<Content, Error> {
+    let entry = BUILTINS
+        .iter()
+        .find(|entry| entry.name == name && entry.source == source)
+        .ok_or_else(|| Error::config("unknown functional subagent for this source"))?;
+    let template = match name {
+        "compact" => &config.compact_template,
+        "auto_compact" => &config.auto_compact_template,
+        "rename" => &config.rename_template,
+        "action_review" => &config.action_review_template,
+        _ => return Err(Error::config("unknown configured helper")),
+    };
+    entry.definition().prepare_markdown(
+        if template.is_empty() {
+            entry.prompt
+        } else {
+            template
+        },
+        issuer,
+        bindings,
+    )
+}
 
 const BUILTINS: &[Builtin] = &[
     compact::BUILTIN,

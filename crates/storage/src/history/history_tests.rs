@@ -17,6 +17,7 @@ fn recover(epoch: u64, label: &str) -> Recover {
         workspace: None,
         cache_report: None,
         agent: None,
+        prompt_config: None,
     }
 }
 #[tokio::test]

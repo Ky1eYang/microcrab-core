@@ -77,7 +77,7 @@ fn unresolved_variables_fail_strictly_instead_of_disappearing() {
 fn optional_values_remain_guarded_and_defaults_do_not_hide_required_values() {
     assert_eq!(
         render(
-            "{% if agent is defined %}present{% else %}absent{% endif %}|{{ missing | default(value=\"fallback\") }}",
+            "{% if agent is defined %}present{% else %}absent{% endif %}|{{ client_prompt | default(value=\"fallback\") }}",
             None,
         )
         .unwrap(),
@@ -106,8 +106,11 @@ fn injected_strings_are_literal_and_nonempty_valid_templates_are_required() {
         render("{{ agent.literal }}", Some(&info)).unwrap(),
         "{{ missing }}{% if missing %}<raw> & intact{% endif %}"
     );
+    assert_eq!(
+        render("", None).unwrap(),
+        render(DEFAULT_SYSTEM, None).unwrap()
+    );
     for template in [
-        "",
         " \n\t",
         "{% if true %}",
         "{{",
@@ -134,7 +137,7 @@ fn arbitrary_structured_agent_values_render_exactly_without_stringification_or_a
     info.variables.inject("payload", &payload).unwrap();
     assert_eq!(info.variables.get("payload"), Some(&payload));
     assert_eq!(render(
-        "{{ agent.payload.enabled }}|{{ agent.payload.count }}|{{ agent.payload.ratio }}|{{ agent.payload.nested.label }}|{% for entry in agent.payload.entries %}{{ entry.name }}={{ entry.value }};{% endfor %}|{{ agent.payload.optional | json_encode }}",
+        "{{ agent.payload.enabled }}|{{ agent.payload.count }}|{{ agent.payload.ratio }}|{{ agent.payload.nested.label }}|{{ agent.payload.entries[0].name }}={{ agent.payload.entries[0].value }};{{ agent.payload.entries[1].name }}={{ agent.payload.entries[1].value }};|{{ agent.payload.optional | json_encode }}",
         Some(&info),
     ).unwrap(), "true|7|1.5|<typed> & intact|alpha=2;beta=3;|null");
     assert_eq!(
@@ -203,6 +206,118 @@ impl Client for Capture {
         })
     }
 }
+#[tokio::test]
+async fn public_one_shot_builder_renders_explicit_system() {
+    let session = Session::builder_arc(Arc::new(Capture::default()), runtime())
+        .kind(microcrab_session::SessionKind::OneShot)
+        .system("PUBLIC {{ client_prompt }}")
+        .client_prompt("  {{ literal }} ")
+        .build()
+        .unwrap();
+    assert_eq!(
+        session.context_snapshot().unwrap().system,
+        "PUBLIC   {{ literal }} "
+    );
+    assert!(
+        Session::builder_arc(Arc::new(Capture::default()), runtime())
+            .kind(microcrab_session::SessionKind::OneShot)
+            .system("{{ missing }}")
+            .build()
+            .is_err()
+    );
+    session.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn prompt_snapshot_survives_restore_fork_and_configures_real_helpers() {
+    use microcrab_session::context::system::PromptConfig;
+    use microcrab_session::runtime::journal::MemoryJournal;
+    let config = PromptConfig {
+        system_template: "FROZEN {{ client_prompt }}".into(),
+        client_prompt: "  {{ authored_literal }}\n".into(),
+        rename_template: "CUSTOM RENAME {{ user_input }}".into(),
+        compact_template: "CUSTOM COMPACT {{ user_input }}".into(),
+        ..Default::default()
+    };
+    let journal = MemoryJournal::new();
+    let client = Arc::new(Capture::default());
+    let source = Session::builder_arc(client.clone(), runtime())
+        .session_id("prompt-source")
+        .prompt_config(config.clone())
+        .journal(journal.clone())
+        .build()
+        .unwrap();
+    source.submit("first").await.unwrap();
+    let frozen = source.context_snapshot().unwrap().system;
+    source.rename_with_model("{{ nested }}").await.unwrap();
+    assert_eq!(
+        client.0.lock().unwrap().last().unwrap().system,
+        "CUSTOM RENAME {{ nested }}"
+    );
+    source
+        .compact_with_model("literal {{ missing }}", json!({}))
+        .await
+        .unwrap();
+    let requests = client.0.lock().unwrap().clone();
+    let compact = requests.last().unwrap();
+    assert_eq!(compact.system, frozen);
+    assert!(
+        serde_json::to_string(&compact.items)
+            .unwrap()
+            .contains("CUSTOM COMPACT literal {{ missing }}")
+    );
+    let checkpoint = journal.latest().unwrap();
+    assert_eq!(checkpoint.prompt_config.as_ref(), Some(&config));
+    let before_recover = serde_json::to_value(source.context_snapshot().unwrap()).unwrap();
+    let mut incompatible = checkpoint.clone();
+    incompatible.prompt_config.as_mut().unwrap().client_prompt = "replacement".into();
+    assert!(source.recover(incompatible).await.is_err());
+    assert_eq!(source.prompt_config(), &config);
+    assert_eq!(
+        serde_json::to_value(source.context_snapshot().unwrap()).unwrap(),
+        before_recover
+    );
+    let restored = Session::restore(
+        Session::builder_arc(client.clone(), runtime())
+            .session_id("prompt-restored")
+            .system("{{ invalid_new_default }}"),
+        checkpoint.clone(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(restored.prompt_config(), &config);
+    assert_eq!(restored.context_snapshot().unwrap().system, frozen);
+    let fork = restored
+        .fork(
+            Session::builder_arc(client.clone(), runtime())
+                .session_id("prompt-fork")
+                .client_prompt("replacement"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(fork.prompt_config(), &config);
+    assert_eq!(
+        serde_json::to_value(fork.context_snapshot().unwrap()).unwrap(),
+        serde_json::to_value(restored.context_snapshot().unwrap()).unwrap()
+    );
+    let mut legacy = checkpoint;
+    legacy.prompt_config = None;
+    let old = Session::restore(
+        Session::builder_arc(client, runtime())
+            .session_id("prompt-legacy")
+            .client_prompt("new default must not apply"),
+        legacy,
+    )
+    .await
+    .unwrap();
+    assert_eq!(old.prompt_config(), &PromptConfig::default());
+    assert_eq!(old.context_snapshot().unwrap().system, frozen);
+    old.close().await.unwrap();
+    fork.close().await.unwrap();
+    restored.close().await.unwrap();
+    source.close().await.unwrap();
+}
+
 fn runtime() -> Runtime {
     Runtime::new(vec![], Arc::new(DenyAll)).unwrap()
 }

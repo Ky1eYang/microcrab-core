@@ -28,7 +28,7 @@ pub(crate) async fn run(
     }
     let tool_args =
         serde_json::to_string(&permission.arguments).map_err(|_| PermissionError::Review)?;
-    let request = super::prepare(
+    let request = super::prepare_configured(
         BUILTIN.name,
         Source::System,
         issuer,
@@ -38,6 +38,7 @@ pub(crate) async fn run(
             ("tool_name", permission.tool.as_str()),
             ("tool_args", tool_args.as_str()),
         ],
+        &executor.prompt_config(),
     )
     .map_err(|_| PermissionError::Review)?;
     let response = executor

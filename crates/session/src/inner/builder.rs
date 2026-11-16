@@ -8,7 +8,13 @@ impl SessionInner {
         if let Some((policy, _)) = &parts.auto_compaction {
             policy.validate()?;
         }
-        let system = crate::context::system::render(&parts.system, parts.agent.as_ref())?;
+        let system = match parts.materialized_system {
+            Some(system) => {
+                parts.prompt_config.validate()?;
+                system
+            }
+            None => parts.prompt_config.render_system(parts.agent.as_ref())?,
+        };
         let context = Context::new(
             system,
             parts.runtime.definitions(),
@@ -148,7 +154,10 @@ impl SessionInner {
                     Error::config_with_private(error.public_reason(), error.to_string())
                 })?;
         }
-        let one_shots = Arc::new(functional::one_shot::SessionOneShot::default());
+        let one_shots = Arc::new(functional::one_shot::SessionOneShot {
+            prompt_config: parts.prompt_config.clone(),
+            ..Default::default()
+        });
         controller
             .bind_one_shot_executor(one_shots.clone())
             .map_err(|e| Error::config_with_private(e.public_reason(), e.to_string()))?;
@@ -175,6 +184,7 @@ impl SessionInner {
                 weak.clone();
             parts.runtime.bind_delegate_parent(parent);
             Self {
+                prompt_config: parts.prompt_config,
                 kind: parts.kind,
                 one_shot_claimed: AtomicBool::new(false),
                 delegation_completion: Mutex::new(None),

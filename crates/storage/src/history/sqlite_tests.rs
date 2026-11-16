@@ -76,6 +76,7 @@ fn checkpoint(epoch: u64, label: &str) -> CreatorEnvelope {
             workspace: None,
             cache_report: None,
             agent: None,
+            prompt_config: None,
         },
         request_head: None,
         model_selection: None,

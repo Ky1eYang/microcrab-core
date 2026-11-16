@@ -38,6 +38,7 @@ struct SessionClose {
 }
 
 pub(crate) struct SessionInner {
+    pub(crate) prompt_config: crate::context::system::PromptConfig,
     pub(crate) kind: crate::SessionKind,
     pub(crate) one_shot_claimed: AtomicBool,
     delegation_completion: Mutex<
@@ -136,7 +137,8 @@ pub(crate) struct SessionParts {
     pub round_limit_callback: Option<Arc<dyn crate::budget::RoundLimitCallback>>,
     pub attachment_resolver: Option<Arc<dyn crate::admission::image::AttachmentResolver>>,
     pub runtime: Runtime,
-    pub system: String,
+    pub prompt_config: crate::context::system::PromptConfig,
+    pub materialized_system: Option<String>,
     pub limits: Limits,
     pub agent: Option<AgentInfo>,
     pub auditor: Arc<dyn Auditor>,

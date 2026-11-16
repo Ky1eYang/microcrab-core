@@ -319,6 +319,7 @@ mod failure_cause_tests {
                 workspace: None,
                 cache_report: None,
                 agent: None,
+                prompt_config: None,
             },
             request_head: None,
             model_selection: None,

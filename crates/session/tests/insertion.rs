@@ -329,6 +329,7 @@ async fn continuation_preserves_total_ordinal_and_unattended_count() {
             workspace: None,
             cache_report: None,
             agent: None,
+            prompt_config: None,
         },
     )
     .await

@@ -1,6 +1,6 @@
 //! Session admission, dynamic backend assembly and caller-visible stream ownership.
 use crate::ModelEvent;
-use crate::context::{ContentItem, system::DEFAULT_SYSTEM};
+use crate::context::{ContentItem, system::PromptConfig};
 use crate::inner::{SessionInner, SessionParts};
 use crate::runtime::{
     Runtime, TurnOutcome,
@@ -103,7 +103,8 @@ pub struct SessionBuilder {
     )>,
     review_client: Option<Arc<dyn Client>>,
     runtime: Runtime,
-    system: String,
+    prompt_config: PromptConfig,
+    materialized_system: Option<String>,
     limits: Limits,
     agent: Option<microcrab_agent_types::AgentInfo>,
     auditor: Arc<dyn Auditor>,
@@ -172,7 +173,8 @@ impl Session {
             auto_compaction: None,
             review_client: None,
             runtime,
-            system: DEFAULT_SYSTEM.to_owned(),
+            prompt_config: PromptConfig::default(),
+            materialized_system: None,
             limits: Limits::default(),
             agent: None,
             auditor: Arc::new(ChannelAuditor::disconnected()),
@@ -195,6 +197,9 @@ impl Session {
     }
 }
 impl Session {
+    pub fn prompt_config(&self) -> &PromptConfig {
+        &self.inner.prompt_config
+    }
     pub fn kind(&self) -> SessionKind {
         self.inner.kind
     }
@@ -813,6 +818,10 @@ impl Session {
     /// move. Initialization loads live references and emits SessionRestored when
     /// the Session starts; legacy workspace bytes remain inert.
     pub async fn restore(mut builder: SessionBuilder, recover: Recover) -> Result<Self, Error> {
+        // Frozen Context is installed below; creation must never render a mutable
+        // replacement SYSTEM or require Agent values no longer present in it.
+        builder.prompt_config = recover.prompt_config.clone().unwrap_or_default();
+        builder.materialized_system = Some(recover.context.system.clone());
         if let Some(kind) = recover.state.session_kind {
             if builder.kind.is_some_and(|configured| configured != kind) {
                 return Err(Error::config(
@@ -901,8 +910,20 @@ impl SessionBuilder {
         self.host = Some(host);
         self
     }
+    pub(crate) fn materialized_system(mut self, system: String) -> Self {
+        self.materialized_system = Some(system);
+        self
+    }
+    pub fn prompt_config(mut self, config: PromptConfig) -> Self {
+        self.prompt_config = config;
+        self
+    }
+    pub fn client_prompt(mut self, prompt: impl Into<String>) -> Self {
+        self.prompt_config.client_prompt = prompt.into();
+        self
+    }
     pub fn system(mut self, system: impl Into<String>) -> Self {
-        self.system = system.into();
+        self.prompt_config.system_template = system.into();
         self
     }
     /// Bind a creator's provider routing without adding creator metadata to core State.
@@ -973,7 +994,8 @@ impl SessionBuilder {
                 round_limit_callback: self.round_limit_callback,
                 attachment_resolver: self.attachment_resolver,
                 runtime: self.runtime,
-                system: self.system,
+                prompt_config: self.prompt_config.resolved(),
+                materialized_system: self.materialized_system,
                 limits: self.limits,
                 agent: self.agent,
                 auditor: self.auditor,

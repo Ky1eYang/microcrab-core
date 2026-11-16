@@ -663,6 +663,7 @@ async fn fork_rejects_suspended_recovery_continuation() {
             workspace: None,
             cache_report: None,
             agent: None,
+            prompt_config: None,
         },
     )
     .await

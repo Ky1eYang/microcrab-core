@@ -16,6 +16,7 @@ fn recover(context: &Context) -> Recover {
         workspace: None,
         cache_report: None,
         agent: None,
+        prompt_config: None,
     }
 }
 

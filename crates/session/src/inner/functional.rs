@@ -132,7 +132,6 @@ impl SessionInner {
                     Arc::new(variables),
                     &issued,
                     &user_input,
-                    &limits,
                     &cancellation,
                 ))
                 .catch_unwind()

@@ -46,3 +46,7 @@ Hints are not ordered and carry no precedence over one another by position. Appl
 {% endfor %}
 {% endif %}
 {% endif %}
+{% if client_prompt is defined and client_prompt %}
+# Client Instructions
+{{ client_prompt | safe }}
+{% endif %}

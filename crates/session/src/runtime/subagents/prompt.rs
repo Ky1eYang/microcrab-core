@@ -49,7 +49,11 @@ impl Definition {
     }
 }
 
-fn interpolate(template: &str, bindings: &[(&str, &str)], maximum: usize) -> Result<String, Error> {
+pub(super) fn interpolate(
+    template: &str,
+    bindings: &[(&str, &str)],
+    maximum: usize,
+) -> Result<String, Error> {
     for (index, (name, _)) in bindings.iter().enumerate() {
         if name.is_empty()
             || !name.bytes().enumerate().all(|(index, byte)| {

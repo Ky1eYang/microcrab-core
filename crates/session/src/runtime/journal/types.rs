@@ -130,6 +130,8 @@ impl From<AgentInfo> for HistoricalAgent {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Recover {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_config: Option<crate::context::system::PromptConfig>,
     pub state: SessionState,
     pub context: ContextSnapshot,
     pub continuation: Option<RoundContinuation>,
@@ -165,6 +167,9 @@ pub struct RoundContinuation {
 impl Recover {
     pub fn validate(&self) -> Result<(), Error> {
         self.context.validate()?;
+        if let Some(config) = &self.prompt_config {
+            config.validate()?;
+        }
         if let Some(report) = &self.cache_report {
             report.validate()?;
         }

@@ -70,6 +70,53 @@ fn child_config(
 }
 
 #[tokio::test]
+async fn delegated_prompt_snapshot_uses_child_agent_and_rejects_before_allocation() {
+    use crate::delegate::ChildFactory;
+    use microcrab_session::context::system::PromptConfig;
+    let root = tempfile::tempdir().unwrap();
+    let parent = Session::builder(
+        Answer,
+        Runtime::new(vec![], Arc::new(DeclarativePermission)).unwrap(),
+    )
+    .build()
+    .unwrap();
+    let mut config = child_config(root.path(), Arc::new(Answer), Children::default());
+    config.catalog[0]
+        .variables
+        .inject("description", "selected child")
+        .unwrap();
+    let invalid = NativeChildFactory::new(config.clone()).prompt_config(PromptConfig {
+        system_template: "{{ agent.required }}".into(),
+        ..Default::default()
+    });
+    assert!(
+        invalid
+            .create(None, "review", None, "clean", parent.process_control())
+            .await
+            .is_err()
+    );
+    assert!(!root.path().join("sessions/subsessions").exists());
+    let prompts = PromptConfig {
+        system_template: "{{ agent.description }}|{{ client_prompt }}".into(),
+        client_prompt: "  {{ literal }} ".into(),
+        rename_template: "CHILD NAME {{ user_input }}".into(),
+        ..Default::default()
+    };
+    let factory = NativeChildFactory::new(config).prompt_config(prompts.clone());
+    let child = factory
+        .create(None, "review", None, "clean", parent.process_control())
+        .await
+        .unwrap();
+    assert_eq!(child.session.prompt_config(), &prompts);
+    assert_eq!(
+        child.session.context_snapshot().unwrap().system,
+        "selected child|  {{ literal }} "
+    );
+    child.session.close().await.unwrap();
+    parent.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn native_delegate_assembles_without_python_and_settles_before_close() {
     let directory = tempfile::tempdir().unwrap();
     let children = Children::default();

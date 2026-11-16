@@ -16,6 +16,7 @@ fn session() -> SessionRecord {
         mode: Some("plan".into()),
         model_selection: None,
         auto_compaction: None,
+        prompt_config: None,
         permissions: vec![],
         initialization: microcrab_permission::Action::Ask,
         review: true,
@@ -600,6 +601,7 @@ fn recover(epoch: u64, label: &str) -> microcrab_session::Recover {
         workspace: None,
         cache_report: None,
         agent: None,
+        prompt_config: None,
     }
 }
 async fn settlement_head_fence(

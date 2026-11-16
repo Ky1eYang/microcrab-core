@@ -136,6 +136,7 @@ impl SessionInner {
             workspace: None,
             cache_report: None,
             agent: self.agent.clone().map(Into::into),
+            prompt_config: Some(self.prompt_config.clone()),
         };
         recover.validate()?;
         let mut guard = FaultOnDrop {

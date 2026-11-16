@@ -52,6 +52,7 @@ fn recover(with_metadata: bool) -> Recover {
         workspace: None,
         cache_report: None,
         agent: None,
+        prompt_config: None,
     }
 }
 

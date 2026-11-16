@@ -45,6 +45,7 @@ fn neutral_recover() -> Recover {
         workspace: None,
         cache_report: None,
         agent: None,
+        prompt_config: None,
     }
 }
 async fn commit_neutral(journal: &CreatorJournal) -> JournalCursor {

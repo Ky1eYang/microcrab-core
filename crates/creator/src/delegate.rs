@@ -121,6 +121,7 @@ pub trait ChildConfiguration: Send + Sync {
 #[derive(Clone)]
 pub struct NativeChildFactory {
     config: NativeDelegateConfig,
+    prompt_config: Option<microcrab_session::context::system::PromptConfig>,
     external_source: Option<Arc<dyn ExternalToolSource>>,
     display_factory: Option<Arc<dyn ChildDisplayFactory>>,
     child_configuration: Option<Arc<dyn ChildConfiguration>>,
@@ -130,9 +131,17 @@ pub struct NativeChildFactory {
 }
 
 impl NativeChildFactory {
+    pub fn prompt_config(
+        mut self,
+        config: microcrab_session::context::system::PromptConfig,
+    ) -> Self {
+        self.prompt_config = Some(config);
+        self
+    }
     pub fn new(config: NativeDelegateConfig) -> Self {
         Self {
             config,
+            prompt_config: None,
             external_source: None,
             display_factory: None,
             child_configuration: None,
@@ -189,6 +198,7 @@ impl NativeChildFactory {
             children,
             Arc::new(Self {
                 config,
+                prompt_config: None,
                 external_source: Some(source),
                 display_factory: None,
                 child_configuration: None,
@@ -256,6 +266,11 @@ impl ChildFactory for NativeChildFactory {
     ) -> Result<ChildSession, Error> {
         let config = &self.config;
         let (agent, mode) = select_child(&config.catalog, caller_mode, target, requested_mode)?;
+        let mut prompts = self.prompt_config.clone().unwrap_or_default();
+        if let Some(system) = &config.system {
+            prompts.system_template = system.clone();
+        }
+        prompts.render_system(Some(&agent))?;
         let parent = config.directory.clone();
         let (id, directory) =
             tokio::task::spawn_blocking(move || crate::paths::reserve_child(&parent))
@@ -349,6 +364,9 @@ impl ChildFactory for NativeChildFactory {
         }
         if let Some(resolver) = &self.attachment_resolver {
             builder = builder.attachment_resolver(resolver.clone());
+        }
+        if let Some(prompt_config) = &self.prompt_config {
+            builder = builder.prompt_config(prompt_config.clone());
         }
         if let Some(system) = &config.system {
             builder = builder.system(system.clone());

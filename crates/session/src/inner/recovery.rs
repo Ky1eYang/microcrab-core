@@ -103,6 +103,7 @@ impl SessionInner {
                 .unwrap_or_else(|error| error.into_inner())
                 .clone(),
             agent: self.agent.clone().map(Into::into),
+            prompt_config: Some(self.prompt_config.clone()),
         };
         recover.validate()?;
         self.commit_recover(recover).await?;
@@ -140,6 +141,7 @@ impl SessionInner {
             workspace: None,
             cache_report: None,
             agent: self.agent.clone().map(Into::into),
+            prompt_config: Some(self.prompt_config.clone()),
         };
         recover.validate()?;
         let mut commit_guard = FaultOnDrop {
@@ -236,6 +238,7 @@ impl SessionInner {
             workspace: None,
             cache_report,
             agent: self.agent.clone().map(Into::into),
+            prompt_config: Some(self.prompt_config.clone()),
         };
         recover.validate()?;
         if preserve_selection {
@@ -365,6 +368,11 @@ impl SessionInner {
         definitions: &[microcrab_protocol::ToolDefinition],
     ) -> Result<Context, Error> {
         recover.validate()?;
+        if recover.prompt_config.clone().unwrap_or_default().resolved() != self.prompt_config {
+            return Err(Error::config(
+                "recovery prompt configuration differs from the frozen Session",
+            ));
+        }
         if recover
             .state
             .session_kind
@@ -980,6 +988,7 @@ impl RoundRecorder for SessionInner {
                 .unwrap_or_else(|error| error.into_inner())
                 .clone(),
             agent: self.agent.clone().map(Into::into),
+            prompt_config: Some(self.prompt_config.clone()),
         };
         recover.validate()?;
         admission.validate(&recover)?;

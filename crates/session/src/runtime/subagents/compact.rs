@@ -55,7 +55,8 @@ pub(super) async fn run_builtin(
     name: &str,
     source: Source,
 ) -> Result<Response, Error> {
-    let request = super::prepare(name, source, issuer, bindings)?;
+    let request =
+        super::prepare_configured(name, source, issuer, bindings, &executor.prompt_config())?;
     let response = tokio::select! {
         biased;
         _ = cancellation.cancelled() => return Err(Error::Cancelled),

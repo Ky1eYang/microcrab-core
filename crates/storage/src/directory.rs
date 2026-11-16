@@ -51,6 +51,8 @@ pub struct SessionRecord {
     pub model_selection: Option<ModelSelection>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_compaction: Option<microcrab_session::context::AutoCompactionPolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_config: Option<microcrab_session::context::system::PromptConfig>,
     pub permissions: Vec<Permission>,
     #[serde(default = "default_initialization")]
     pub initialization: microcrab_permission::Action,
@@ -257,6 +259,9 @@ impl SessionRecord {
         }) {
             return Err(invalid());
         }
+        if let Some(config) = &self.prompt_config {
+            config.validate()?;
+        }
         if let Some(policy) = &self.auto_compaction {
             policy.validate().map_err(|_| invalid())?;
         }
@@ -284,6 +289,7 @@ impl SessionRecord {
             || revision.checked_add(1) != Some(next.revision)
             || self.project_id != next.project_id
             || self.project_root != next.project_root
+            || self.prompt_config != next.prompt_config
             || self.created_at_ms != next.created_at_ms
             || next.updated_at_ms < self.updated_at_ms
         {
