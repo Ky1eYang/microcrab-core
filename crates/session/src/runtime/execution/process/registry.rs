@@ -31,6 +31,7 @@ use tracing::Instrument;
 pub struct ProcessId(pub u64);
 
 pub struct OwnedProcess {
+    redaction: super::super::InvocationRedaction,
     pub process_id: ProcessId,
     pub tool_name: String,
     pub session_id: String,
@@ -321,11 +322,11 @@ impl ProcessRegistry {
             let result = owner.close_session(&session).await;
             {
                 let mut contents = owner.contents.lock().unwrap_or_else(|e| e.into_inner());
-                if !owner.sealed.load(Ordering::Acquire) {
-                    if let Some(budget) = contents.sessions.get_mut(&session) {
-                        budget.sealed = false;
-                        budget.stopping = CancellationToken::new();
-                    }
+                if !owner.sealed.load(Ordering::Acquire)
+                    && let Some(budget) = contents.sessions.get_mut(&session)
+                {
+                    budget.sealed = false;
+                    budget.stopping = CancellationToken::new();
                 }
             }
             owner.signal();
@@ -665,6 +666,7 @@ impl ProcessRegistry {
         cancellation: CancellationToken,
         pending: &mut Option<ProcessHandle>,
         launch_handle: &Mutex<Option<ProcessHandle>>,
+        redaction: super::super::InvocationRedaction,
     ) -> Result<ProcessHandle, Error> {
         let admission_token = CancellationToken::new();
         let session_stopping = self
@@ -696,7 +698,7 @@ impl ProcessRegistry {
             _ = cancellation.cancelled() => { admission_token.cancel(); spawn.await },
             result = &mut spawn => result,
         }
-        .map_err(host_error)?;
+        .map_err(|error| redacted_host_error(error, &redaction))?;
         *pending = Some(handle);
         *launch_handle.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
         self.pending
@@ -716,10 +718,12 @@ impl ProcessRegistry {
             return Err(Error::Cancelled);
         }
         // Subscribe before the first status so completion cannot fall between them.
-        let changes = ProcessApi::watch(host.as_ref(), handle).map_err(host_error)?;
-        let status = self.status(host, handle, capture).await?;
+        let changes = ProcessApi::watch(host.as_ref(), handle)
+            .map_err(|error| redacted_host_error(error, &redaction))?;
+        let status = redact_process_status(self.status(host, handle, capture).await?, &redaction);
         let id = ProcessId(handle.0.0);
         let process = Arc::new(OwnedProcess {
+            redaction,
             process_id: id,
             tool_name: tool.into(),
             session_id: session_id.into(),
@@ -821,6 +825,7 @@ impl ProcessRegistry {
         all
     }
     fn update(&self, process: &OwnedProcess, status: SessionProcessStatus) {
+        let status = redact_process_status(status, &process.redaction);
         let changed = {
             let mut previous = process.status.lock().unwrap_or_else(|e| e.into_inner());
             let changed = previous.state != status.state || previous.closed != status.closed;
@@ -1138,6 +1143,19 @@ impl ProcessControl for ProcessRegistry {
             .upgrade()
             .expect("a live registry has an Arc owner")
     }
+    fn for_invocation(
+        &self,
+        redaction: super::super::InvocationRedaction,
+    ) -> Option<Arc<dyn ProcessControl>> {
+        let mut scoped = ScopedProcessControl::new(
+            self.registry(),
+            self.owner.clone(),
+            self.owner.clone(),
+            true,
+        );
+        scoped.redaction = redaction;
+        Some(Arc::new(scoped))
+    }
     fn scoped(&self, session_id: String, agent: String, is_main: bool) -> Arc<dyn ProcessControl> {
         let root = self
             .self_ref
@@ -1159,6 +1177,7 @@ impl ProcessControl for ProcessRegistry {
             call_id,
             Launch::Shell(request),
             cancellation,
+            super::super::InvocationRedaction::default(),
         )
         .await
     }
@@ -1176,6 +1195,7 @@ impl ProcessControl for ProcessRegistry {
             call_id,
             Launch::Process(spec),
             cancellation,
+            super::super::InvocationRedaction::default(),
         )
         .await
     }
@@ -1304,6 +1324,10 @@ impl ProcessRegistry {
         }
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Process launch retains distinct Session, Agent, invocation, cancellation and redaction owners"
+    )]
     async fn launch_scoped(
         &self,
         session_id: &str,
@@ -1312,6 +1336,7 @@ impl ProcessRegistry {
         call_id: &str,
         request: Launch,
         cancellation: CancellationToken,
+        redaction: super::super::InvocationRedaction,
     ) -> Result<ProcessHandle, Error> {
         let host = self
             .host
@@ -1368,6 +1393,7 @@ impl ProcessRegistry {
                 token.clone(),
                 &mut pending,
                 &launch_handle,
+                redaction.clone(),
             ))
             .catch_unwind()
             .await;
@@ -1391,10 +1417,12 @@ impl ProcessRegistry {
             if result.is_ok() {
                 admission.refund = None; // published ownership now carries the slot
             }
-            let result = result.map(|handle| LaunchReceipt {
-                owner: owner.clone(),
-                handle: Some(handle),
-            });
+            let result = result
+                .map_err(|error| redaction.redact_error(error))
+                .map(|handle| LaunchReceipt {
+                    owner: owner.clone(),
+                    handle: Some(handle),
+                });
             drop(admission);
             let _ = sender.send(result);
         });
@@ -1513,11 +1541,17 @@ impl ProcessRegistry {
                             owner.signal();
                             Ok(())
                         }
-                        Ok(Err(error)) => Err(host_error(error).tool_diagnostic()),
+                        Ok(Err(error)) => {
+                            Err(redacted_host_error(error, &attempt.process.redaction)
+                                .tool_diagnostic())
+                        }
                         Err(_) => {
                             Err(Error::tool("process release worker panicked").tool_diagnostic())
                         }
                     };
+                    let result = result.map_err(|diagnostic| {
+                        attempt.process.redaction.redact_diagnostic(diagnostic)
+                    });
                     if result.is_err() {
                         owner.cleanup_failed.store(true, Ordering::Release);
                     }
@@ -1615,6 +1649,7 @@ impl ProcessRegistry {
 
 #[derive(Clone)]
 pub struct ScopedProcessControl {
+    redaction: super::super::InvocationRedaction,
     registry: Arc<ProcessRegistry>,
     session_id: String,
     agent: Arc<Mutex<String>>,
@@ -1629,6 +1664,7 @@ impl ScopedProcessControl {
         is_main: bool,
     ) -> Self {
         Self {
+            redaction: super::super::InvocationRedaction::default(),
             registry,
             session_id,
             agent: Arc::new(Mutex::new(agent)),
@@ -1669,6 +1705,14 @@ impl ProcessControl for ScopedProcessControl {
     fn registry(&self) -> Arc<ProcessRegistry> {
         self.registry.clone()
     }
+    fn for_invocation(
+        &self,
+        redaction: super::super::InvocationRedaction,
+    ) -> Option<Arc<dyn ProcessControl>> {
+        let mut scoped = self.clone();
+        scoped.redaction = redaction;
+        Some(Arc::new(scoped))
+    }
     fn scoped(&self, session_id: String, agent: String, is_main: bool) -> Arc<dyn ProcessControl> {
         Arc::new(ScopedProcessControl::new(
             self.registry.clone(),
@@ -1693,6 +1737,7 @@ impl ProcessControl for ScopedProcessControl {
                 call_id,
                 Launch::Shell(request),
                 cancellation,
+                self.redaction.clone(),
             )
             .await
     }
@@ -1712,6 +1757,7 @@ impl ProcessControl for ScopedProcessControl {
                 call_id,
                 Launch::Process(spec),
                 cancellation,
+                self.redaction.clone(),
             )
             .await
     }
@@ -1745,6 +1791,34 @@ impl ProcessControl for ScopedProcessControl {
             .read_pipe_scoped(&self.session_id, handle, stderr, max, cancellation)
             .await
     }
+}
+fn redact_process_status(
+    mut status: SessionProcessStatus,
+    redaction: &super::super::InvocationRedaction,
+) -> SessionProcessStatus {
+    if let SessionProcessState::Failed { reason } = &mut status.state {
+        *reason = redaction.redact_text(reason);
+    }
+    status
+}
+fn redacted_host_error(
+    mut error: HostError,
+    redaction: &super::super::InvocationRedaction,
+) -> Error {
+    let auto_reason = microcrab_protocol::diagnostic::sanitize(&error.message, 2048);
+    let derived = error.public_reason.as_deref() == Some(auto_reason.as_str());
+    error.message = redaction.redact_text(&error.message);
+    error.public_reason = if derived {
+        Some(microcrab_protocol::diagnostic::sanitize(
+            &error.message,
+            2048,
+        ))
+    } else {
+        error
+            .public_reason
+            .map(|reason| redaction.redact_text(&reason))
+    };
+    redaction.redact_error(host_error(error))
 }
 fn host_error(error: HostError) -> Error {
     Error::from_host_error(ToolError::Host(error))
@@ -1814,6 +1888,7 @@ mod tests {
                 registry.contents.lock().unwrap().entries.insert(
                     ProcessId(id),
                     Arc::new(OwnedProcess {
+                        redaction: super::super::super::InvocationRedaction::default(),
                         process_id: ProcessId(id),
                         tool_name: "shell".into(),
                         session_id: "detached".into(),
@@ -1862,6 +1937,7 @@ mod tests {
             registry.contents.lock().unwrap().entries.insert(
                 ProcessId(1),
                 Arc::new(OwnedProcess {
+                    redaction: super::super::super::InvocationRedaction::default(),
                     process_id: ProcessId(1),
                     tool_name: "shell".into(),
                     session_id: "detached".into(),

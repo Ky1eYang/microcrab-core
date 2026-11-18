@@ -33,6 +33,32 @@ impl ToolContext {
         self.cancellation = cancellation;
         Ok(())
     }
+    /// Retain a cleanup receipt in this exact invocation before any resource effect.
+    pub fn retain_cleanup(&self, owner: Arc<dyn super::ExecutionController>) -> Result<(), Error> {
+        let id = self
+            .execution_id
+            .ok_or_else(|| Error::tool("cleanup requires an admitted execution"))?;
+        let registry = self.state.executions();
+        if self.state.is_attached() {
+            let progress = self.execution_progress.as_ref().ok_or_else(|| {
+                Error::tool("attached cleanup requires authoritative execution progress")
+            })?;
+            if !progress.belongs_to(&registry, id) {
+                return Err(Error::tool("cleanup owner does not match this invocation"));
+            }
+            progress.retain_cleanup(owner)
+        } else {
+            let row = registry.get(id)?;
+            if row.call_id != self.call_id
+                || row.session_id != self.session_id
+                || row.tool != self.tool
+            {
+                return Err(Error::tool("cleanup owner does not match this invocation"));
+            }
+            registry.retain_cleanup(id, owner)
+        }
+    }
+
     pub async fn complete_detached_output(&self, output: &ToolOutput) -> Result<(), Error> {
         if self.state.is_attached() {
             return Err(Error::tool("attached executions are completed by Runtime"));

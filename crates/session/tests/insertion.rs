@@ -160,14 +160,21 @@ async fn steer_batches_once_at_cap_then_queue_uses_a_new_turn() {
         assert_eq!(users(&seen[1]), ["first", "steer-a", "steer-b"]);
         assert_eq!(seen[0].turn_id, seen[1].turn_id);
         assert_eq!(seen[1].round, Some(2));
-        assert!(matches!(
-            seen[1].items[seen[1].items.len() - 3],
-            ContentItem::State(_)
-        ));
-        assert!(matches!(
-            seen[1].items.last(),
-            Some(ContentItem::User { source: None, .. })
-        ));
+        let suffix = &seen[1].items[seen[0].items.len()..];
+        assert_eq!(suffix.len(), 6);
+        assert!(
+            matches!(&suffix[0], ContentItem::Assistant { content, tool_calls, .. }
+            if content == "answer-1" && tool_calls.is_empty())
+        );
+        // Round refresh has its own changed-State suffix; every admitted Steer
+        // input additionally retains exactly one leading State and a v1 envelope.
+        assert!(matches!(&suffix[1], ContentItem::State(_)));
+        for (state, user, expected) in [(2, 3, "steer-a"), (4, 5, "steer-b")] {
+            assert!(matches!(&suffix[state], ContentItem::State(_)));
+            assert!(matches!(&suffix[user], ContentItem::User {
+                source: None, envelope: Some(microcrab_transport::CarrierEnvelopeVersion::V1), parts
+            } if parts == &vec![InputPart::Text { text: expected.into() }]));
+        }
     }
     client.release.add_permits(1);
     assert_eq!(turn.await.unwrap().unwrap().rounds, 2);

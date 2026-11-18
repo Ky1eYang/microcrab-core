@@ -199,6 +199,11 @@ impl Error {
     pub fn tool(reason: &'static str) -> Self {
         Self::Tool(ErrorReason::known(reason))
     }
+    /// A model-visible tool failure whose cause names keys, paths and types, never values.
+    pub fn tool_dynamic(reason: impl AsRef<str>) -> Self {
+        let reason = reason.as_ref();
+        Self::Tool(ErrorReason::with_private(reason, reason))
+    }
     pub fn tool_with_private(reason: &'static str, private: impl Into<String>) -> Self {
         Self::Tool(ErrorReason::with_private(reason, private))
     }

@@ -5,6 +5,11 @@ use crate::policy::{
 };
 
 impl ToolContext {
+    pub(crate) fn has_resolution_for(&self, proof: &crate::policy::AdmittedInvocation) -> bool {
+        self.resolved_arguments
+            .as_ref()
+            .is_some_and(|resolved| resolved.belongs_to(proof))
+    }
     /// Claim tool/lifecycle entry once. Internal Host operations and background
     /// continuations validate the retained proof without claiming another entry.
     pub fn begin_dispatch(&self, component: Option<&str>) -> Result<(), PermissionError> {
@@ -14,6 +19,11 @@ impl ToolContext {
             .begin_dispatch(self, component)
     }
     pub(crate) fn admitted_arguments(&self) -> Result<&Value, PermissionError> {
+        self.recorded_arguments()
+    }
+    /// Original admitted arguments for audit, descriptors and durable dispatch
+    /// records. Resolved secret values must never be copied into those owners.
+    pub fn recorded_arguments(&self) -> Result<&Value, PermissionError> {
         self.ensure_admitted(None)?;
         Ok(self
             .admission
@@ -21,8 +31,15 @@ impl ToolContext {
             .ok_or(PermissionError::Denied)?
             .original_arguments())
     }
+    /// Opaque per-invocation literal masking for trusted retention adapters.
+    pub fn redaction_handle(&self) -> super::super::execution::InvocationRedaction {
+        self.redaction.clone()
+    }
     pub fn ensure_admitted_arguments(&self, arguments: &Value) -> Result<(), PermissionError> {
         self.ensure_admitted(None)?;
+        if let Some(resolved) = &self.resolved_arguments {
+            return resolved.validate(self, arguments);
+        }
         self.admission
             .as_ref()
             .ok_or(PermissionError::Denied)?

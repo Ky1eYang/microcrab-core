@@ -6,6 +6,46 @@ mod inspect;
 
 pub const MAX_IMAGE_BYTES: usize = 20 * 1024 * 1024;
 pub const MAX_IMAGES_PER_INPUT: usize = 20;
+pub const MAX_IMAGES_PER_TOOL_OUTPUT: usize = 1;
+
+/// Context stores JSON numeric byte vectors: each byte and comma uses at most four
+/// bytes. One image's fixed framing/MIME overhead is bounded by admitted MIME types.
+pub(crate) fn tool_context_reservation(media_bytes: usize) -> usize {
+    if media_bytes == 0 {
+        0
+    } else {
+        media_bytes.saturating_mul(4).saturating_add(256)
+    }
+}
+
+/// Canonical tool history admits self-contained Data only, never transport hints.
+pub(crate) fn validate_tool_parts(parts: &[microcrab_protocol::InputPart]) -> Result<(), Error> {
+    use microcrab_protocol::{ImageSource, InputPart};
+    crate::budget::check(
+        crate::LimitKind::AttachmentCount,
+        parts
+            .iter()
+            .filter(|part| matches!(part, InputPart::Image { .. }))
+            .count(),
+        MAX_IMAGES_PER_TOOL_OUTPUT,
+    )?;
+    for part in parts {
+        match part {
+            InputPart::Text { .. } => {}
+            InputPart::Image {
+                source: ImageSource::Data { media_type, data },
+            } => {
+                validate_image(media_type, data)?;
+            }
+            InputPart::Image { .. } => {
+                return Err(Error::protocol(
+                    "tool history requires self-contained image Data",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
 pub const MAX_INPUT_IMAGE_BYTES: usize = 200 * 1024 * 1024;
 pub const MAX_IMAGE_PIXELS: u64 = 64_000_000;
 pub const MAX_IMAGE_DIMENSION: u32 = 8192;
@@ -28,6 +68,13 @@ pub struct ResolvedAttachment {
     pub data: Vec<u8>,
 }
 
+/// Optional stable public route hint. Canonical Context always retains Data.
+/// The embedder owns identity scope and must not disclose private carrier URLs.
+pub struct UploadedAttachment {
+    pub attachment_id: String,
+    pub public_url: Option<String>,
+}
+
 /// The embedding application owns identity scope, durable bytes and cancellation.
 #[async_trait]
 pub trait AttachmentResolver: Send + Sync {
@@ -36,6 +83,16 @@ pub trait AttachmentResolver: Send + Sync {
         id: &str,
         cancellation: CancellationToken,
     ) -> Result<ResolvedAttachment, Error>;
+
+    /// Optional upload authority; no upload occurs unless an embedder overrides it.
+    async fn upload_attachment(
+        &self,
+        _media_type: &str,
+        _data: &[u8],
+        _cancellation: CancellationToken,
+    ) -> Result<Option<UploadedAttachment>, Error> {
+        Ok(None)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

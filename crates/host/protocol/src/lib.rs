@@ -353,6 +353,16 @@ pub type HostReply = Result<Value, WireError>;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum WireFrame {
+    Inspect {
+        request: InspectRequest,
+    },
+    Inspected {
+        request_id: String,
+        result: Result<HostDescriptor, WireError>,
+    },
+    HandshakeRejected {
+        error: WireError,
+    },
     Pair {
         token: String,
         scope: BindingScope,
@@ -362,6 +372,10 @@ pub enum WireFrame {
         expected_host_id: Option<String>,
         #[serde(default)]
         expected_workspace_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_descriptor_digest: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_workspace_root: Option<String>,
     },
     Resume {
         credential: String,
@@ -372,6 +386,10 @@ pub enum WireFrame {
         expected_host_id: Option<String>,
         #[serde(default)]
         expected_workspace_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_descriptor_digest: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_workspace_root: Option<String>,
     },
     WorkspaceBound {
         descriptor: HostDescriptor,
@@ -494,6 +512,127 @@ mod tests {
         for method in ["shell", "start_job", "job_status", "job_release"] {
             let payload = serde_json::json!({"method": method, "params": {}});
             assert!(serde_json::from_value::<HostRequest>(payload).is_err());
+        }
+    }
+}
+
+/// Authentication for descriptor inspection grants no execution authority.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum InspectAuthentication {
+    Pair { token: String },
+    Resume { credential: String },
+}
+impl std::fmt::Debug for InspectAuthentication {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Pair { .. } => "Pair { token: [redacted] }",
+            Self::Resume { .. } => "Resume { credential: [redacted] }",
+        })
+    }
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InspectRequest {
+    pub request_id: String,
+    pub authentication: InspectAuthentication,
+    pub scope: BindingScope,
+    pub directory: Option<String>,
+    pub expected_host_id: Option<String>,
+    pub expected_workspace_id: Option<String>,
+}
+impl InspectRequest {
+    pub fn new(request_id: String, handshake: &WireFrame) -> Result<Self, WireError> {
+        let (authentication, scope, directory, expected_host_id, expected_workspace_id) =
+            match handshake {
+                WireFrame::Pair {
+                    token,
+                    scope,
+                    directory,
+                    expected_host_id,
+                    expected_workspace_id,
+                    ..
+                } => (
+                    InspectAuthentication::Pair {
+                        token: token.clone(),
+                    },
+                    scope,
+                    directory,
+                    expected_host_id,
+                    expected_workspace_id,
+                ),
+                WireFrame::Resume {
+                    credential,
+                    scope,
+                    directory,
+                    expected_host_id,
+                    expected_workspace_id,
+                    ..
+                } => (
+                    InspectAuthentication::Resume {
+                        credential: credential.clone(),
+                    },
+                    scope,
+                    directory,
+                    expected_host_id,
+                    expected_workspace_id,
+                ),
+                _ => {
+                    return Err(WireError::new(
+                        ErrorCode::InvalidRequest,
+                        "inspection requires Pair or Resume intent",
+                    ));
+                }
+            };
+        let request = Self {
+            request_id,
+            authentication,
+            scope: scope.clone(),
+            directory: directory.clone(),
+            expected_host_id: expected_host_id.clone(),
+            expected_workspace_id: expected_workspace_id.clone(),
+        };
+        request.validate()?;
+        Ok(request)
+    }
+    pub fn validate(&self) -> Result<(), WireError> {
+        if self.request_id.is_empty()
+            || self.request_id.len() > 128
+            || !self
+                .request_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+            || !self.scope.valid()
+            || !self.scope.is_project()
+        {
+            return Err(WireError::new(
+                ErrorCode::InvalidRequest,
+                "invalid inspection identity or scope",
+            ));
+        }
+        Ok(())
+    }
+    /// Reconstruct only the intended authentication, never an inspected execution grant.
+    pub fn handshake(&self) -> WireFrame {
+        match &self.authentication {
+            InspectAuthentication::Pair { token } => WireFrame::Pair {
+                token: token.clone(),
+                scope: self.scope.clone(),
+                directory: self.directory.clone(),
+                expected_host_id: self.expected_host_id.clone(),
+                expected_workspace_id: self.expected_workspace_id.clone(),
+                expected_descriptor_digest: None,
+                expected_workspace_root: None,
+            },
+            InspectAuthentication::Resume { credential } => WireFrame::Resume {
+                credential: credential.clone(),
+                scope: self.scope.clone(),
+                directory: self.directory.clone(),
+                expected_host_id: self.expected_host_id.clone(),
+                expected_workspace_id: self.expected_workspace_id.clone(),
+                expected_descriptor_digest: None,
+                expected_workspace_root: None,
+            },
         }
     }
 }

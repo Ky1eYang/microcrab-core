@@ -4,6 +4,8 @@ mod catalog;
 #[cfg(target_arch = "wasm32")]
 mod component;
 mod host;
+#[cfg(any(target_arch = "wasm32", test))]
+mod image;
 #[cfg(test)]
 mod tests;
 mod tools;

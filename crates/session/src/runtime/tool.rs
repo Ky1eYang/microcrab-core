@@ -4,6 +4,9 @@ mod catalog;
 mod context;
 pub mod delegate;
 pub mod expand;
+mod messaging;
+pub(crate) mod injection;
+pub(crate) mod secret;
 pub mod sleep;
 pub(crate) mod switch_mode;
 pub use authorization::{AllowTools, DenyAll};
@@ -38,14 +41,38 @@ pub struct ToolContext {
     pub interaction_timeout_ms: u64,
     pub execution_id: Option<super::execution::ExecutionId>,
     pub execution_progress: Option<super::execution::ExecutionProgress>,
+    resolved_arguments: Option<Arc<secret::ResolvedArguments>>,
+    pub(crate) literal_mask: injection::LiteralMask,
+    redaction: super::execution::InvocationRedaction,
     cache_scope: Option<super::cache::Scope>,
     cache_collector: Arc<super::cache::Collector>,
+}
+
+/// Argument delivery chosen by the trusted registered implementation, not by a
+/// model-supplied name. Human interaction adapters may forward placeholders to UI;
+/// ordinary native, WASM and plugin tools resolve them only after permission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SecretDelivery {
+    #[default]
+    Resolve,
+    ForwardPlaceholders,
 }
 
 /// A callable tool receives live state and invocation-scoped capabilities.
 #[async_trait]
 pub trait Tool: Send + Sync {
     fn definition(&self) -> ToolDefinition;
+    /// Only a trusted registered adapter may declare model/UI-facing delivery.
+    /// This is not a per-secret permission or a model-controlled tool-name rule.
+    fn secret_delivery(&self) -> SecretDelivery {
+        SecretDelivery::Resolve
+    }
+    /// Trusted registered implementation's maximum encoded image output.
+    /// Text tools keep zero. This declaration grants no Host or path permission.
+    fn media_output_bytes(&self) -> usize {
+        0
+    }
+
     /// Registered component identity binds admission to the actual implementation.
     fn component_identity(&self) -> Option<&str> {
         None
@@ -78,6 +105,8 @@ pub enum BuiltinTool {
     Sleep,
     Expand,
     SwitchMode,
+    SendMessage,
+    Escalate,
 }
 
 impl BuiltinTool {
@@ -88,6 +117,8 @@ impl BuiltinTool {
             "sleep" => Some(Self::Sleep),
             "expand" => Some(Self::Expand),
             "switch_mode" => Some(Self::SwitchMode),
+            "send_message" => Some(Self::SendMessage),
+            "escalate" => Some(Self::Escalate),
             _ => None,
         }
     }
@@ -99,6 +130,8 @@ impl BuiltinTool {
             Self::Sleep => sleep::Sleep.definition(),
             Self::Expand => expand::Expand.definition(),
             Self::SwitchMode => switch_mode::SwitchMode::definition(),
+            Self::SendMessage => messaging::SendMessage.definition(),
+            Self::Escalate => messaging::Escalate.definition(),
         }
     }
 
@@ -109,6 +142,8 @@ impl BuiltinTool {
             Self::Sleep => Arc::new(sleep::Sleep),
             Self::Expand => Arc::new(expand::Expand),
             Self::SwitchMode => Arc::new(switch_mode::SwitchMode),
+            Self::SendMessage => Arc::new(messaging::SendMessage),
+            Self::Escalate => Arc::new(messaging::Escalate),
         }
     }
 }

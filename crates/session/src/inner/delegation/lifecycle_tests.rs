@@ -27,6 +27,7 @@ impl Client for Answer {
 }
 fn agent() -> AgentInfo {
     AgentInfo {
+        tool_media_output_bytes: Default::default(),
         name: "worker".into(),
         modes: vec![AgentMode {
             name: "work".into(),
@@ -315,6 +316,7 @@ async fn requested_mode_applies_after_the_original_batch_and_before_the_next_req
         runtime,
     )
     .agent(AgentInfo {
+        tool_media_output_bytes: Default::default(),
         name: "mode-agent".into(),
         modes,
         tools: vec![],
@@ -356,6 +358,7 @@ async fn later_user_mode_selection_rejects_an_older_agent_transition() {
         .collect();
     let session = Session::builder(Answer, runtime)
         .agent(AgentInfo {
+            tool_media_output_bytes: Default::default(),
             name: "mode-race".into(),
             modes,
             tools: vec![],
@@ -578,5 +581,42 @@ async fn existing_child_controls_do_not_require_start_discovery_and_keep_policy_
         assert!(matches!(child.start().await,Err(Error::Closed)));
         assert!(parent.messages().iter().any(|item|matches!(item,crate::context::ContentItem::Tool {content,..} if serde_json::from_str::<serde_json::Value>(content).is_ok_and(|receipt|receipt["cleanup_acknowledged"]==true))));
         parent.close().await.unwrap();children.close().await.unwrap();
+    }).await.unwrap();
+}
+
+#[tokio::test]
+async fn return_child_publishes_one_reply_and_settles_only_after_cleanup_ack() {
+    tokio::time::timeout(std::time::Duration::from_secs(5),async {
+        struct ReturnScript(Mutex<bool>);
+        #[async_trait]
+        impl Client for ReturnScript {
+            async fn complete(&self,_:&crate::context::Content,_:&dyn Auditor,_:&dyn VariableView,_:CancellationToken)
+                ->Result<Response,microcrab_transport::Error>{
+                let first=std::mem::take(&mut*self.0.lock().unwrap());
+                Ok(Response{content:"parent".into(),provider_metadata:None,usage:Usage::default(),tool_calls:if first{
+                    vec![ToolCall{id:"return-work".into(),name:"delegate".into(),arguments:json!({"target":"worker","input":"focused task","interaction":"return"}),provider_metadata:None}]
+                }else{vec![]}})
+            }
+        }
+        let(sent,mut received)=mpsc::unbounded_channel();
+        let audit=Arc::new(FlushGate{entered:Notify::new(),release:Semaphore::new(0)});
+        let children=Children::default();
+        let runtime=crate::runtime::Runtime::new(vec![ToolRegistration::Builtin(BuiltinTool::Delegate)],Arc::new(AllowTools::new(["delegate"]))).unwrap()
+            .with_delegate_executor(Arc::new(OwnedDelegateExecutor::new(children.clone(),Arc::new(Factory{sent,audit:audit.clone()}))));
+        let parent=Session::builder(ReturnScript(Mutex::new(true)),runtime).catalog(vec![agent()]).build().unwrap();
+        parent.submit("run once").await.unwrap();
+        let child=received.recv().await.unwrap();
+        audit.entered.notified().await;
+        assert_eq!(child.communication_identity().unwrap().interaction,crate::state::communication::SessionInteraction::Return);
+        assert!(child.submit("forbidden").await.is_err());
+        assert!(child.queue("forbidden").is_err());
+        assert!(parent.executions().has_pending(),"flush acknowledgement still owns the parent execution");
+        audit.release.add_permits(4);
+        let mut changes=parent.executions().subscribe();
+        while parent.executions().has_pending(){changes.changed().await.unwrap();}
+        assert_eq!(child.subscribe_activity().borrow().outcome_sequence,1);
+        assert!(child.submit("after close").await.is_err());
+        children.close().await.unwrap();
+        parent.close().await.unwrap();
     }).await.unwrap();
 }

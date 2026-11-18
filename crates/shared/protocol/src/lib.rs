@@ -10,7 +10,7 @@ mod types;
 pub use hooks::{HookPayload, Moment};
 pub use types::{
     ImageSource, InputPart, ScopedVariableSet, SessionInput, VariableMetadata, VariablePersistence,
-    VariableRole, VariableVisibility, VariablesChange,
+    VariableRole, VariableVisibility, VariablesChange, secret_placeholder, valid_secret_key,
 };
 
 use serde::{Deserialize, Serialize};
@@ -68,6 +68,8 @@ pub enum Message {
     Tool {
         call_id: String,
         content: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        parts: Vec<InputPart>,
     },
 }
 

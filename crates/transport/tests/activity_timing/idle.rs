@@ -51,6 +51,7 @@ fn content(protocol: Protocol) -> Content {
         system: "system".into(),
         items: if protocol == Protocol::Google {
             vec![microcrab_transport::ContentItem::User {
+                envelope: None,
                 source: None,
                 parts: vec![microcrab_protocol::InputPart::Text {
                     text: "hello".into(),

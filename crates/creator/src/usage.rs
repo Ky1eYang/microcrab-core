@@ -341,6 +341,12 @@ impl Auditor for UsageAuditor {
     }
 }
 
+impl microcrab_session::DelegateUsage for UsageLedger {
+    fn total(&self) -> microcrab_protocol::Usage {
+        UsageLedger::total(self)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -518,11 +524,5 @@ mod tests {
         assert_eq!(reopened.snapshot(), live);
         assert!(!directory.path().join("usage.jsonl").exists());
         assert!(!directory.path().join("aggregate_usage.jsonl").exists());
-    }
-}
-
-impl microcrab_session::DelegateUsage for UsageLedger {
-    fn total(&self) -> microcrab_protocol::Usage {
-        UsageLedger::total(self)
     }
 }

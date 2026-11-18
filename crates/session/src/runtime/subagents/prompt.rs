@@ -40,6 +40,7 @@ impl Definition {
             rendered
         };
         content.items.push(ContentItem::User {
+            envelope: None,
             source: None,
             parts: vec![InputPart::Text { text }],
         });

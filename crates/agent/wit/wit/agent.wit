@@ -1,4 +1,4 @@
-package microcrab:agent@0.7.0;
+package microcrab:agent@0.8.0;
 
 /// Immutable discovery facts, available without operation grants.
 interface host-info {
@@ -13,7 +13,10 @@ interface execution {
   enum failure-kind { failed, timeout, cancelled }
   record tool-failure { kind: failure-kind, code: string, message: string, retryable: bool }
   resource buffer;
-  record final-output { content: string, failure: option<tool-failure> }
+  /// Copied binary output; Runtime validates media before Context admission.
+  record media-attachment { media-type: string, data: list<u8> }
+  /// Attachments belong only to Final; buffer append/finish remain UTF-8 output.
+  record final-output { content: string, failure: option<tool-failure>, attachments: list<media-attachment> }
   record buffered-output { output: own<buffer>, include-initial: bool }
   variant tool-output { final(final-output), buffered(buffered-output) }
   record driver-step { state: list<u8>, wake-after-ms: u64, finished: bool }

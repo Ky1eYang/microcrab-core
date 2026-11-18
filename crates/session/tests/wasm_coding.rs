@@ -665,7 +665,7 @@ async fn known_validation_reasons_override_guest_failure_in_context_and_audit_af
             .messages()
             .into_iter()
             .find_map(|item| match item {
-                ContentItem::Tool { call_id, content } if call_id == "safe-cause" => Some(content),
+                ContentItem::Tool { call_id, content, .. } if call_id == "safe-cause" => Some(content),
                 _ => None,
             })
             .unwrap();

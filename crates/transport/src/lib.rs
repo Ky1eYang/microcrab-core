@@ -10,6 +10,8 @@ mod failure;
 pub mod google;
 pub mod http;
 mod idle;
+pub mod media;
+pub use media::{ImageUrlResolver, MediaProjection};
 pub mod model_metadata;
 mod native_usage;
 mod observation;
@@ -26,9 +28,15 @@ pub(crate) mod sse;
 pub use anthropic::{Anthropic, AnthropicConfig};
 pub use client::{Client, ModelEvent};
 pub use config::{AuthMode, TransportConfig};
-pub use content::{Content, ContentItem, StateFrame, UserSource};
+pub use content::{
+    AgentExchange, CarrierEnvelopeVersion, Content, ContentItem, ExchangeIntent, StateFrame,
+    UserSource,
+};
 pub use dispatcher::{TransportClient, create_client};
-pub use error::{Error, IdleTimeout, ProtocolError, ProviderError, ProviderFailure};
+pub use error::{
+    EmptyCompletionFacts, EmptyCompletionFinish, Error, IdleTimeout, ProtocolError, ProviderError,
+    ProviderFailure,
+};
 pub use google::{Google, GoogleConfig};
 use microcrab_protocol::{Response, ToolDefinition};
 pub use model_metadata::{
@@ -46,12 +54,23 @@ pub use render::render_ast;
 pub use rewrite::{MAX_REQUEST_REWRITE_BYTES, validate_request_rewrite};
 use std::collections::HashSet;
 
+#[cfg(test)]
+mod empty_completion_tests;
+
 /// Shared decoded-response validation; history-dependent call-id reuse remains
 /// a Session concern, while each provider response validates on its own here.
 pub fn validate_response(response: &Response, tools: &[ToolDefinition]) -> Result<(), Error> {
+    validate_response_shape(response, tools)?;
     if response.content.trim().is_empty() && response.tool_calls.is_empty() {
         return Err(Error::protocol("empty assistant response"));
     }
+    Ok(())
+}
+
+pub(crate) fn validate_response_shape(
+    response: &Response,
+    tools: &[ToolDefinition],
+) -> Result<(), Error> {
     let mut ids = HashSet::new();
     for call in &response.tool_calls {
         if call.id.trim().is_empty() {
@@ -72,6 +91,39 @@ pub fn validate_response(response: &Response, tools: &[ToolDefinition]) -> Resul
         metadata
             .validate_projection(&response.content, &response.tool_calls)
             .map_err(|reason| Error::Protocol(reason.into()))?;
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_response_with_finish(
+    response: &Response,
+    tools: &[ToolDefinition],
+    finish: EmptyCompletionFinish,
+) -> Result<(), Error> {
+    validate_response_shape(response, tools)?;
+    if response.content.trim().is_empty() && response.tool_calls.is_empty() {
+        use microcrab_protocol::{AssistantPart, AssistantProviderMetadata};
+        let reasoning_present = match &response.provider_metadata {
+            Some(metadata) => {
+                let normalized = metadata
+                    .normalized(&response.content, &response.tool_calls)
+                    .map_err(|reason| Error::Protocol(reason.into()))?;
+                match normalized {
+                    AssistantProviderMetadata::Neutral { parts, .. } => parts.iter().any(|part| {
+                        matches!(part, AssistantPart::Reasoning { text } if !text.is_empty())
+                            || matches!(part, AssistantPart::RedactedReasoning)
+                    }),
+                    AssistantProviderMetadata::Google { .. } => unreachable!("normalized metadata"),
+                }
+            }
+            None => false,
+        };
+        return Err(Error::Provider(ProviderError::empty_completion(
+            EmptyCompletionFacts {
+                reasoning_present,
+                finish,
+            },
+        )));
     }
     Ok(())
 }

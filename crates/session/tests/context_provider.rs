@@ -64,6 +64,7 @@ fn state_epochs_keep_system_and_tools_and_preserve_text() {
     assert_eq!(
         content.items[1],
         ContentItem::User {
+            envelope: Some(microcrab_transport::CarrierEnvelopeVersion::V1),
             source: None,
             parts: vec![InputPart::Text {
                 text: "hello\n  world".into()
@@ -111,10 +112,11 @@ fn restored_framework_notice_keeps_source_and_state_first_batch() {
         .admit_user("notice </framework> literal", &json!({"cwd":"a"}))
         .unwrap();
     let mut snapshot = context.snapshot().unwrap();
-    let ContentItem::User { source, .. } = &mut snapshot.items[1] else {
+    let ContentItem::User { source, envelope, .. } = &mut snapshot.items[1] else {
         panic!("notice user item")
     };
     *source = Some(microcrab_transport::UserSource::Framework);
+    *envelope = None;
     let mut restored = Context::from_snapshot(snapshot).unwrap();
     restored.synchronize_state(&json!({"cwd":"b"})).unwrap();
     let content = restored.content(100).unwrap();

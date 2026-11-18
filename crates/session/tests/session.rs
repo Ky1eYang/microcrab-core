@@ -197,6 +197,7 @@ impl microcrab_session::runtime::tool::delegate::DelegateExecutor for ChildExecu
 
 fn delegate_catalog() -> Vec<microcrab_agent_types::AgentInfo> {
     vec![microcrab_agent_types::AgentInfo {
+        tool_media_output_bytes: Default::default(),
         name: "review".into(),
         modes: vec![microcrab_agent_types::AgentMode {
             description: String::new(),
@@ -298,35 +299,36 @@ async fn delegate_permission_denial_prevents_executor_dispatch() {
     let (session, client) = delegate_session(Some(executor.clone()), false);
     session.submit("inspect").await.unwrap();
     assert!(executor.calls.lock().unwrap().is_empty());
-    let seen = client.seen.lock().unwrap();
-    let result = seen[1]
-        .items
-        .iter()
-        .find_map(|item| match item {
-            microcrab_session::context::ContentItem::Tool { call_id, content }
-                if call_id == "delegate-call" =>
-            {
-                Some(serde_json::from_str::<serde_json::Value>(content).unwrap())
-            }
-            _ => None,
-        })
-        .expect("next model request contains the delegate denial");
-    // Denied delegate authority removes the target from the eligible catalog
-    // before ordinary invocation admission, so retain that concrete cause.
-    assert_eq!(
-        result,
-        json!({
-            "error": "delegate target has no authorized eligible modes",
-            "diagnostic": {
-                "code": "permission_denied",
-                "layer": "runtime",
-                "phase": "authorization",
-                "effects": "unknown",
-                "reason": "delegate target has no authorized eligible modes",
-            },
-        })
-    );
-    drop(seen);
+    {
+        let seen = client.seen.lock().unwrap();
+        let result = seen[1]
+            .items
+            .iter()
+            .find_map(|item| match item {
+                microcrab_session::context::ContentItem::Tool {
+                    call_id, content, ..
+                } if call_id == "delegate-call" => {
+                    Some(serde_json::from_str::<serde_json::Value>(content).unwrap())
+                }
+                _ => None,
+            })
+            .expect("next model request contains the delegate denial");
+        // Denied delegate authority removes the target from the eligible catalog
+        // before ordinary invocation admission, so retain that concrete cause.
+        assert_eq!(
+            result,
+            json!({
+                "error": "delegate target has no authorized eligible modes",
+                "diagnostic": {
+                    "code": "permission_denied",
+                    "layer": "runtime",
+                    "phase": "authorization",
+                    "effects": "unknown",
+                    "reason": "delegate target has no authorized eligible modes",
+                },
+            })
+        );
+    }
     session.close().await.unwrap();
 }
 

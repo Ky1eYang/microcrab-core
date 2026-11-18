@@ -5,6 +5,7 @@ mod commands;
 pub(crate) mod delegation;
 mod execution;
 pub(crate) use execution::OperationReservation;
+mod communication;
 mod configuration;
 mod fork;
 pub(crate) mod functional;
@@ -40,7 +41,19 @@ struct SessionClose {
 pub(crate) struct SessionInner {
     pub(crate) prompt_config: crate::context::system::PromptConfig,
     pub(crate) kind: crate::SessionKind,
+    directory: std::sync::RwLock<Arc<crate::runtime::messaging::LineageDirectory>>,
+    communication_transaction: Arc<tokio::sync::Mutex<()>>,
+    communication_loaded: AtomicBool,
+    durable_carrier_consumption: Mutex<
+        std::collections::BTreeMap<String, crate::state::communication::inbox::OperationReceipt>,
+    >,
+    recovered_child_reservations:
+        Mutex<std::collections::BTreeMap<String, crate::state::communication::AgentId>>,
     pub(crate) one_shot_claimed: AtomicBool,
+    #[expect(
+        clippy::type_complexity,
+        reason = "The optional watched cleanup receipt distinguishes absent, pending and acknowledged outcomes"
+    )]
     delegation_completion: Mutex<
         Option<
             tokio::sync::watch::Receiver<
@@ -56,6 +69,10 @@ pub(crate) struct SessionInner {
     model_retry_ready: AtomicBool,
     replacing: AtomicBool,
     replacement: Arc<tokio::sync::Mutex<()>>,
+    #[expect(
+        clippy::type_complexity,
+        reason = "Pending tool publication retains its exact generation beside its owned tool definitions"
+    )]
     pending_tools: Mutex<Option<(u64, Vec<Arc<dyn crate::runtime::tool::Tool>>)>>,
     applied_tools: std::sync::atomic::AtomicU64,
     route: Option<Arc<dyn crate::session::TurnRouting>>,
@@ -80,6 +97,10 @@ pub(crate) struct SessionInner {
     configured_mode: Mutex<(u64, Option<String>)>,
     pending_mode: Mutex<Option<PendingMode>>,
     delegated_children: Mutex<std::collections::BTreeMap<String, delegation::ChildRecord>>,
+    #[expect(
+        clippy::type_complexity,
+        reason = "Closed child history retains exact child identity, target and acknowledged cleanup result"
+    )]
     closed_children: Mutex<
         std::collections::VecDeque<(
             String,
@@ -128,6 +149,7 @@ pub(crate) struct SessionInner {
 
 pub(crate) struct SessionParts {
     pub kind: crate::SessionKind,
+    pub communication: Option<crate::state::communication::CommunicationState>,
     pub client: Arc<dyn Client>,
     pub route: Option<Arc<dyn crate::session::TurnRouting>>,
     pub auto_compaction: Option<(
@@ -220,12 +242,12 @@ impl SessionInner {
                 ));
             }
         }
-        if let Some(expected) = expected {
-            if expected.generation != configured.0 || expected.epoch != self.state().epoch_id {
-                return Err(Error::tool(
-                    "pending mode transition rejected because its epoch or mode generation changed",
-                ));
-            }
+        if let Some(expected) = expected
+            && (expected.generation != configured.0 || expected.epoch != self.state().epoch_id)
+        {
+            return Err(Error::tool(
+                "pending mode transition rejected because its epoch or mode generation changed",
+            ));
         }
         let generation = configured
             .0

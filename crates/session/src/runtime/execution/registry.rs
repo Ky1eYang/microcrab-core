@@ -19,14 +19,17 @@ use std::{
 use tokio::sync::{oneshot, watch};
 use tokio_util::sync::CancellationToken;
 struct Entry {
+    redaction: super::InvocationRedaction,
     // One admission per reserved identity, independent of mutable tool contexts.
     admission_claimed: bool,
     controlled_receipt: bool,
+    media_output_bytes: usize,
     row: ExecutionSnapshot,
     started: Option<Instant>,
     cancellation: CancellationToken,
     buffer: Option<Buffer>,
     controller: Option<Arc<dyn ExecutionController>>,
+    subordinate_cleanups: Vec<Arc<dyn ExecutionController>>,
     nonce: u64,
     adopted: bool,
     exposed: bool,
@@ -70,10 +73,33 @@ mod drain_budget_tests;
 #[path = "tests/drain_release.rs"]
 mod drain_release_tests;
 
-struct Completion(Result<String, Arc<Error>>);
+#[cfg(test)]
+#[path = "tests/reservation_resources.rs"]
+mod reservation_resource_tests;
+
+struct Completion {
+    content: Result<String, Arc<Error>>,
+    media: Mutex<Option<Vec<super::MediaAttachment>>>,
+    had_media: bool,
+}
 impl Completion {
-    fn result(&self) -> Result<String, Error> {
-        self.0
+    fn new(result: Result<super::ResolvedOutput, Arc<Error>>) -> Self {
+        match result {
+            Ok(output) => Self {
+                had_media: !output.attachments.is_empty(),
+                content: Ok(output.content),
+                media: Mutex::new(Some(output.attachments)),
+            },
+            Err(error) => Self {
+                had_media: false,
+                content: Err(error),
+                media: Mutex::new(None),
+            },
+        }
+    }
+    fn result(&self) -> Result<super::ResolvedOutput, Error> {
+        let content = self
+            .content
             .as_ref()
             .cloned()
             .map_err(|error| match error.as_ref() {
@@ -83,7 +109,26 @@ impl Completion {
                 Error::Tool(message) => Error::Tool(message.clone()),
                 Error::Limit(message) => Error::Limit(message.clone()),
                 other => Error::Diagnostic(other.tool_diagnostic()),
-            })
+            })?;
+        let attachments = if self.had_media {
+            self.media
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .take()
+                .ok_or_else(|| Error::tool("typed media completion was already consumed"))?
+        } else {
+            Vec::new()
+        };
+        Ok(super::ResolvedOutput {
+            content,
+            attachments,
+        })
+    }
+    fn text_result(&self) -> Result<String, Error> {
+        if self.had_media {
+            return Err(Error::tool("image output requires typed Session admission"));
+        }
+        self.result()?.into_text()
     }
 }
 #[derive(Clone)]
@@ -115,12 +160,21 @@ impl ExecutionProgress {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         let entry = state.entries.get_mut(&self.id).ok_or(Error::Closed)?;
-        entry.row.invocation_result = Some(content.into());
+        let content = entry.redaction.redact_content(content);
+        self.reserve_mutation_receipt(content.len())?;
+        entry.row.invocation_result = Some(content);
         entry.controlled_receipt = true;
         drop(state);
         registry.notify();
         Ok(())
     }
+    /// Retain one actual cleanup owner before its first resource effect. Owners
+    /// survive a dropped/poisoned guest Store; registration grants no Host access.
+    pub fn retain_cleanup(&self, owner: Arc<dyn ExecutionController>) -> Result<(), Error> {
+        let registry = self.registry.upgrade().ok_or(Error::Closed)?;
+        registry.retain_cleanup(self.id, owner)
+    }
+
     pub fn execution_id(&self) -> ExecutionId {
         self.id
     }
@@ -189,6 +243,14 @@ impl ExecutionHandle {
     pub async fn wait(&mut self) -> Result<String, Error> {
         loop {
             if let Some(result) = self.completion.borrow().clone() {
+                return result.text_result();
+            }
+            self.completion.changed().await.map_err(|_| Error::Closed)?;
+        }
+    }
+    pub(crate) async fn wait_output(&mut self) -> Result<super::ResolvedOutput, Error> {
+        loop {
+            if let Some(result) = self.completion.borrow().clone() {
                 return result.result();
             }
             self.completion.changed().await.map_err(|_| Error::Closed)?;
@@ -204,6 +266,39 @@ impl Drop for ExecutionHandle {
 }
 include!("cleanup.rs");
 impl ExecutionRegistry {
+    pub(crate) fn retain_cleanup(
+        &self,
+        id: ExecutionId,
+        owner: Arc<dyn ExecutionController>,
+    ) -> Result<(), Error> {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if state.closed {
+            return Err(Error::Closed);
+        }
+        let entry = state.entries.get_mut(&id).ok_or(Error::Closed)?;
+        if entry
+            .subordinate_cleanups
+            .iter()
+            .any(|current| Arc::ptr_eq(current, &owner))
+        {
+            return Ok(());
+        }
+        if entry.cancellation.is_cancelled() {
+            return Err(Error::Cancelled);
+        }
+        if entry.cleanup.is_some() || !entry.row.status_projection().is_pending() {
+            return Err(Error::tool(
+                "execution cleanup registration is already closed",
+            ));
+        }
+        crate::budget::check(
+            crate::LimitKind::ExecutionBuffers,
+            entry.subordinate_cleanups.len().saturating_add(1),
+            8,
+        )?;
+        entry.subordinate_cleanups.push(owner);
+        Ok(())
+    }
     /// Claim proof issuance under the execution owner's existing identity lock.
     /// Context clones or cleared proof fields cannot reset this private fact.
     pub(crate) fn claim_admission(&self, id: ExecutionId) -> Result<bool, Error> {
@@ -606,21 +701,22 @@ impl ExecutionRegistry {
     /// Retains the observed foreground result, including a buffered receipt, for
     /// authorized display after the corresponding transcript preview was truncated.
     pub(crate) fn error_result_with_effects(&self, id: ExecutionId, error: &Error) -> String {
-        let mut value: serde_json::Value =
-            serde_json::from_str(&error.tool_diagnostic().result_json())
-                .unwrap_or_else(|_| serde_json::json!({"error":"execution failed"}));
+        let diagnostic = self
+            .redaction(id)
+            .unwrap_or_default()
+            .redact_diagnostic(error.tool_diagnostic());
+        let mut value: serde_json::Value = serde_json::from_str(&diagnostic.result_json())
+            .unwrap_or_else(|_| serde_json::json!({"error":"execution failed"}));
         let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         if let Some(entry) = state
             .entries
             .get(&id)
             .filter(|entry| entry.controlled_receipt)
+            && let Some(content) = &entry.row.invocation_result
+            && let Ok(receipt) = serde_json::from_str::<serde_json::Value>(content)
         {
-            if let Some(content) = &entry.row.invocation_result {
-                if let Ok(receipt) = serde_json::from_str::<serde_json::Value>(content) {
-                    let rows = receipt["receipts"].as_array();
-                    value["mutation_effects"] = serde_json::json!({"execution_id":id,"committed":rows.map_or(0,|rows|rows.iter().filter(|row|row["status"]=="committed").count()),"uncertain":rows.is_some_and(|rows|rows.iter().any(|row|row["status"]=="uncertain")),"receipts":"Inspect this execution's invocation_result for ordered Host outcomes; do not replay."});
-                }
-            }
+            let rows = receipt["receipts"].as_array();
+            value["mutation_effects"] = serde_json::json!({"execution_id":id,"committed":rows.map_or(0,|rows|rows.iter().filter(|row|row["status"]=="committed").count()),"uncertain":rows.is_some_and(|rows|rows.iter().any(|row|row["status"]=="uncertain")),"receipts":"Inspect this execution's invocation_result for ordered Host outcomes; do not replay."});
         }
         value.to_string()
     }
@@ -637,7 +733,9 @@ impl ExecutionRegistry {
             .get_mut(&id)
             .ok_or_else(|| Error::tool("unknown execution handle"))?;
         if !entry.controlled_receipt {
-            entry.row.invocation_result = Some(content.to_owned());
+            let content = entry.redaction.redact_content(content);
+            crate::budget::check(crate::LimitKind::ExecutionInspection, content.len(), budget)?;
+            entry.row.invocation_result = Some(content);
         }
         drop(state);
         self.notify();
@@ -645,6 +743,7 @@ impl ExecutionRegistry {
     }
     pub fn validate_recovery_limits(&self, limits: &Limits) -> Result<(), Error> {
         if limits.max_tool_output_bytes > self.limits.max_tool_output_bytes
+            || limits.max_tool_image_bytes > self.limits.max_tool_image_bytes
             || limits.output_buffer_bytes > self.limits.output_buffer_bytes
             || limits.max_pending_executions > self.limits.max_pending_executions
             || limits.max_retained_executions > self.limits.max_retained_executions
@@ -736,15 +835,15 @@ impl ExecutionRegistry {
         };
         let mut first = None;
         for id in &ids {
-            if self.get(*id)?.status.is_pending() {
-                if let Err(error) = self.cancel(*id).await {
-                    // A producer may settle between the snapshot and cancel's
-                    // locked admission; that exact terminal race is success.
-                    let settled = matches!(&error, Error::Tool(cause) if cause.as_str() == "execution is already terminal")
-                        && !self.get(*id)?.status.is_pending();
-                    if !settled {
-                        first.get_or_insert(error);
-                    }
+            if self.get(*id)?.status.is_pending()
+                && let Err(error) = self.cancel(*id).await
+            {
+                // A producer may settle between the snapshot and cancel's
+                // locked admission; that exact terminal race is success.
+                let settled = matches!(&error, Error::Tool(cause) if cause.as_str() == "execution is already terminal")
+                    && !self.get(*id)?.status.is_pending();
+                if !settled {
+                    first.get_or_insert(error);
                 }
             }
         }
@@ -799,7 +898,10 @@ impl ExecutionRegistry {
         {
             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             for entry in state.entries.values_mut() {
-                if entry.controller.is_none() && entry.worker.is_none() {
+                if entry.controller.is_none()
+                    && entry.subordinate_cleanups.is_empty()
+                    && entry.worker.is_none()
+                {
                     if entry.row.status.is_pending() {
                         entry.row.status = ExecutionStatus::Interrupted;
                     }
@@ -825,7 +927,9 @@ impl ExecutionRegistry {
             state
                 .entries
                 .iter()
-                .filter(|(_, entry)| entry.controller.is_some())
+                .filter(|(_, entry)| {
+                    entry.controller.is_some() || !entry.subordinate_cleanups.is_empty()
+                })
                 .map(|(id, _)| *id)
                 .collect::<Vec<_>>()
         };
@@ -837,11 +941,11 @@ impl ExecutionRegistry {
     pub fn restore(&self, rows: &[ExecutionSnapshot]) -> Result<(), Error> {
         Self::validate_rows(rows, &self.limits)?;
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if state
-            .entries
-            .values()
-            .any(|e| e.row.status_projection().is_pending() || e.controller.is_some())
-        {
+        if state.entries.values().any(|e| {
+            e.row.status_projection().is_pending()
+                || e.controller.is_some()
+                || !e.subordinate_cleanups.is_empty()
+        }) {
             return Err(Error::Busy);
         }
         for entry in state.entries.values_mut() {
@@ -884,13 +988,16 @@ impl ExecutionRegistry {
             state.entries.insert(
                 row.execution_id,
                 Entry {
+                    redaction: super::InvocationRedaction::default(),
                     admission_claimed: false,
                     controlled_receipt: false,
+                    media_output_bytes: 0,
                     row,
                     started: None,
                     cancellation: CancellationToken::new(),
                     buffer,
                     controller: None,
+                    subordinate_cleanups: Vec::new(),
                     nonce: 0,
                     adopted: true,
                     exposed: delivery.exposed || was_pending,
@@ -909,9 +1016,10 @@ impl ExecutionRegistry {
         self.notify();
         Ok(())
     }
+    #[cfg(test)]
     pub(crate) fn start<F, Make>(
         self: &Arc<Self>,
-        mut row: ExecutionSnapshot,
+        row: ExecutionSnapshot,
         cancellation: CancellationToken,
         make: Make,
     ) -> Result<ExecutionHandle, Error>
@@ -919,6 +1027,27 @@ impl ExecutionRegistry {
         F: Future<Output = Result<ToolOutput, Error>> + Send + 'static,
         Make: FnOnce(ExecutionProgress) -> F,
     {
+        self.start_with_media_output(row, cancellation, 0, make)
+    }
+
+    /// Runtime pins this trusted registration declaration before activation/effects.
+    pub(crate) fn start_with_media_output<F, Make>(
+        self: &Arc<Self>,
+        mut row: ExecutionSnapshot,
+        cancellation: CancellationToken,
+        declared_media_bytes: usize,
+        make: Make,
+    ) -> Result<ExecutionHandle, Error>
+    where
+        F: Future<Output = Result<ToolOutput, Error>> + Send + 'static,
+        Make: FnOnce(ExecutionProgress) -> F,
+    {
+        crate::budget::check(
+            crate::LimitKind::AttachmentBytes,
+            declared_media_bytes,
+            crate::admission::image::MAX_IMAGE_BYTES,
+        )?;
+        let media_output_bytes = declared_media_bytes.min(self.limits.max_tool_image_bytes);
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.closed {
             return Err(Error::Closed);
@@ -942,6 +1071,7 @@ impl ExecutionRegistry {
             .filter(|(_, e)| {
                 !e.row.status_projection().is_pending()
                     && e.controller.is_none()
+                    && e.subordinate_cleanups.is_empty()
                     && ((!e.exposed && e.buffer.is_none()) || e.released)
             })
             .map(|(id, _)| *id)
@@ -987,6 +1117,9 @@ impl ExecutionRegistry {
                 .get(&row.execution_id)
                 .filter(|e| {
                     e.worker.is_none()
+                        && e.controller.is_none()
+                        && e.buffer.is_none()
+                        && e.cleanup.is_none()
                         && e.row.status_projection().is_pending()
                         && e.row.call_id == row.call_id
                         && e.row.session_id == row.session_id
@@ -1038,7 +1171,7 @@ impl ExecutionRegistry {
                 if let Err(error) = &resolved {
                     registry.finish_error(id, error).await;
                 }
-                let _ = sender.send(Some(Arc::new(Completion(resolved.map_err(Arc::new)))));
+                let _ = sender.send(Some(Arc::new(Completion::new(resolved.map_err(Arc::new)))));
             }
         });
         let admission_claimed = state
@@ -1049,16 +1182,29 @@ impl ExecutionRegistry {
             .entries
             .get_mut(&id)
             .and_then(|entry| entry.terminal_observer.take());
+        let subordinate_cleanups = state
+            .entries
+            .get_mut(&id)
+            .map(|entry| std::mem::take(&mut entry.subordinate_cleanups))
+            .unwrap_or_default();
+        let redaction = state
+            .entries
+            .get(&id)
+            .map(|entry| entry.redaction.clone())
+            .unwrap_or_default();
         state.entries.insert(
             id,
             Entry {
+                redaction,
                 admission_claimed,
                 controlled_receipt: false,
+                media_output_bytes,
                 row,
                 started: Some(started),
                 cancellation: cancellation.clone(),
                 buffer: None,
                 controller: None,
+                subordinate_cleanups,
                 nonce: id.0,
                 adopted: false,
                 exposed: false,
@@ -1108,6 +1254,7 @@ impl ExecutionRegistry {
             .filter(|(_, e)| {
                 !e.row.status_projection().is_pending()
                     && e.controller.is_none()
+                    && e.subordinate_cleanups.is_empty()
                     && ((!e.exposed && e.buffer.is_none()) || e.released)
             })
             .map(|(id, _)| *id)
@@ -1155,13 +1302,16 @@ impl ExecutionRegistry {
         state.entries.insert(
             id,
             Entry {
+                redaction: super::InvocationRedaction::default(),
                 admission_claimed: false,
                 controlled_receipt: false,
+                media_output_bytes: 0,
                 row,
                 started: Some(Instant::now()),
                 cancellation,
                 buffer: None,
                 controller: None,
+                subordinate_cleanups: Vec::new(),
                 nonce: id.0,
                 adopted: false,
                 exposed: false,
@@ -1185,7 +1335,16 @@ impl ExecutionRegistry {
         options: OutputOptions,
         controller: Arc<dyn ExecutionController>,
     ) -> Result<(OutputWriter, BufferedOutput), Error> {
-        let buffer = Buffer::new(options, self.limits.output_buffer_bytes)?;
+        let redaction = self.redaction(id)?;
+        if options
+            .channels
+            .iter()
+            .any(|channel| redaction.redact_text(channel) != *channel)
+        {
+            return Err(Error::tool("output channel contains a secret"));
+        }
+        let mut buffer = Buffer::new(options, self.limits.output_buffer_bytes)?;
+        buffer.install_redaction(redaction);
         let capabilities = controller.capabilities();
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.closed {
@@ -1213,7 +1372,11 @@ impl ExecutionRegistry {
             .entries
             .get_mut(&id)
             .ok_or_else(|| Error::tool("output requires an admitted execution"))?;
-        if entry.buffer.is_some() || !entry.row.status_projection().is_pending() {
+        if entry.buffer.is_some()
+            || entry.controller.is_some()
+            || entry.cleanup.is_some()
+            || !entry.row.status_projection().is_pending()
+        {
             return Err(Error::tool("execution already has output or is terminal"));
         }
         entry.buffer = Some(buffer);
@@ -1232,6 +1395,39 @@ impl ExecutionRegistry {
                 include_output: false,
             },
         ))
+    }
+    pub(crate) fn install_redaction(
+        &self,
+        id: ExecutionId,
+        redaction: super::InvocationRedaction,
+    ) -> Result<(), Error> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = state.entries.get_mut(&id).ok_or(Error::Closed)?;
+        if entry.buffer.is_some() || entry.worker.is_some() {
+            return Err(Error::tool(
+                "execution redaction must be installed before dispatch",
+            ));
+        }
+        entry.redaction = redaction;
+        Ok(())
+    }
+    pub(crate) fn merge_redaction(
+        &self,
+        id: ExecutionId,
+        source: &super::InvocationRedaction,
+    ) -> Result<(), Error> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = state.entries.get(&id).ok_or(Error::Closed)?;
+        entry.redaction.merge(source)
+    }
+    fn redaction(&self, id: ExecutionId) -> Result<super::InvocationRedaction, Error> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(state
+            .entries
+            .get(&id)
+            .ok_or(Error::Closed)?
+            .redaction
+            .clone())
     }
     pub(super) fn append(
         &self,
@@ -1282,6 +1478,7 @@ impl ExecutionRegistry {
             return Ok(());
         }
         if let Some(buffer) = &mut entry.buffer {
+            buffer.flush_redaction()?;
             buffer.closed = true;
         }
         entry.row.status = ExecutionStatus::Cancelled;
@@ -1315,6 +1512,7 @@ impl ExecutionRegistry {
         if buffer.closed {
             return Ok(());
         }
+        buffer.flush_redaction()?;
         buffer.closed = true;
         entry.row.status = ExecutionStatus::Interrupted;
         entry.row.failure = None;
@@ -1346,6 +1544,10 @@ impl ExecutionRegistry {
             .get_mut(&id)
             .filter(|e| e.nonce == nonce)
             .ok_or_else(|| Error::tool("stale output writer"))?;
+        let outcome = match outcome {
+            Ok(()) => Ok(()),
+            Err(failure) => Err(failure.redacted(&entry.redaction)?),
+        };
         let buffer = entry
             .buffer
             .as_mut()
@@ -1353,6 +1555,7 @@ impl ExecutionRegistry {
         if buffer.closed {
             return Ok(());
         }
+        buffer.flush_redaction()?;
         buffer.closed = true;
         entry.row.status = match &outcome {
             Ok(()) => ExecutionStatus::Succeeded,
@@ -1384,7 +1587,7 @@ impl ExecutionRegistry {
         self: &Arc<Self>,
         id: ExecutionId,
         result: Result<ToolOutput, Error>,
-    ) -> Result<String, Error> {
+    ) -> Result<super::ResolvedOutput, Error> {
         match result {
             Ok(ToolOutput::Buffered(mut output)) => {
                 if !Arc::ptr_eq(self, &output.registry) || output.id != id {
@@ -1415,16 +1618,61 @@ impl ExecutionRegistry {
                 };
                 output.adopted = true;
                 self.notify();
-                Ok(receipt)
+                Ok(super::ResolvedOutput::text(receipt))
             }
-            Ok(ToolOutput::Final(final_output)) => {
+            Ok(ToolOutput::Final(mut final_output)) => {
+                crate::budget::check(
+                    crate::LimitKind::ToolOutput,
+                    final_output.content.len(),
+                    self.limits.max_tool_output_bytes,
+                )?;
+                let redaction = self.redaction(id)?;
+                final_output.content = redaction.redact_content(&final_output.content);
+                final_output.failure = final_output
+                    .failure
+                    .map(|failure| failure.redacted(&redaction))
+                    .transpose()?;
                 if let Some(failure) = &final_output.failure {
                     failure.validate()?;
                 }
+                crate::budget::check(
+                    crate::LimitKind::AttachmentCount,
+                    final_output.attachments.len(),
+                    crate::admission::image::MAX_IMAGES_PER_TOOL_OUTPUT,
+                )?;
+                let media_limit = {
+                    let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+                    state
+                        .entries
+                        .get(&id)
+                        .ok_or(Error::Closed)?
+                        .media_output_bytes
+                };
+                for attachment in &final_output.attachments {
+                    crate::budget::check(
+                        crate::LimitKind::AttachmentBytes,
+                        attachment.data.len(),
+                        media_limit,
+                    )?;
+                    crate::admission::image::validate_image(
+                        &attachment.media_type,
+                        &attachment.data,
+                    )?;
+                }
                 let body = if final_output.failure.is_some() {
-                    serde_json::to_string(&final_output)?
+                    serde_json::to_string(&serde_json::json!({
+                        "content": &final_output.content,
+                        "failure": &final_output.failure,
+                    }))?
                 } else {
                     final_output.content.clone()
+                };
+                let observation =
+                    super::ResolvedOutput::observation_text(&body, &final_output.attachments)?;
+                let display = if final_output.attachments.is_empty() {
+                    final_output.content.clone()
+                } else {
+                    observation.clone()
                 };
                 if let Err(error) = crate::budget::check(
                     crate::LimitKind::ToolOutput,
@@ -1441,9 +1689,9 @@ impl ExecutionRegistry {
                         buffer.closed = true;
                     }
                     entry.buffer = None;
-                    entry.row.result = Some(final_output.content.clone());
+                    entry.row.result = Some(display.clone());
                     if !entry.controlled_receipt {
-                        entry.row.invocation_result = Some(body.clone());
+                        entry.row.invocation_result = Some(observation.clone());
                     }
                     entry.row.elapsed_ms = entry
                         .started
@@ -1463,13 +1711,18 @@ impl ExecutionRegistry {
                         _ => ExecutionStatus::Failed,
                     };
                     entry.row.failure = final_output.failure;
-                    entry.row.result = Some(final_output.content);
+                    entry.row.result = Some(display);
                     entry.released = true;
+                    entry.redaction = super::InvocationRedaction::default();
                 }
                 self.notify();
-                Ok(body)
+                Ok(super::ResolvedOutput {
+                    content: body,
+                    attachments: final_output.attachments,
+                })
             }
             Err(error) => {
+                let error = self.redaction(id)?.redact_error(error);
                 self.finish_error(id, &error).await;
                 Err(error)
             }
@@ -1481,7 +1734,7 @@ impl ExecutionRegistry {
             let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
             if let Some(entry) = state.entries.get_mut(&id) {
                 cleanup_failed = entry.row.status == ExecutionStatus::Interrupted
-                    && entry.controller.is_some()
+                    && (entry.controller.is_some() || !entry.subordinate_cleanups.is_empty())
                     && matches!(error, Error::Diagnostic(diagnostic) if entry.row.diagnostic.as_ref() == Some(diagnostic));
                 entry.row.status = if cleanup_failed {
                     ExecutionStatus::Interrupted
@@ -1497,21 +1750,31 @@ impl ExecutionRegistry {
                         _ => ExecutionStatus::Failed,
                     }
                 };
+                let mut diagnostic = entry.redaction.redact_diagnostic(error.tool_diagnostic());
                 entry.row.failure = if let Error::ToolFailure(failure) = error {
                     if entry.buffer.is_none() {
                         entry.row.result = Some(String::new());
                     }
-                    Some(failure.clone())
+                    match failure.clone().redacted(&entry.redaction) {
+                        Ok(failure) => Some(failure),
+                        Err(error) => {
+                            diagnostic = entry.redaction.redact_diagnostic(error.tool_diagnostic());
+                            None
+                        }
+                    }
                 } else {
                     None
                 };
-                entry.row.diagnostic = Some(error.tool_diagnostic());
+                entry.row.diagnostic = Some(diagnostic);
                 if entry.row.elapsed_ms.is_none() {
                     entry.row.elapsed_ms = entry
                         .started
                         .map(|start| start.elapsed().as_millis().try_into().unwrap_or(u64::MAX));
                 }
                 if let Some(buffer) = &mut entry.buffer {
+                    if let Err(error) = buffer.flush_redaction() {
+                        entry.row.diagnostic = Some(error.tool_diagnostic());
+                    }
                     buffer.closed = true;
                 }
             }
@@ -1703,9 +1966,11 @@ impl ExecutionRegistry {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         if let Some(entry) = state.entries.get_mut(&id) {
             entry.released = true;
+            entry.redaction = super::InvocationRedaction::default();
             if let Some(buffer) = &mut entry.buffer {
                 buffer.closed = true;
                 buffer.clear();
+                buffer.install_redaction(super::InvocationRedaction::default());
             }
         }
         drop(state);
@@ -1789,7 +2054,9 @@ impl ExecutionRegistry {
                 if let Some(buffer) = &mut entry.buffer {
                     buffer.closed = true;
                 } else {
-                    entry.released = entry.controller.is_none() && !entry.exposed;
+                    entry.released = entry.controller.is_none()
+                        && entry.subordinate_cleanups.is_empty()
+                        && !entry.exposed;
                 }
             }
         }
@@ -1923,7 +2190,8 @@ mod admission_claim_tests {
             registry
                 .resolve(id, Ok(ToolOutput::text("guest summary")))
                 .await
-                .unwrap(),
+                .unwrap()
+                .content,
             "guest summary"
         );
         registry

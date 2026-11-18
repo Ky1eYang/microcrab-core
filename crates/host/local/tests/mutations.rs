@@ -5,7 +5,7 @@ use microcrab_host_api::{
 };
 use microcrab_host_local::{LocalHost, ShellLimits};
 use sha2::{Digest, Sha256};
-use std::{fs, path::PathBuf};
+use std::fs;
 use tokio_util::sync::CancellationToken;
 
 fn host() -> (tempfile::TempDir, LocalHost) {
@@ -103,7 +103,7 @@ async fn normalized_preflight_then_sequential_write_move_delete_report_exact_pha
     .await
     .unwrap();
     assert!(
-        matches!(&requests[0], FileMutation::Write(request) if request.path == PathBuf::from("new"))
+        matches!(&requests[0], FileMutation::Write(request) if request.path == std::path::Path::new("new"))
     );
     assert!(!root.path().join("new").exists());
     let first = Host::mutate(&host, requests[0].clone(), CancellationToken::new())

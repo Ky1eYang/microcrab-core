@@ -33,6 +33,25 @@ fn completed(d: &mut OpenAiResponsesSseDecoder) {
     .unwrap();
 }
 #[test]
+fn empty_terminal_cannot_hide_a_streamed_answer_or_reasoning_mismatch() {
+    for kind in [
+        "response.output_text.delta",
+        "response.reasoning_summary_text.delta",
+    ] {
+        let mut d = OpenAiResponsesSseDecoder::default();
+        push(&mut d, json!({"type":kind,"delta":"streamed value"})).unwrap();
+        push(
+            &mut d,
+            json!({"type":"response.completed","response":{"status":"completed","output":[]}}),
+        )
+        .unwrap();
+        let error = d.finish(&request()).unwrap_err();
+        assert!(matches!(&error, Error::Protocol(_)));
+        assert!(error.diagnostic_reason().contains("differs from streamed"));
+    }
+}
+
+#[test]
 fn interleaved_output_indices_and_components_keep_canonical_semantics() {
     for terminal_snapshot in [false, true] {
         let mut d = OpenAiResponsesSseDecoder::default();

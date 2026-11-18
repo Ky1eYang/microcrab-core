@@ -57,10 +57,10 @@ impl CreatorJournal {
         if bytes > MAX_UNDO_BYTES {
             return Err(Error::Limit("undo input ancestry byte budget".into()));
         }
-        if let Some(live) = live {
-            if serde_json::to_vec(live)?.len() > MAX_UNDO_BYTES {
-                return Err(Error::Limit("undo live Context byte budget".into()));
-            }
+        if let Some(live) = live
+            && serde_json::to_vec(live)?.len() > MAX_UNDO_BYTES
+        {
+            return Err(Error::Limit("undo live Context byte budget".into()));
         }
         let index =
             source_context.undo_input_index(live.unwrap_or(source_context), index, input)?;

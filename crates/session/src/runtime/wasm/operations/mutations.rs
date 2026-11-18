@@ -464,10 +464,11 @@ pub(in crate::runtime::wasm) fn mutate(
             }
         }
     }
-    if receipt_index.is_some() && result.as_ref().map_or(true, |out| out.diagnostic.is_some()) {
-        if let Some(plan) = state.patch_plan.as_mut() {
-            plan.clear();
-        }
+    if receipt_index.is_some()
+        && result.as_ref().map_or(true, |out| out.diagnostic.is_some())
+        && let Some(plan) = state.patch_plan.as_mut()
+    {
+        plan.clear();
     }
     if result
         .as_ref()

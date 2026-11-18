@@ -298,14 +298,14 @@ impl Tool for CauseEffect {
 
 #[tokio::test]
 async fn producer_causes_survive_real_tool_context_and_audit_without_legacy_secrets() {
-    let cases: [(fn() -> Error, &str, &str); 3] = [
+    let cases = [
         (
-            || {
+            (|| {
                 Error::denied_with_private(
                     "process belongs to another Session",
                     "private-tool-secret",
                 )
-            },
+            }) as fn() -> Error,
             "process belongs to another Session",
             "permission_denied",
         ),

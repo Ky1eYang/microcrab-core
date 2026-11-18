@@ -175,7 +175,7 @@ impl Client for Script {
         _: CancellationToken,
     ) -> Result<Response, microcrab_transport::Error> {
         for item in &content.items {
-            if let ContentItem::Tool { call_id, content } = item
+            if let ContentItem::Tool { call_id, content, .. } = item
                 && self.captured.lock().unwrap().insert(call_id.clone())
             {
                 self.outputs.lock().unwrap().push(

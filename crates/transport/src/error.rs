@@ -69,13 +69,33 @@ impl std::fmt::Display for ProtocolError {
         formatter.write_str(&self.private_reason)
     }
 }
+/// Closed provider finish evidence used only for an empty completed response.
+/// Unknown means the transport did not observe a supported terminal classification.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EmptyCompletionFinish {
+    Stop,
+    Length,
+    Unknown,
+}
+
+/// Bounded facts for a provider completion that had no answer or tool calls.
+/// These facts never carry provider text, response bodies or model identifiers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EmptyCompletionFacts {
+    pub reasoning_present: bool,
+    pub finish: EmptyCompletionFinish,
+}
+
 /// Provider failures preserve their recovery classification while retaining an
-/// optional protocol cause. Dynamic descriptions use the canonical sanitizer.
+/// optional protocol cause and bounded response facts. Dynamic descriptions use
+/// the canonical sanitizer.
 #[derive(Clone, PartialEq, Eq)]
 pub struct ProviderError {
     private_reason: String,
     protocol: Option<ProtocolError>,
     failure: Option<ProviderFailure>,
+    empty_completion: Option<EmptyCompletionFacts>,
+    remote_image_fetch_rejected: bool,
 }
 
 impl ProviderError {
@@ -84,7 +104,23 @@ impl ProviderError {
             private_reason: "provider returned an invalid response".into(),
             protocol: Some(cause),
             failure: None,
+            empty_completion: None,
+            remote_image_fetch_rejected: false,
         }
+    }
+
+    pub fn empty_completion(facts: EmptyCompletionFacts) -> Self {
+        Self {
+            private_reason: "provider completed without an assistant answer".into(),
+            protocol: None,
+            failure: None,
+            empty_completion: Some(facts),
+            remote_image_fetch_rejected: false,
+        }
+    }
+
+    pub fn empty_completion_details(&self) -> Option<EmptyCompletionFacts> {
+        self.empty_completion
     }
 
     pub fn failure(failure: ProviderFailure) -> Self {
@@ -92,6 +128,8 @@ impl ProviderError {
             private_reason: failure.public_reason().into(),
             protocol: None,
             failure: Some(failure),
+            empty_completion: None,
+            remote_image_fetch_rejected: false,
         }
     }
 
@@ -120,6 +158,8 @@ impl From<String> for ProviderError {
             private_reason: microcrab_protocol::diagnostic::sanitize(&private_reason, 2048),
             protocol: None,
             failure: None,
+            empty_completion: None,
+            remote_image_fetch_rejected: false,
         }
     }
 }
@@ -135,6 +175,7 @@ impl std::fmt::Debug for ProviderError {
         formatter
             .debug_struct("ProviderError")
             .field("protocol", &self.protocol)
+            .field("empty_completion", &self.empty_completion)
             .finish_non_exhaustive()
     }
 }
@@ -184,6 +225,21 @@ pub enum Error {
     Json(#[from] serde_json::Error),
 }
 impl Error {
+    /// Framework-owned typed evidence; never construct this from status or message text alone.
+    pub(crate) fn remote_image_fetch_rejected() -> Self {
+        Self::Provider(ProviderError {
+            private_reason: "provider rejected remote image fetch".into(),
+            protocol: None,
+            failure: None,
+            empty_completion: None,
+            remote_image_fetch_rejected: true,
+        })
+    }
+
+    pub fn is_remote_image_fetch_rejection(&self) -> bool {
+        matches!(self, Self::Provider(cause) if cause.remote_image_fetch_rejected)
+    }
+
     pub fn diagnostic_reason(&self) -> String {
         use microcrab_protocol::diagnostic::{describe, json_reason};
         match self {

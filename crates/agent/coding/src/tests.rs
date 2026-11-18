@@ -226,6 +226,8 @@ fn info(family: OsFamily) -> HostInfo {
 }
 #[derive(Default)]
 struct MemoryHost {
+    image: Option<MediaAttachment>,
+    image_paths: Vec<String>,
     preflights: Vec<Vec<FileMutation>>,
     mutations: Vec<FileMutation>,
     fail_mutation: Option<(usize, OperationErrorCode)>,
@@ -247,6 +249,13 @@ struct MemoryHost {
     started: bool,
 }
 impl Host for MemoryHost {
+    fn read_image(&mut self, path: &str) -> Result<MediaAttachment, OperationError> {
+        self.image_paths.push(path.into());
+        self.image.clone().ok_or_else(|| OperationError {
+            code: OperationErrorCode::Unsupported,
+            message: "image fixture unavailable".into(),
+        })
+    }
     fn preflight_mutations(
         &mut self,
         requests: Vec<FileMutation>,
@@ -268,13 +277,13 @@ impl Host for MemoryHost {
     }
     fn mutate(&mut self, request: FileMutation) -> Result<MutationOutput, OperationError> {
         self.mutations.push(request.clone());
-        if let Some((index, code)) = &self.fail_mutation {
-            if *index == self.mutations.len() {
-                return Err(OperationError {
-                    code: code.clone(),
-                    message: "injected later operation failure".into(),
-                });
-            }
+        if let Some((index, code)) = &self.fail_mutation
+            && *index == self.mutations.len()
+        {
+            return Err(OperationError {
+                code: code.clone(),
+                message: "injected later operation failure".into(),
+            });
         }
         let (content, source_removed, destination_written) = match request {
             FileMutation::Write(r) => (Some(r.content), false, true),
@@ -396,7 +405,7 @@ impl Host for MemoryHost {
 }
 fn call(host: &mut MemoryHost, name: &str, args: Value) -> Result<Value, String> {
     let output = invoke(&info(OsFamily::Unix), name, &args.to_string(), host)?;
-    serde_json::from_str(&output).map_err(|e| e.to_string())
+    serde_json::from_str(&output.content).map_err(|e| e.to_string())
 }
 #[test]
 fn read_renders_lines_and_preserves_version_and_truncation() {
@@ -1051,4 +1060,61 @@ fn patch_partial_move_reports_both_phases_and_stops_suffix() {
     assert_eq!(out["receipts"][0]["outcome"]["destination_written"], true);
     assert_eq!(out["receipts"][0]["outcome"]["source_removed"], false);
     assert_eq!(out["receipts"][1]["status"], "not_started");
+}
+
+#[test]
+fn image_catalog_requires_complete_read_linkage_and_keeps_payload_typed() {
+    let mut info = info(OsFamily::Unix);
+    let mut host = MemoryHost {
+        image: Some(MediaAttachment {
+            media_type: "image/png".into(),
+            data: vec![0xff; 128 * 1024],
+        }),
+        ..Default::default()
+    };
+    assert!(invoke(&info, "read_image", r#"{"path":"picture.png"}"#, &mut host).is_err());
+    for capability in [
+        "filesystem.stat",
+        "filesystem.open",
+        "filesystem.read",
+        "filesystem.close",
+    ] {
+        info.capabilities.push(capability.into());
+    }
+    let agents = describe(&info).unwrap();
+    let tool = agents[0]
+        .tools
+        .iter()
+        .find(|tool| tool.name == "read_image")
+        .unwrap();
+    assert_eq!(tool.parameters["required"], json!(["path"]));
+    for mode in &agents[0].modes {
+        assert_eq!(
+            mode.permissions
+                .iter()
+                .find(|permission| permission.tool
+                    == Some(microcrab_permission::Matcher::Exact("read_image".into())))
+                .unwrap()
+                .action,
+            Action::Allow
+        );
+    }
+    let result = invoke(&info, "read_image", r#"{"path":"picture.png"}"#, &mut host).unwrap();
+    assert_eq!(result.attachments[0].data, vec![0xff; 128 * 1024]);
+    assert_eq!(
+        serde_json::from_str::<Value>(&result.content).unwrap(),
+        json!({"media_type":"image/png","bytes":128 * 1024})
+    );
+    assert_eq!(host.image_paths, ["picture.png"]);
+    for arguments in [
+        r#"{"path":null}"#,
+        r#"{"path":"x","extra":true}"#,
+        r#"{"path":""}"#,
+    ] {
+        assert!(invoke(&info, "read_image", arguments, &mut host).is_err());
+    }
+    info.capabilities
+        .retain(|capability| capability != "filesystem.close");
+    assert!(invoke(&info, "read_image", r#"{"path":"picture.png"}"#, &mut host).is_err());
+    assert_eq!(host.image_paths.len(), 1);
 }

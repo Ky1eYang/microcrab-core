@@ -1,5 +1,6 @@
 //! Retry fixtures use synthetic requests only; no configured provider or audit storage.
 mod idle;
+mod media;
 mod upstream;
 
 use super::*;

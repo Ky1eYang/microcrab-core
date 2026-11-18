@@ -395,10 +395,11 @@ async fn client_protocol_failure_retries_the_exact_unadmitted_request() {
         session.resume().await.unwrap().content,
         "next input completed"
     );
-    let requests = seen.lock().unwrap();
-    assert_eq!(requests.len(), 2);
-    assert_eq!(requests[0], requests[1]);
-    drop(requests);
+    {
+        let requests = seen.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0], requests[1]);
+    }
     assert!(!session.retry_ready());
     session.close().await.unwrap();
 }

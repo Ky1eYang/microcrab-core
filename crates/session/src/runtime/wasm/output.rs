@@ -189,7 +189,7 @@ pub(super) fn insert(
     Ok(Resource::new_own(id))
 }
 pub(super) fn add_to_linker(linker: &mut Linker<RuntimeState>) -> wasmtime::Result<()> {
-    let mut interface = linker.instance("microcrab:agent/execution@0.7.0")?;
+    let mut interface = linker.instance("microcrab:agent/execution@0.8.0")?;
     interface.resource(
         "buffer",
         ResourceType::host::<BufferResource>(),
@@ -440,6 +440,38 @@ pub(super) fn lift(
         }),
         Ok(abi::ToolOutput::Final(value)) => {
             crate::budget::check(
+                crate::LimitKind::AttachmentCount,
+                value.attachments.len(),
+                1,
+            )?;
+            let image_limit = state
+                .tool_context
+                .as_ref()
+                .map_or(0, |context| {
+                    context.state.snapshot().limits.max_tool_image_bytes
+                })
+                .min(crate::admission::image::MAX_IMAGE_BYTES)
+                .min(state.max_media_output_bytes);
+            let attachments = value
+                .attachments
+                .into_iter()
+                .map(|attachment| {
+                    crate::budget::check(
+                        crate::LimitKind::AttachmentBytes,
+                        attachment.data.len(),
+                        image_limit,
+                    )?;
+                    crate::admission::image::validate_image(
+                        &attachment.media_type,
+                        &attachment.data,
+                    )?;
+                    Ok(crate::runtime::execution::MediaAttachment {
+                        media_type: attachment.media_type,
+                        data: attachment.data,
+                    })
+                })
+                .collect::<Result<Vec<_>, Error>>()?;
+            crate::budget::check(
                 crate::LimitKind::ToolOutput,
                 value.content.len(),
                 state.max_output_bytes,
@@ -452,6 +484,7 @@ pub(super) fn lift(
                 outcome: ToolOutput::Final(FinalOutput {
                     content: value.content,
                     failure: value.failure.map(native_failure).transpose()?,
+                    attachments,
                 }),
                 driver: None,
             })
@@ -486,6 +519,71 @@ pub(super) fn lift(
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn png() -> Vec<u8> {
+        let mut bytes = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
+        bytes.extend_from_slice(&1u32.to_be_bytes());
+        bytes.extend_from_slice(&1u32.to_be_bytes());
+        bytes.extend_from_slice(&[8, 2, 0, 0, 0, 0, 0, 0, 0]);
+        bytes.resize(128 * 1024, 0);
+        bytes
+    }
+    fn final_media(
+        attachments: Vec<abi::MediaAttachment>,
+    ) -> Result<abi::ToolOutput, abi::ToolFailure> {
+        Ok(abi::ToolOutput::Final(abi::FinalOutput {
+            content: String::new(),
+            failure: None,
+            attachments,
+        }))
+    }
+    #[test]
+    fn final_media_preserves_bytes_independently_of_text_output_cap() {
+        let mut state = super::super::resources::tests::runtime_state(true);
+        state.max_output_bytes = 1;
+        let bytes = png();
+        let prepared = lift(
+            &mut state,
+            final_media(vec![abi::MediaAttachment {
+                media_type: "image/png".into(),
+                data: bytes.clone(),
+            }]),
+        )
+        .unwrap();
+        let ToolOutput::Final(output) = prepared.outcome else {
+            panic!("media must remain Final")
+        };
+        assert_eq!(output.attachments[0].data, bytes);
+        assert!(output.content.is_empty());
+    }
+    #[test]
+    fn final_media_rejects_count_mime_and_snapshot_capacity() {
+        let mut state = super::super::resources::tests::runtime_state(true);
+        let image = || abi::MediaAttachment {
+            media_type: "image/png".into(),
+            data: png(),
+        };
+        state.max_media_output_bytes = 0;
+        assert!(lift(&mut state, final_media(vec![image()])).is_err());
+        state.max_media_output_bytes = crate::admission::image::MAX_IMAGE_BYTES;
+        assert!(lift(&mut state, final_media(vec![image(), image()])).is_err());
+        assert!(
+            lift(
+                &mut state,
+                final_media(vec![abi::MediaAttachment {
+                    media_type: "image/jpeg".into(),
+                    data: png()
+                }])
+            )
+            .is_err()
+        );
+        state
+            .tool_context
+            .as_ref()
+            .unwrap()
+            .state
+            .update(|snapshot| snapshot.limits.max_tool_image_bytes = 1);
+        assert!(lift(&mut state, final_media(vec![image()])).is_err());
+    }
     #[test]
     fn typed_tool_failure_preserves_startup_timeout_and_retryability() {
         let reported = abi::ToolFailure {

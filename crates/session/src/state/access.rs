@@ -1,4 +1,6 @@
 //! Shared snapshots, queued custom writes, and atomic Session hook commits.
+mod secrets;
+pub use secrets::PreparedSecretWrite;
 #[cfg(test)]
 mod tests;
 use super::endpoint::VariableEndpoint;
@@ -52,6 +54,7 @@ pub struct State {
     actor: VariableRole,
     // Independent of LiveState so registry callbacks never reenter its lock.
     notice_inbox: Arc<Mutex<Weak<crate::admission::inbox::Inbox>>>,
+    messaging: Arc<Mutex<Option<Weak<dyn crate::runtime::messaging::AgentPeer>>>>,
 }
 #[derive(Clone)]
 enum Writer {
@@ -75,6 +78,7 @@ struct LiveState {
     agent: Option<microcrab_agent_types::AgentInfo>,
     is_main: bool,
     delegate_available: bool,
+    active_correspondents: std::collections::BTreeSet<crate::state::communication::AgentId>,
     cache_points: Arc<crate::runtime::cache::Collector>,
     /// Live epoch resources: shared by handles of this Session, never serialized.
     #[cfg(feature = "wasm")]
@@ -149,6 +153,7 @@ impl State {
                 agent: None,
                 is_main: true,
                 delegate_available: false,
+                active_correspondents: Default::default(),
                 cache_points: Arc::new(crate::runtime::cache::Collector::default()),
                 #[cfg(feature = "wasm")]
                 wasm: Arc::new(crate::runtime::wasm::EpochInstances::default()),
@@ -156,6 +161,7 @@ impl State {
             })),
             writer: Writer::Detached,
             actor: VariableRole::Client,
+            messaging: Default::default(),
             notice_inbox: Arc::new(Mutex::new(Weak::new())),
         }
     }
@@ -167,6 +173,7 @@ impl State {
             inner: Arc::new(Mutex::new(live)),
             writer: Writer::Detached,
             actor: self.actor,
+            messaging: Default::default(),
             notice_inbox: Arc::new(Mutex::new(Weak::new())),
         }
     }
@@ -239,6 +246,7 @@ impl State {
             inner: self.inner.clone(),
             writer: Writer::Detached,
             actor: self.actor,
+            messaging: self.messaging.clone(),
             notice_inbox: self.notice_inbox.clone(),
         };
         let endpoint = VariableEndpoint::new(detached, closed, faulted);
@@ -246,11 +254,50 @@ impl State {
             inner: self.inner.clone(),
             writer: Writer::Session(Arc::downgrade(&endpoint)),
             actor: self.actor,
+            messaging: self.messaging.clone(),
             notice_inbox: self.notice_inbox.clone(),
         };
         (attached, endpoint)
     }
     /// Install kinds before the session starts. Recovery never reloads them from a snapshot.
+    pub(crate) fn set_correspondent_active(
+        &self,
+        agent_id: crate::state::communication::AgentId,
+        active: bool,
+    ) {
+        let mut live = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        if active {
+            live.active_correspondents.insert(agent_id);
+        } else {
+            live.active_correspondents.remove(&agent_id);
+        }
+    }
+    pub(crate) fn clear_active_correspondents(&self) {
+        self.inner
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .active_correspondents
+            .clear();
+    }
+    pub(crate) fn install_messaging_peer(
+        &self,
+        peer: Weak<dyn crate::runtime::messaging::AgentPeer>,
+    ) {
+        *self
+            .messaging
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(peer);
+    }
+    pub(crate) fn messaging_peer(
+        &self,
+    ) -> Result<Arc<dyn crate::runtime::messaging::AgentPeer>, Error> {
+        self.messaging
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+            .and_then(Weak::upgrade)
+            .ok_or_else(|| Error::denied("Session communication endpoint is unavailable"))
+    }
     pub(crate) fn install_references(&self, references: References) -> Result<(), Error> {
         let mut state = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if state.references_installed {
@@ -268,6 +315,29 @@ impl State {
         Ok(())
     }
 
+    /// Initial delegation/recovery installs only the immutable selected material.
+    pub(crate) fn install_focused_references(
+        &self,
+        snapshots: Vec<super::reference::focus::FocusSnapshot>,
+    ) -> Result<(), Error> {
+        super::reference::focus::validate_snapshots(&snapshots)?;
+        let references = References::new(vec![super::reference::DynReference::new(
+            super::reference::focus::FocusedReferences(snapshots),
+        )?])?;
+        let mut state = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        references.validate_variables(&state.snapshot.variables)?;
+        state.snapshot.references = references;
+        state.reference_projection.clear();
+        state.references_loaded = false;
+        state.references_revision = state.references_revision.checked_add(1).ok_or_else(|| {
+            crate::budget::reject(
+                crate::LimitKind::Arithmetic,
+                "reference generation overflow",
+            )
+        })?;
+        state.catalog.clear();
+        Ok(())
+    }
     /// Load every installed kind. The state lock is not held across the await.
     pub(crate) async fn load_references(&self) -> Result<(), Error> {
         let references = self.snapshot().references.clone();
@@ -507,13 +577,18 @@ impl State {
                     .filter(|_| !is_reserved_key(name) && !live.snapshot.references.owns(name))
                 {
                     let owner = metadata.owner == VariableRole::Client;
-                    let editable = owner || metadata.editors.contains(&VariableRole::Client);
+                    let secret =
+                        metadata.visibility == microcrab_protocol::VariableVisibility::Secret;
+                    let editable =
+                        !secret && (owner || metadata.editors.contains(&VariableRole::Client));
                     VariableDescriptor {
                         kind: "custom".into(),
                         editable,
-                        owner_editable: owner,
+                        owner_editable: owner && !secret,
                         deletable: owner,
-                        reason: if editable {
+                        reason: if secret {
+                            Some("Secret values are write-only".into())
+                        } else if editable {
                             None
                         } else {
                             Some("Client is not an editor of this variable".into())
@@ -716,7 +791,7 @@ impl State {
         let mut variables = state.snapshot.variables.clone();
         variables.change(&change, actor)?;
         crate::admission::variables::admit(
-            &serde_json::json!({"values": variables.all_values(), "metadata": variables.metadata()}),
+            &variables.admission_value(),
             state.snapshot.limits.max_context_bytes,
         )?;
         let changed = variables != state.snapshot.variables;
@@ -754,6 +829,8 @@ impl State {
         if live.runtime_instance_id != original.runtime_instance_id
             || live.variables_revision != original.variables_revision
             || live.references_revision != original.references_revision
+            || live.active_correspondents != original.active_correspondents
+            || live.snapshot.communication != original.snapshot.communication
             || live.snapshot.selected_mode != original.snapshot.selected_mode
             || live.snapshot.epoch_id != original.snapshot.epoch_id
             || live.snapshot.last_turn_id != original.snapshot.last_turn_id
@@ -762,6 +839,7 @@ impl State {
         {
             return false;
         }
+        live.snapshot.communication = candidate.snapshot.communication;
         live.snapshot.variables = candidate.snapshot.variables;
         live.variables_revision = candidate.variables_revision;
         live.snapshot.turn_id = candidate.snapshot.turn_id;
@@ -842,6 +920,8 @@ impl State {
             || live.variables_revision != original.variables_revision
             || live.references_revision != original.references_revision
             || live.reference_projection != original.reference_projection
+            || live.active_correspondents != original.active_correspondents
+            || live.snapshot.communication != original.snapshot.communication
             || live.snapshot.selected_mode != original.snapshot.selected_mode
         {
             return Err(Error::config(
@@ -1059,6 +1139,37 @@ fn current_projection(live: &LiveState) -> Result<Value, crate::policy::Permissi
         session.insert("kind".into(), json!(kind));
     } else {
         session.remove("kind");
+    }
+    if let Some(communication) = &live.snapshot.communication {
+        session.insert("agent_id".into(), json!(communication.identity.agent_id));
+        session.insert("depth".into(), json!(communication.identity.depth));
+        session.insert(
+            "interaction".into(),
+            json!(communication.identity.interaction),
+        );
+        let mut correspondents = communication
+            .correspondents
+            .iter()
+            .filter(|row| live.active_correspondents.contains(&row.agent_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut speakers = communication.external_speakers.clone();
+        for carrier in &communication.inbox.pending {
+            if let Some(row) = &carrier.correspondent
+                && !correspondents
+                    .iter()
+                    .any(|prior| prior.agent_id == row.agent_id)
+            {
+                correspondents.push(row.clone());
+            }
+            if let Some(row) = &carrier.speaker
+                && !speakers.iter().any(|prior| prior.identity == row.identity)
+            {
+                speakers.push(row.clone());
+            }
+        }
+        values.insert("correspondents".into(), json!(correspondents));
+        values.insert("external_speakers".into(), json!(speakers));
     }
     if let Some(witness) = witness {
         witness()?;

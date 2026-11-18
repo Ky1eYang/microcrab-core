@@ -148,6 +148,7 @@ async fn exact_boundary(journal: CreatorJournal) {
         parts: vec![microcrab_session::InputPart::Text {
             text: "different input".into(),
         }],
+        envelope: None,
         source: None,
     };
     assert!(

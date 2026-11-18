@@ -33,7 +33,7 @@ impl TokenEstimate {
         window: u64,
     ) -> Result<Option<Self>, Error> {
         if window == 0 || content.items.iter().any(|item| matches!(item,
-            super::ContentItem::User { parts, .. } if parts.iter().any(|part| !matches!(part, microcrab_protocol::InputPart::Text { .. }))
+            super::ContentItem::User { parts, .. } | super::ContentItem::Tool { parts, .. } if parts.iter().any(|part| !matches!(part, microcrab_protocol::InputPart::Text { .. }))
         )) {
             return Ok(None);
         }

@@ -19,15 +19,28 @@ pub(super) fn native(tools: &[(String, ToolOrigin)], _agent: &str, _mode: &str) 
         .filter(|(name, origin)| {
             *origin == ToolOrigin::Builtin && BuiltinTool::from_name(name).is_some()
         })
-        .map(|(name, _)| {
-            rule(
+        .flat_map(|(name, _)| {
+            if name == "send_message" {
+                let mut send = rule(name, Action::Ask);
+                send.args.push(super::ArgumentPredicate {
+                    pointer: "/intent".into(),
+                    matcher: Matcher::Exact("send".into()),
+                });
+                let mut reply = rule(name, Action::Allow);
+                reply.args.push(super::ArgumentPredicate {
+                    pointer: "/intent".into(),
+                    matcher: Matcher::Exact("reply".into()),
+                });
+                return vec![send, reply];
+            }
+            vec![rule(
                 name,
-                if name == "switch_mode" {
+                if matches!(name.as_str(), "switch_mode" | "escalate" | "send_message") {
                     Action::Ask
                 } else {
                     Action::Allow
                 },
-            )
+            )]
         })
         .collect()
 }

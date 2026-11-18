@@ -366,6 +366,27 @@ impl Runtime {
             .unwrap_or_else(|error| error.into_inner())
             .clone()
     }
+    /// Initial Session assembly only; never changes an already frozen epoch.
+    pub(crate) fn configure_conversation_tools(
+        &self,
+        identity: Option<&crate::state::communication::ConversationIdentity>,
+    ) -> Result<(), Error> {
+        let registry = Arc::new(self.registry().for_conversation(identity)?);
+        let provider = registry.provider_defaults()?;
+        let snapshot = self
+            .permission
+            .tool_config(&registry.origins(), &provider, &[])
+            .map_err(|error| {
+                Error::config_with_private(error.public_reason(), error.to_string())
+            })?;
+        self.permission
+            .publish_tools(registry.origins(), provider, snapshot)
+            .map_err(|error| {
+                Error::config_with_private(error.public_reason(), error.to_string())
+            })?;
+        self.publish_registry(registry);
+        Ok(())
+    }
     pub(crate) fn prepare_external_tools(
         &self,
         tools: Vec<Arc<dyn super::tool::Tool>>,
@@ -692,13 +713,18 @@ impl Runtime {
                 let mut required = measured.bytes;
                 for call in &response.tool_calls {
                     let framing = serde_json::to_vec(&crate::context::ContentItem::Tool {
+                        parts: vec![],
                         call_id: call.id.clone(),
                         content: String::new(),
                     })?
                     .len()
                     .saturating_add(1);
                     required = required
-                        .saturating_add(tool_result_reservation_bytes(call, &limits))
+                        .saturating_add(tool_result_reservation_bytes(
+                            call,
+                            &limits,
+                            self.registry().media_output_bytes(&call.name),
+                        ))
                         .saturating_add(framing);
                 }
                 // Renewable consumption checkpoints: crossing one asks the embedding
@@ -953,13 +979,14 @@ impl Runtime {
         client: &dyn Client,
     ) -> Result<(), Error> {
         let limits = state.snapshot().limits;
+        let tool_registry = self.registry();
         let mut ordered = response.tool_calls.to_vec();
         ordered.sort_by_key(is_pending_work_wait);
         let mut pending = ordered
             .into_iter()
-            .map(|call| (call, None))
+            .map(|call| (call, None, super::tool::injection::LiteralMask::default()))
             .collect::<std::collections::VecDeque<_>>();
-        while let Some((mut normalized, prepared)) = pending.pop_front() {
+        while let Some((mut normalized, prepared, mut literal_mask)) = pending.pop_front() {
             if cancellation.is_cancelled() {
                 return Err(Error::Cancelled);
             }
@@ -975,6 +1002,7 @@ impl Runtime {
                     Instant::now(),
                 )
             });
+            let mut expansion_error = None;
             if prepared.is_none() {
                 let injection = crate::observation::hooks::intervene_recorded(
                     auditor,
@@ -992,25 +1020,54 @@ impl Runtime {
                     },
                 )
                 .await?;
+                let rewritten = injection.tool_arguments.is_some();
                 if let Some(arguments) = injection.tool_arguments {
                     normalized.arguments = arguments;
-                    self.registry().validate(&normalized)?;
-                    // A rewrite may turn a small status response into a destructive
-                    // drain. Re-admit it together with remaining calls so it cannot
-                    // spend capacity already reserved for their results.
-                    let mut reserved = context.clone();
-                    reserve_tool_result(&mut reserved, &normalized, &limits)?;
-                    for (remaining, _) in &pending {
-                        reserve_tool_result(&mut reserved, remaining, &limits)?;
-                    }
                 }
-                // Restoring or replacing arguments may create a cross-plane wait. Defer
-                // it without repeating the hook or its committed variables.
-                if is_pending_work_wait(&normalized)
-                    && pending.iter().any(|(call, _)| !is_pending_work_wait(call))
-                {
-                    pending.push_back((normalized, Some(clock)));
-                    continue;
+                // Visible expansion is a derived copy. Context and the ToolCall audit
+                // retain the authored or hook-replaced placeholders.
+                match super::tool::injection::expand_visible(
+                    &normalized.arguments,
+                    &state.injection_view(),
+                    limits.max_context_bytes,
+                ) {
+                    Ok((arguments, mask)) => {
+                        normalized.arguments = arguments;
+                        literal_mask = mask;
+                    }
+                    Err(error) => expansion_error = Some(error),
+                }
+                if expansion_error.is_none() {
+                    if rewritten {
+                        // A rewrite may turn a small status response into a destructive
+                        // drain. Re-admit it together with remaining calls so it cannot
+                        // spend capacity already reserved for their results.
+                        let mut reserved = context.clone();
+                        reserve_tool_result(
+                            &mut reserved,
+                            &normalized,
+                            &limits,
+                            tool_registry.media_output_bytes(&normalized.name),
+                        )?;
+                        for (remaining, _, _) in &pending {
+                            reserve_tool_result(
+                                &mut reserved,
+                                remaining,
+                                &limits,
+                                tool_registry.media_output_bytes(&remaining.name),
+                            )?;
+                        }
+                    }
+                    // Restoring or replacing arguments may create a cross-plane wait. Defer
+                    // it without repeating the hook or its committed variables.
+                    if is_pending_work_wait(&normalized)
+                        && pending
+                            .iter()
+                            .any(|(call, _, _)| !is_pending_work_wait(call))
+                    {
+                        pending.push_back((normalized, Some(clock), literal_mask));
+                        continue;
+                    }
                 }
             }
             if normalized.name == "job"
@@ -1054,6 +1111,24 @@ impl Runtime {
                 None
             };
             let call = &normalized;
+            // A registration may have changed since model response admission.
+            // Pin its actual declaration and reserve this entire remaining batch
+            // before any invocation can begin Host effects.
+            let mut result_probe = context.clone();
+            reserve_tool_result(
+                &mut result_probe,
+                call,
+                &limits,
+                tool_registry.media_output_bytes(&call.name),
+            )?;
+            for (remaining, _, _) in &pending {
+                reserve_tool_result(
+                    &mut result_probe,
+                    remaining,
+                    &limits,
+                    tool_registry.media_output_bytes(&remaining.name),
+                )?;
+            }
             // Registry ownership replaces call/turn CancelOnDrop after transfer.
             let tool_token = CancellationToken::new();
             let snapshot_config = self
@@ -1082,7 +1157,7 @@ impl Runtime {
                 agent,
                 mode,
             );
-            let action_error = self.registry().validate(call).err().or_else(|| {
+            let action_error = expansion_error.or_else(|| tool_registry.clone().validate(call).err()).or_else(|| {
                 if call.name == "job" {
                     crate::runtime::execution::job::validate(&call.arguments).err()
                 } else {
@@ -1091,7 +1166,8 @@ impl Runtime {
             });
             use crate::policy::{PermissionError, PermissionRequest};
             let mut invocation = invocation;
-            let observation_interrupt = (self.registry().origin(&call.name)
+            invocation.literal_mask = literal_mask;
+            let observation_interrupt = (tool_registry.clone().origin(&call.name)
                 == Some(super::tool::ToolOrigin::Builtin)
                 && call.name == "job"
                 && call
@@ -1146,7 +1222,7 @@ impl Runtime {
                     arguments: call.arguments.clone(),
                     revision: snapshot.revision,
                 };
-                let component = self.registry().component(&call.name);
+                let component = tool_registry.clone().component(&call.name);
                 let result = tokio::select! { biased;
                     _ = cancellation.cancelled() => { executions.finish_error(reserved, &Error::Cancelled).await; return Err(Error::Cancelled); },
                     result = self.permission.admit(&request, &invocation, &issuer, component) => result,
@@ -1163,74 +1239,94 @@ impl Runtime {
             } else if let Some(error) = action_error {
                 Err(error)
             } else if allowed {
-                let mut descriptor = super::execution::ExecutionSnapshot::new(
-                    invocation.session_id.clone(),
-                    call.id.clone(),
-                    call.name.clone(),
-                    invocation.agent.clone(),
-                    invocation.mode.clone(),
-                );
-                descriptor.execution_id = reserved;
-                let registry = self.registry();
-                let delegate = self.delegate.clone();
-                let controls = self.controls();
-                let owned_call = call.clone();
-                let execution_cancellation = invocation.cancellation.clone();
-                match executions.start(descriptor, execution_cancellation, move |progress| {
-                    invocation.execution_id = Some(progress.execution_id());
-                    invocation.execution_progress = Some(progress);
-                    async move {
-                        if registry.origin(&owned_call.name)
-                            == Some(super::tool::ToolOrigin::Builtin)
-                            && owned_call.name == "delegate"
-                        {
-                            super::tool::delegate::execute(
-                                delegate.as_deref(),
-                                &owned_call.arguments,
-                                invocation,
-                            )
-                            .await
-                        } else if registry.origin(&owned_call.name)
-                            == Some(super::tool::ToolOrigin::Builtin)
-                            && owned_call.name == "switch_mode"
-                        {
-                            super::tool::switch_mode::execute(
-                                controls.as_deref(),
-                                &owned_call.arguments,
-                                invocation,
-                            )
-                        } else {
-                            registry.execute(&owned_call, invocation).await
-                        }
-                    }
-                }) {
+                // Permission, public records and descriptors see Visible-expanded
+                // arguments. Secret placeholders remain until this sealed resolver.
+                // Context and the ToolCall audit retain the model-authored text.
+                let prepared =
+                    tool_registry
+                        .resolve_call(call, &mut invocation)
+                        .and_then(|resolved| {
+                            executions
+                                .install_redaction(reserved, invocation.redaction_handle())?;
+                            Ok(resolved)
+                        });
+                match prepared {
                     Err(error) => Err(error),
-                    Ok(mut execution) => {
-                        execution.activate()?;
-                        // Tools own observation/yield and self-reported timeouts. Waiting
-                        // for a question or a long tool is not Runtime timeout evidence.
-                        let result = loop {
-                            tokio::select! {
-                                biased;
-                                _ = cancellation.cancelled() => {
-                                    executions.cancel(execution.id).await?;
-                                    let _ = execution.wait().await;
-                                    break Err(Error::Cancelled);
-                                },
-                                result = execution.wait() => break result,
-                                _ = recorder.wait_for_steer(), if observation_interrupt
-                                    .as_ref().is_some_and(|signal| !signal.is_cancelled()) => {
-                                    // Only the read-only observation is interrupted. Job
-                                    // returns its own final result through normal recording.
-                                    if let Some(signal) = &observation_interrupt {
-                                        signal.cancel();
+                    Ok(owned_call) => {
+                        let mut descriptor = super::execution::ExecutionSnapshot::new(
+                            invocation.session_id.clone(),
+                            call.id.clone(),
+                            call.name.clone(),
+                            invocation.agent.clone(),
+                            invocation.mode.clone(),
+                        );
+                        descriptor.execution_id = reserved;
+                        let registry = tool_registry.clone();
+                        let delegate = self.delegate.clone();
+                        let controls = self.controls();
+                        let execution_cancellation = invocation.cancellation.clone();
+                        match executions.start_with_media_output(
+                            descriptor,
+                            execution_cancellation,
+                            tool_registry.media_output_bytes(&call.name),
+                            move |progress| {
+                                invocation.execution_id = Some(progress.execution_id());
+                                invocation.execution_progress = Some(progress);
+                                async move {
+                                    if registry.origin(&owned_call.name)
+                                        == Some(super::tool::ToolOrigin::Builtin)
+                                        && owned_call.name == "delegate"
+                                    {
+                                        super::tool::delegate::execute(
+                                            delegate.as_deref(),
+                                            &owned_call.arguments,
+                                            invocation,
+                                        )
+                                        .await
+                                    } else if registry.origin(&owned_call.name)
+                                        == Some(super::tool::ToolOrigin::Builtin)
+                                        && owned_call.name == "switch_mode"
+                                    {
+                                        super::tool::switch_mode::execute(
+                                            controls.as_deref(),
+                                            &owned_call.arguments,
+                                            invocation,
+                                        )
+                                    } else {
+                                        registry.execute(&owned_call, invocation).await
                                     }
-                                },
+                                }
+                            },
+                        ) {
+                            Err(error) => Err(error),
+                            Ok(mut execution) => {
+                                execution.activate()?;
+                                // Tools own observation/yield and self-reported timeouts. Waiting
+                                // for a question or a long tool is not Runtime timeout evidence.
+                                let result = loop {
+                                    tokio::select! {
+                                        biased;
+                                        _ = cancellation.cancelled() => {
+                                            executions.cancel(execution.id).await?;
+                                            let _ = execution.wait_output().await;
+                                            break Err(Error::Cancelled);
+                                        },
+                                        result = execution.wait_output() => break result,
+                                        _ = recorder.wait_for_steer(), if observation_interrupt
+                                            .as_ref().is_some_and(|signal| !signal.is_cancelled()) => {
+                                            // Only the read-only observation is interrupted. Job
+                                            // returns its own final result through normal recording.
+                                            if let Some(signal) = &observation_interrupt {
+                                                signal.cancel();
+                                            }
+                                        },
+                                    }
+                                };
+                                // A Buffered return transfers lifetime to its Session owner.
+                                execution.detach();
+                                result
                             }
-                        };
-                        // A Buffered return transfers lifetime to its Session owner.
-                        execution.detach();
-                        result
+                        }
                     }
                 }
             } else {
@@ -1247,12 +1343,11 @@ impl Runtime {
                 } else {
                     limits.max_tool_output_bytes
                 };
-                crate::budget::check(crate::LimitKind::ToolOutput, output.len(), budget).map_err(
-                    |error| match error {
+                crate::budget::check(crate::LimitKind::ToolOutput, output.content.len(), budget)
+                    .map_err(|error| match error {
                         Error::Limit(limit) => Error::Limit(limit.with_label("tool output budget")),
                         other => other,
-                    },
-                )?;
+                    })?;
                 Ok(output)
             });
             // Every returned outcome, including terminal errors, is observable.
@@ -1260,7 +1355,10 @@ impl Runtime {
             let snapshot = state.snapshot();
             let payload = match &result {
                 Ok(output) => HookPayload::ToolResult {
-                    result: Some(output.clone()),
+                    result: Some(super::execution::ResolvedOutput::observation_text(
+                        &output.content,
+                        &output.attachments,
+                    )?),
                     error: None,
                 },
                 Err(error) => HookPayload::ToolResult {
@@ -1286,14 +1384,14 @@ impl Runtime {
                     ..Default::default()
                 },
             );
-            let content = match result {
+            let output = match result {
                 Ok(output) => output,
                 Err(Error::Cancelled) if cancellation.is_cancelled() => {
                     return Err(Error::Cancelled);
                 }
-                Err(Error::Cancelled) => {
-                    executions.error_result_with_effects(reserved, &Error::Cancelled)
-                }
+                Err(Error::Cancelled) => super::execution::ResolvedOutput::text(
+                    executions.error_result_with_effects(reserved, &Error::Cancelled),
+                ),
                 Err(Error::Limit(message)) => return Err(Error::Limit(message)),
                 Err(error) => {
                     let content = match &error {
@@ -1302,7 +1400,7 @@ impl Runtime {
                         }
                         _ => executions.error_result_with_effects(reserved, &error),
                     };
-                    if content.len() > error_result_reservation_bytes()
+                    let content = if content.len() > error_result_reservation_bytes()
                         || serde_json::json!(&content).to_string().len() - 2
                             > error_result_context_reservation_bytes()
                     {
@@ -1312,10 +1410,21 @@ impl Runtime {
                         error.tool_diagnostic().result_json()
                     } else {
                         content
-                    }
+                    };
+                    super::execution::ResolvedOutput::text(content)
                 }
             };
-            context.append_tool_result(call.id.clone(), content)?;
+            let parts = output
+                .attachments
+                .into_iter()
+                .map(|attachment| microcrab_protocol::InputPart::Image {
+                    source: microcrab_protocol::ImageSource::Data {
+                        media_type: attachment.media_type,
+                        data: attachment.data,
+                    },
+                })
+                .collect();
+            context.append_tool_result_with_parts(call.id.clone(), output.content, parts)?;
             let (epoch, items) = context.admitted_items();
             client.observe_admitted(epoch, items, None).await;
             executions.acknowledge_result_delivered(reserved);
@@ -1344,6 +1453,7 @@ fn error_result_context_reservation_bytes() -> usize {
 fn tool_result_reservation_bytes(
     call: &microcrab_protocol::ToolCall,
     limits: &crate::Limits,
+    declared_media_bytes: usize,
 ) -> usize {
     let output = if call.name == "job"
         && call
@@ -1363,13 +1473,17 @@ fn tool_result_reservation_bytes(
     output
         .saturating_mul(6)
         .max(error_result_context_reservation_bytes())
+        .saturating_add(crate::admission::image::tool_context_reservation(
+            declared_media_bytes.min(limits.max_tool_image_bytes),
+        ))
 }
 fn reserve_tool_result(
     context: &mut Context,
     call: &microcrab_protocol::ToolCall,
     limits: &crate::Limits,
+    declared_media_bytes: usize,
 ) -> Result<(), Error> {
-    let bytes = tool_result_reservation_bytes(call, limits);
+    let bytes = tool_result_reservation_bytes(call, limits, declared_media_bytes);
     crate::budget::check(
         crate::LimitKind::ToolResultReservation,
         bytes,
@@ -1379,7 +1493,12 @@ fn reserve_tool_result(
         Error::Limit(limit) => Error::Limit(limit.calls(1)),
         other => other,
     })?;
-    context.append_tool_result(call.id.clone(), "x".repeat(bytes))
+    context
+        .append_tool_result(call.id.clone(), "x".repeat(bytes))
+        .map_err(|error| match error {
+            Error::Limit(limit) => Error::Limit(limit.before_effects()),
+            other => other,
+        })
 }
 
 impl RuntimeHandler for Runtime {

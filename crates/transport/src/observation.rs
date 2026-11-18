@@ -186,6 +186,9 @@ impl CallObservation {
                         "timed_out"
                     }
                     crate::Error::Cancelled => "cancelled",
+                    crate::Error::Provider(cause) if cause.empty_completion_details().is_some() => {
+                        "empty_assistant_response"
+                    }
                     _ => "provider_call_failed",
                 }
                 .into(),

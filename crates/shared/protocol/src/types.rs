@@ -9,6 +9,24 @@ pub enum VariableVisibility {
     #[default]
     Visible,
     Invisible,
+    /// A live write-only value; public projections expose its placeholder.
+    Secret,
+}
+
+/// Secret keys have an unambiguous, bounded placeholder grammar.
+pub fn valid_secret_key(key: &str) -> bool {
+    let bytes = key.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= 128
+        && (bytes[0].is_ascii_alphabetic() || bytes[0] == b'_')
+        && bytes
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'))
+}
+
+/// Format an already validated key as data, never as a template evaluation.
+pub fn secret_placeholder(key: &str) -> String {
+    format!("{{{{secret:{key}}}}}")
 }
 
 #[derive(Default, Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -216,6 +234,33 @@ pub enum ImageSource {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn secret_keys_and_placeholders_have_one_bounded_wire_grammar() {
+        for key in ["token", "_", "Token.key-1", &"k".repeat(128)] {
+            assert!(valid_secret_key(key));
+            assert_eq!(secret_placeholder(key), format!("{{{{secret:{key}}}}}"));
+        }
+        for key in [
+            "",
+            "1token",
+            "space key",
+            "key:part",
+            "key}x",
+            "é",
+            &"k".repeat(129),
+        ] {
+            assert!(!valid_secret_key(key));
+        }
+        assert_eq!(
+            serde_json::to_value(VariableVisibility::Secret).unwrap(),
+            json!("secret")
+        );
+        assert_eq!(
+            serde_json::from_value::<VariableVisibility>(json!("secret")).unwrap(),
+            VariableVisibility::Secret
+        );
+    }
 
     #[test]
     fn scope_receipt_projection_preserves_authority_input_and_legacy_empty_shape() {

@@ -21,6 +21,14 @@ pub trait ProcessControl: Send + Sync {
     fn projection(&self) -> Option<Value>;
     fn register_child(&self, child: Arc<ProcessRegistry>) -> Result<(), Error>;
     fn registry(&self) -> Arc<ProcessRegistry>;
+    /// Built-in process owners capture this invocation's opaque output witness.
+    /// Custom process capabilities may implement the same non-authority hook.
+    fn for_invocation(
+        &self,
+        _redaction: super::super::InvocationRedaction,
+    ) -> Option<Arc<dyn ProcessControl>> {
+        None
+    }
     fn scoped(&self, session_id: String, agent: String, is_main: bool) -> Arc<dyn ProcessControl>;
     /// Reserve Session capacity and own every launched process before publication.
     async fn launch_shell(

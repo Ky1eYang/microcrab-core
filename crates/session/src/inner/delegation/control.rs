@@ -10,6 +10,13 @@ pub(crate) struct ChildRecord {
 
 #[async_trait::async_trait]
 impl DelegateParent for SessionInner {
+    async fn capture_focus(
+        &self,
+        selections: Vec<crate::state::reference::focus::FocusSelection>,
+        invocation: &ToolContext,
+    ) -> Result<Vec<crate::state::reference::focus::FocusSnapshot>, Error> {
+        self.capture_delegation_focus(selections, invocation).await
+    }
     fn adopt_child(
         &self,
         target: &str,
@@ -19,6 +26,7 @@ impl DelegateParent for SessionInner {
         invocation: &ToolContext,
     ) -> Result<(), Error> {
         self.ensure_open()?;
+        self.require_derivation()?;
         invocation
             .ensure_admitted(None)
             .map_err(|e| e.into_runtime_error())?;
@@ -92,23 +100,7 @@ impl DelegateParent for SessionInner {
             .map_err(|e| Error::config_with_private(e.public_reason(), e.to_string()))?;
         let parent_limits = self.state().limits;
         let child_limits = child.state().limits;
-        macro_rules! ceiling {($($field:ident),+) => {$({ if child_limits.$field>parent_limits.$field {return Err(Error::config(concat!("prepared child exceeds parent ",stringify!($field)," ceiling")));} })+};}
-        ceiling!(
-            max_rounds,
-            max_tool_calls_per_round,
-            max_context_bytes,
-            max_tool_output_bytes,
-            max_output_tokens,
-            interaction_timeout_ms,
-            max_pending_executions,
-            max_retained_executions,
-            lifecycle_timeout_ms,
-            max_processes,
-            max_execution_buffers,
-            max_retained_processes,
-            output_buffer_bytes,
-            sleep_max_ms
-        );
+        child_limits.ensure_within_parent(&parent_limits)?;
         let execution_id = invocation
             .execution_id
             .ok_or_else(|| Error::tool("delegation requires its admitted execution identity"))?;
@@ -141,6 +133,7 @@ impl DelegateParent for SessionInner {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         self.ensure_open()?;
+        self.require_derivation()?;
         crate::budget::check(
             crate::LimitKind::PendingExecutions,
             children.len().saturating_add(1),
@@ -173,6 +166,7 @@ impl DelegateParent for SessionInner {
             .inner
             .state
             .update(|state| state.parent_relationship = child.parent_relationship());
+        self.bind_child_communication(child)?;
         children.insert(
             id,
             ChildRecord {
@@ -188,6 +182,7 @@ impl DelegateParent for SessionInner {
         target: &str,
         result: Result<(), crate::observation::diagnostics::ToolDiagnostic>,
     ) {
+        self.remove_child_communication(child_id);
         self.delegated_children
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -208,7 +203,13 @@ impl DelegateParent for SessionInner {
         input: String,
     ) -> Result<TurnOutcome, Error> {
         self.ensure_open()?;
+        self.require_derivation()?;
         let child = self.owned_child(child_id, target)?;
+        if child.communication_identity().is_some_and(|identity| {
+            identity.interaction == crate::state::communication::SessionInteraction::Return
+        }) {
+            return Err(Error::denied("return child cannot receive follow-up input"));
+        }
         child
             .inner
             .submit(crate::SessionInput::text(input), None)
@@ -216,7 +217,14 @@ impl DelegateParent for SessionInner {
     }
     async fn resume_child(&self, child_id: &str, target: &str) -> Result<TurnOutcome, Error> {
         self.ensure_open()?;
-        self.owned_child(child_id, target)?.inner.resume(None).await
+        self.require_derivation()?;
+        let child = self.owned_child(child_id, target)?;
+        if child.communication_identity().is_some_and(|identity| {
+            identity.interaction == crate::state::communication::SessionInteraction::Return
+        }) {
+            return Err(Error::denied("return child cannot be resumed"));
+        }
+        child.inner.resume(None).await
     }
     async fn close_child(&self, child_id: &str, target: &str) -> Result<(), Error> {
         let receipt = self

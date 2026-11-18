@@ -5,7 +5,9 @@ use crate::runtime::tool::ToolContext;
 /// Unforgeable, non-serializable authority for one approved invocation. Cloning
 /// carries that same authority into its continuations, never into a new call.
 pub struct AdmittedInvocation {
-    entered: std::sync::atomic::AtomicBool,
+    // 0 original/unentered, 1 resolved/unentered, 2 original/entered,
+    // 3 resolved/entered. A single CAS owns binding versus dispatch races.
+    dispatch_state: std::sync::atomic::AtomicU8,
     processes: Arc<dyn crate::runtime::execution::process::ProcessControl>,
     state: crate::State,
     agent: String,
@@ -28,14 +30,46 @@ struct AdmissionWitness {
     lineage: Vec<(Arc<PermissionController>, PolicySnapshot)>,
 }
 impl AdmittedInvocation {
+    /// The sealed resolver is the sole producer of this non-serializable witness.
+    /// Its private fields prevent arbitrary callers from authorizing rewritten input.
+    pub(crate) fn certify_resolution(
+        &self,
+        context: &ToolContext,
+        resolved: &crate::runtime::tool::secret::ResolvedArguments,
+    ) -> Result<(), PermissionError> {
+        self.validate(context, None)?;
+        if !resolved.belongs_to(self) {
+            return Err(PermissionError::ProofMismatch("resolver approval differs"));
+        }
+        self.witness
+            .root
+            .ensure_witness(self.witness.revision, &self.witness.lineage)?;
+        self.dispatch_state
+            .compare_exchange(
+                0,
+                1,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .map_err(|_| PermissionError::AlreadyDispatched)?;
+        Ok(())
+    }
     pub(crate) fn begin_dispatch(
         &self,
         context: &ToolContext,
         component: Option<&str>,
     ) -> Result<(), PermissionError> {
         self.validate(context, component)?;
-        if self.entered.load(std::sync::atomic::Ordering::Acquire) {
+        let state = self
+            .dispatch_state
+            .load(std::sync::atomic::Ordering::Acquire);
+        if state >= 2 {
             return Err(PermissionError::AlreadyDispatched);
+        }
+        if state == 1 && !context.has_resolution_for(self) {
+            return Err(PermissionError::ProofMismatch(
+                "resolved argument witness required",
+            ));
         }
         self.witness
             .root
@@ -43,10 +77,10 @@ impl AdmittedInvocation {
         for interaction in &self.interactions {
             interaction.validate_dispatch()?;
         }
-        self.entered
+        self.dispatch_state
             .compare_exchange(
-                false,
-                true,
+                state,
+                state + 2,
                 std::sync::atomic::Ordering::AcqRel,
                 std::sync::atomic::Ordering::Acquire,
             )
@@ -69,6 +103,16 @@ impl AdmittedInvocation {
         &self,
         arguments: &serde_json::Value,
     ) -> Result<(), PermissionError> {
+        if self
+            .dispatch_state
+            .load(std::sync::atomic::Ordering::Acquire)
+            & 1
+            != 0
+        {
+            return Err(PermissionError::ProofMismatch(
+                "resolved argument witness required",
+            ));
+        }
         if &self.arguments != arguments {
             return Err(PermissionError::ProofMismatch("original arguments differ"));
         }
@@ -247,7 +291,7 @@ impl PermissionController {
                         return Err(PermissionError::AlreadyDispatched);
                     }
                     return Ok(Arc::new(AdmittedInvocation {
-                        entered: std::sync::atomic::AtomicBool::new(false),
+                        dispatch_state: std::sync::atomic::AtomicU8::new(0),
                         processes: invocation.processes.clone(),
                         state: invocation.state.clone(),
                         agent: invocation.agent.clone(),
@@ -297,7 +341,7 @@ impl PermissionController {
         );
         // Preserve owner order even when all members are Static. Each Ask belongs
         // to that owner, and matcher work is bounded across the complete chain.
-        let actions = if request.subject.is_tool() {
+        let mut actions = if request.subject.is_tool() {
             let policies = chain
                 .iter()
                 .map(|(_, snapshot)| compile(snapshot, &request.tool).map_err(configuration))
@@ -313,6 +357,18 @@ impl PermissionController {
                 .map(|(_, snapshot)| snapshot.config.initialization)
                 .collect()
         };
+        if request.subject.is_tool()
+            && (request.tool == "escalate"
+                || (request.tool == "send_message"
+                    && request
+                        .arguments
+                        .get("intent")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("send")))
+            && let Some(action) = actions.first_mut()
+        {
+            *action = action.strictest(Action::Ask);
+        }
         self.ensure_witness(local.revision, &lineage)?;
         if let Some(((owner, snapshot), _)) = chain
             .iter()

@@ -1,5 +1,8 @@
 //! Session-owned process policy and UI projection; Host owns execution and capture.
 mod control;
+#[cfg(test)]
+#[path = "process/redaction_tests.rs"]
+mod redaction_tests;
 mod registry;
 mod source;
 pub use control::ProcessControl;

@@ -149,6 +149,29 @@ impl AdmissionCheckpoint {
 /// and legacy workspace bytes never authorize filesystem restoration.
 #[async_trait]
 pub trait Journal: Send + Sync + 'static {
+    fn supports_communication(&self) -> bool {
+        false
+    }
+    /// Commit a bounded inbox sidecar for this exact communication identity.
+    /// Identical retries may observe the same revision; changed writes require
+    /// the next revision. Unsupported implementations never acknowledge success.
+    async fn commit_communication(
+        &self,
+        _agent_id: &crate::state::communication::AgentId,
+        _inbox: crate::state::communication::inbox::DurableInbox,
+    ) -> Result<(), Error> {
+        Err(Error::config(
+            "Journal does not support durable communication inboxes",
+        ))
+    }
+    async fn load_communication(
+        &self,
+        _agent_id: &crate::state::communication::AgentId,
+    ) -> Result<Option<crate::state::communication::inbox::DurableInbox>, Error> {
+        Err(Error::config(
+            "Journal does not support durable communication inboxes",
+        ))
+    }
     async fn commit(&self, recover: Recover) -> Result<(), Error>;
 
     /// Persist admission recovery without promoting its synthetic receipt suffix

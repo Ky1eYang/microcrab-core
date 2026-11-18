@@ -48,6 +48,7 @@ pub enum InboxFailureKind {
         protocol_reason: Option<String>,
         reason: String,
         failure: Option<microcrab_transport::ProviderFailure>,
+        empty_completion: Option<microcrab_transport::EmptyCompletionFacts>,
     },
     Protocol(Option<String>),
     Limit(crate::LimitError),
@@ -280,6 +281,7 @@ fn inbox_failure(error: &Error) -> InboxFailureKind {
                 .unwrap_or("provider failure")
                 .to_owned(),
             failure: cause.failure_details().cloned(),
+            empty_completion: cause.empty_completion_details(),
         },
         Error::Protocol(cause) => {
             InboxFailureKind::Protocol(cause.public_reason().map(str::to_owned))
@@ -323,6 +325,28 @@ fn inbox_failure(error: &Error) -> InboxFailureKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn empty_completion_inbox_projection_preserves_closed_facts() {
+        let facts = microcrab_transport::EmptyCompletionFacts {
+            reasoning_present: true,
+            finish: microcrab_transport::EmptyCompletionFinish::Stop,
+        };
+        let error = Error::Provider(microcrab_transport::ProviderError::empty_completion(facts));
+        match inbox_failure(&error) {
+            InboxFailureKind::Provider {
+                empty_completion,
+                protocol_reason,
+                failure,
+                ..
+            } => {
+                assert_eq!(empty_completion, Some(facts));
+                assert!(protocol_reason.is_none());
+                assert!(failure.is_none());
+            }
+            other => panic!("unexpected category: {other:?}"),
+        }
+    }
 
     #[test]
     fn inbox_projection_retains_safe_numeric_facts_without_error_labels() {

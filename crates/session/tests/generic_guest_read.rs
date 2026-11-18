@@ -114,7 +114,7 @@ async fn maintained_coding_large_read_preserves_escaped_unicode_through_closed_b
         .messages()
         .iter()
         .find_map(|item| match item {
-            ContentItem::Tool { call_id, content } if call_id == "large-native-read" => {
+            ContentItem::Tool { call_id, content, .. } if call_id == "large-native-read" => {
                 Some(content.clone())
             }
             _ => None,

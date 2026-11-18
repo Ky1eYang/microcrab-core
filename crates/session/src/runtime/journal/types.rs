@@ -174,6 +174,25 @@ impl Recover {
             report.validate()?;
         }
         self.state.limits.validate()?;
+        if let Some(communication) = &self.state.communication {
+            communication.validate()?;
+            let expected_depth = match self.state.session_kind {
+                Some(crate::SessionKind::Interactive) => 0,
+                Some(crate::SessionKind::Delegated) => 1,
+                _ => {
+                    return Err(Error::config(
+                        "communication identity requires a conversational Session kind",
+                    ));
+                }
+            };
+            if communication.identity.depth != expected_depth
+                || (expected_depth == 1 && communication.identity.parent_session_id.is_none())
+            {
+                return Err(Error::config(
+                    "recovered communication lineage disagrees with Session kind",
+                ));
+            }
+        }
         if self.state.agent_init.len() > 128 {
             return Err(Error::config("initialization evidence capacity exceeded"));
         }

@@ -676,6 +676,7 @@ async fn sequential_public_operations_await_internal_checkpoint_but_competing_pu
                 boundaries: Arc::new(Mutex::new(vec![])),
             };
             let agent = microcrab_agent_types::AgentInfo {
+                tool_media_output_bytes: Default::default(),
                 name: "fixture".into(),
                 modes: ["general", "alternate"]
                     .into_iter()
@@ -843,6 +844,7 @@ async fn mode_admitted_during_recovery_io_survives_historical_state_publication(
         release: Arc::new(tokio::sync::Semaphore::new(0)),
     };
     let agent = microcrab_agent_types::AgentInfo {
+        tool_media_output_bytes: Default::default(),
         name:"mode-fixture".into(), modes:["general", "alternate"].into_iter().map(|name| microcrab_agent_types::AgentMode {
             description: String::new(), prompt: String::new(), name:name.into(), role:microcrab_agent_types::AgentRole::MainAgent, permissions:vec![serde_json::from_value(json!({"tool":{"kind":"exact","value":"held"},"action":if name == "general" {"deny"} else {"ask"}})).unwrap()],
         }).collect(), tools:vec![], variables:Default::default(),

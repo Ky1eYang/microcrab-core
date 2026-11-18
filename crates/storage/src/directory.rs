@@ -127,6 +127,10 @@ impl OperationSettlement {
 /// mistaken for absent sessions or admitted as current configuration.
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "availability", rename_all = "snake_case")]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "Public listing entries retain their compatible inline SessionRecord representation"
+)]
 pub enum SessionEntry {
     Available { record: SessionRecord },
     Unavailable { id: String, reason: String },
@@ -149,6 +153,14 @@ pub trait Directory: Send + Sync {
             .into_iter()
             .map(|record| SessionEntry::Available { record })
             .collect())
+    }
+    /// Resolve the validated owner of one exact globally indexed Session id.
+    /// This is a routing selector, never authentication or permission to read a Session.
+    /// Embedders without an exact index fail explicitly rather than scanning owners.
+    async fn session_owner(&self, _id: &str) -> Result<Option<String>, Error> {
+        Err(Error::config(
+            "directory does not support exact Session owner lookup",
+        ))
     }
     async fn get(&self, owner: &str, id: &str) -> Result<Option<SessionRecord>, Error>;
     async fn list(&self, owner: &str) -> Result<Vec<SessionRecord>, Error>;

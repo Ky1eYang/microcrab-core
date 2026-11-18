@@ -37,6 +37,7 @@ fn content() -> Content {
         subagent: None,
         system: "synthetic".into(),
         items: vec![ContentItem::User {
+            envelope: None,
             source: None,
             parts: vec![InputPart::Text {
                 text: "question".into(),

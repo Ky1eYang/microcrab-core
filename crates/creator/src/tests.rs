@@ -48,6 +48,7 @@ fn child_config(
         wasm: vec![],
         external: vec![],
         catalog: vec![AgentInfo {
+            tool_media_output_bytes: Default::default(),
             name: "reviewer".into(),
             modes: vec![AgentMode {
                 description: String::new(),
@@ -235,6 +236,7 @@ async fn failed_requested_mode_closes_the_started_session() {
 fn select_child_uses_declared_roles_without_magic_caller_or_target_names() {
     use crate::delegate::select_child;
     let catalog = vec![AgentInfo {
+        tool_media_output_bytes: Default::default(),
         name: "execute".into(),
         modes: vec![
             AgentMode {
@@ -463,27 +465,34 @@ async fn parent_close_cancels_pending_assembly_and_joins_cleanup() {
     pending_assembly_settles("close").await;
 }
 
-struct PendingLoad(Arc<tokio::sync::Notify>);
-impl microcrab_session::state::reference::Reference for PendingLoad {
-    type Error = std::io::Error;
-    fn kind(&self) -> &str {
-        "pending_load"
+struct PendingStartupAudit {
+    entered: Arc<tokio::sync::Notify>,
+    closed: Arc<AtomicUsize>,
+}
+impl Auditor for PendingStartupAudit {
+    fn is_enabled(&self) -> bool {
+        true
     }
-    async fn load(&self) -> Result<(), Self::Error> {
-        self.0.notify_one();
-        std::future::pending().await
+    fn publish(&self, moment: Moment, _: AuditBody) {
+        if moment == Moment::SessionTerminated {
+            self.closed.fetch_add(1, Ordering::SeqCst);
+        }
     }
-    fn list(&self) -> Result<Vec<microcrab_session::state::reference::ReferenceInfo>, Self::Error> {
-        Ok(vec![])
-    }
-    fn read(
-        &self,
-        _: &str,
-    ) -> Result<Option<microcrab_session::state::reference::ReferenceContent>, Self::Error> {
-        Ok(None)
-    }
-    fn change(&self) -> Result<Option<serde_json::Value>, Self::Error> {
-        Ok(None)
+    fn intervene<'a>(
+        &'a self,
+        moment: Moment,
+        _: microcrab_auditor::HookContext<'a>,
+    ) -> microcrab_auditor::BoxFuture<
+        'a,
+        Result<microcrab_auditor::Injection, microcrab_auditor::AuditorError>,
+    > {
+        Box::pin(async move {
+            if moment == Moment::SessionCreated {
+                self.entered.notify_one();
+                std::future::pending::<()>().await;
+            }
+            Ok(Default::default())
+        })
     }
 }
 struct PendingStart {
@@ -500,7 +509,10 @@ impl crate::delegate::ChildFactory for PendingStart {
         _: &str,
         processes: Arc<dyn microcrab_session::execution::process::ProcessControl>,
     ) -> Result<crate::delegate::ChildSession, Error> {
-        let auditor = Arc::new(ObserveClose(self.closed.clone()));
+        let auditor = Arc::new(PendingStartupAudit {
+            entered: self.entered.clone(),
+            closed: self.closed.clone(),
+        });
         let runtime = Runtime::new(vec![], Arc::new(DeclarativePermission))?;
         let session = Session::builder(Answer, runtime)
             .session_id("pending-start")
@@ -508,9 +520,6 @@ impl crate::delegate::ChildFactory for PendingStart {
             .is_main(false)
             .processes_parent(processes)
             .auditor(auditor.clone())
-            .references(vec![microcrab_session::DynReference::new(PendingLoad(
-                self.entered.clone(),
-            ))?])
             .build()?;
         Ok(crate::delegate::ChildSession {
             id: "pending-start".into(),
@@ -1371,6 +1380,7 @@ struct TestDelegate {
 }
 fn test_agent() -> AgentInfo {
     AgentInfo {
+        tool_media_output_bytes: Default::default(),
         name: "reviewer".into(),
         modes: vec![AgentMode {
             name: "review".into(),

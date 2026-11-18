@@ -54,6 +54,10 @@ impl ExecutionController for ChildController {
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Delegation preserves separate target, mode, authority, focus and invocation owners"
+)]
 pub(super) async fn start(
     executor: &OwnedDelegateExecutor,
     target: &str,
@@ -61,6 +65,8 @@ pub(super) async fn start(
     mode: Option<&str>,
     context_mode: &str,
     timeout_ms: Option<u64>,
+    interaction: crate::state::communication::SessionInteraction,
+    focus: Vec<crate::state::reference::focus::FocusSnapshot>,
     invocation: ToolContext,
 ) -> Result<ToolOutput, Error> {
     // Capture authority before child registration or assembly can yield.
@@ -158,6 +164,33 @@ pub(super) async fn start(
                 .as_ref()
                 .and_then(std::sync::Weak::upgrade)
                 .ok_or_else(|| Error::tool("delegation requires the issuing Session owner"))?;
+            if invocation.state.snapshot().communication.is_some()
+                && let Some(mut communication) = child.session.state().communication
+            {
+                communication.identity.interaction = interaction;
+                communication.focus = focus;
+                communication.validate()?;
+                child.session.inner.configure_unstarted_conversation_tools(
+                    Some(&communication.identity),
+                    Some(&child.mode),
+                )?;
+                child
+                    .session
+                    .inner
+                    .state
+                    .install_focused_references(communication.focus.clone())?;
+                child
+                    .session
+                    .inner
+                    .state
+                    .update(|snapshot| snapshot.communication = Some(communication));
+            } else if interaction != crate::state::communication::SessionInteraction::Persistent
+                || !focus.is_empty()
+            {
+                return Err(Error::denied(
+                    "legacy child cannot accept new focused interaction",
+                ));
+            }
             parent.adopt_child(
                 &target,
                 mode.as_deref(),
@@ -228,10 +261,10 @@ pub(super) async fn start(
             .as_ref()
             .map(|_| ())
             .map_err(|error| error.tool_diagnostic());
-        if let Some(parent) = executor_parent.as_ref().and_then(std::sync::Weak::upgrade) {
-            if let Some(id) = child_id {
-                parent.child_settled(&id, &target, cleanup_result.clone());
-            }
+        if let Some(parent) = executor_parent.as_ref().and_then(std::sync::Weak::upgrade)
+            && let Some(id) = child_id
+        {
+            parent.child_settled(&id, &target, cleanup_result.clone());
         }
         let terminal = cleanup.and(result);
         // Publish cleanup ACK before the terminal buffer event: an explicit release
@@ -298,6 +331,21 @@ async fn observe(
     budget: usize,
     progress: Option<&crate::runtime::execution::ExecutionProgress>,
 ) -> Result<(), Error> {
+    if child
+        .session
+        .communication_identity()
+        .is_some_and(|identity| {
+            identity.interaction == crate::state::communication::SessionInteraction::Return
+        })
+    {
+        let outcome = child
+            .session
+            .inner
+            .submit(SessionInput::text(input), None)
+            .await?;
+        reply(child, target, outcome, writer, budget)?;
+        return Ok(());
+    }
     let mut turns = child.session.subscribe_turns();
     let mut notices = child.session.subscribe_notices();
     let mut activity = child.session.subscribe_activity();

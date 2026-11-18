@@ -44,18 +44,17 @@ impl CreatorEnvelope {
         if let Some(id) = &self.request_head {
             valid_hash(id)?;
         }
-        if let Some(model) = &self.model_selection {
-            if model.provider_id.trim().is_empty()
+        if let Some(model) = &self.model_selection
+            && (model.provider_id.trim().is_empty()
                 || model.provider_id.len() > 256
                 || model.model.trim().is_empty()
                 || model.model.len() > 1024
                 || model
                     .variant
                     .as_ref()
-                    .is_some_and(|v| v.trim().is_empty() || v.len() > 64)
-            {
-                return Err(Error::config("invalid creator model route selection"));
-            }
+                    .is_some_and(|v| v.trim().is_empty() || v.len() > 64))
+        {
+            return Err(Error::config("invalid creator model route selection"));
         }
         if let Some(witness) = &self.route_witness {
             valid_hash(witness)?;

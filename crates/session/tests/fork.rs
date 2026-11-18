@@ -564,7 +564,7 @@ async fn fork_without_reference_override_keeps_inherited_ids_expandable() {
     );
     assert_eq!(target.state_handle().list_references().unwrap().len(), 1);
     target.submit("expand the inherited skill").await.unwrap();
-    assert!(target.messages().iter().any(|item| matches!(item, microcrab_session::context::ContentItem::Tool { call_id, content } if call_id == "fork-expand" && content.contains("Inherited reference body ✓"))));
+    assert!(target.messages().iter().any(|item| matches!(item, microcrab_session::context::ContentItem::Tool { call_id, content, .. } if call_id == "fork-expand" && content.contains("Inherited reference body ✓"))));
     assert_eq!(snapshot_value(&source), before);
     assert!(!Arc::ptr_eq(
         &source.process_control(),

@@ -195,11 +195,34 @@ impl OpenAiResponse {
                         "responses",
                     )?);
                 }
-                Message::Tool { call_id, content } => {
+                Message::Tool {
+                    call_id,
+                    content,
+                    parts,
+                } => {
+                    let output = if parts.is_empty() {
+                        json!(content)
+                    } else {
+                        let mut blocks = vec![json!({"type": "input_text", "text": content})];
+                        for part in parts {
+                            blocks.push(match part {
+                                InputPart::Text { text } => json!({"type": "input_text", "text": text}),
+                                InputPart::Image { source } => {
+                                    let url = match source {
+                                        ImageSource::Data { media_type, data } => format!("data:{media_type};base64,{}", STANDARD.encode(data)),
+                                        ImageSource::Url { url } => url.clone(),
+                                        _ => return Err(Error::protocol("tool images require resolved Data or route URL hints")),
+                                    };
+                                    json!({"type": "input_image", "image_url": url})
+                                }
+                            });
+                        }
+                        Value::Array(blocks)
+                    };
                     input.push(json!({
                         "type": "function_call_output",
                         "call_id": call_id,
-                        "output": content,
+                        "output": output,
                     }));
                 }
             }
@@ -346,6 +369,10 @@ impl OpenAiResponse {
 
         audit.received_complete();
         if !status.is_success() {
+            if let Some(error) = crate::media::remote_image_fetch_rejection(status, &audit.received)
+            {
+                return Err(error);
+            }
             return Err(Error::ProviderStatus {
                 status: status.as_u16(),
             });
@@ -673,10 +700,10 @@ impl OpenAiResponsesSseDecoder {
             return Err(Error::protocol("Responses final item type changed"));
         }
         for key in ["id", "call_id", "name"] {
-            if let Some(old) = started.get(key).filter(|v| !v.is_null()) {
-                if item.get(key) != Some(old) {
-                    return Err(Error::protocol("Responses final item identity changed"));
-                }
+            if let Some(old) = started.get(key).filter(|v| !v.is_null())
+                && item.get(key) != Some(old)
+            {
+                return Err(Error::protocol("Responses final item identity changed"));
             }
         }
         let observed = if item["type"] == "message" {
@@ -686,12 +713,12 @@ impl OpenAiResponsesSseDecoder {
         } else {
             None
         };
-        if let Some(observed) = observed.filter(|text| !text.is_empty()) {
-            if observed != item_plaintext(item)? {
-                return Err(Error::protocol(
-                    "Responses final item text differs from accumulated text",
-                ));
-            }
+        if let Some(observed) = observed.filter(|text| !text.is_empty())
+            && observed != item_plaintext(item)?
+        {
+            return Err(Error::protocol(
+                "Responses final item text differs from accumulated text",
+            ));
         }
         if let Some(call) = self.tool_calls.get_mut(&index) {
             let arguments = item
@@ -733,12 +760,11 @@ impl OpenAiResponsesSseDecoder {
         if let (Some(a), Some(b)) = (
             value.get("type").and_then(Value::as_str),
             frame.event.as_deref(),
-        ) {
-            if a != b {
-                return Err(Error::protocol(
-                    "Responses event name differs from payload type",
-                ));
-            }
+        ) && a != b
+        {
+            return Err(Error::protocol(
+                "Responses event name differs from payload type",
+            ));
         }
         if self.completed {
             return Err(Error::protocol("Responses event received after completion"));
@@ -975,12 +1001,12 @@ impl OpenAiResponsesSseDecoder {
                         "Responses argument event after arguments.done",
                     ));
                 }
-                if let Some(id) = value.get("item_id") {
-                    if id.as_str() != call.item_id.as_deref() {
-                        return Err(Error::protocol(
-                            "Responses argument item identity differs from start",
-                        ));
-                    }
+                if let Some(id) = value.get("item_id")
+                    && id.as_str() != call.item_id.as_deref()
+                {
+                    return Err(Error::protocol(
+                        "Responses argument item identity differs from start",
+                    ));
                 }
                 if kind.ends_with(".delta") {
                     let delta = value
@@ -1156,7 +1182,7 @@ impl OpenAiResponsesSseDecoder {
             ));
         }
         if let Some(terminal) = self.terminal {
-            let response = decode_json_response(terminal, request)?;
+            let response = decode_json_response_inner(terminal, request, true)?;
             if !ordered_text.is_empty() && ordered_text != response.content {
                 return Err(Error::protocol(
                     "Responses terminal text differs from streamed text",
@@ -1168,6 +1194,11 @@ impl OpenAiResponsesSseDecoder {
                     "Responses terminal reasoning differs from streamed reasoning",
                 ));
             }
+            crate::validate_response_with_finish(
+                &response,
+                &request.tools,
+                crate::EmptyCompletionFinish::Stop,
+            )?;
             return Ok(response);
         }
         let mut output = Vec::new();
@@ -1198,8 +1229,11 @@ impl OpenAiResponsesSseDecoder {
         if !has_text && !self.content_text.is_empty() {
             output.push(json!({"type":"message","content":[{"type":"output_text","text":self.content_text}]}));
         }
-        let mut response =
-            decode_json_response(json!({"status":"completed","output":output}), request)?;
+        let mut response = decode_json_response_inner(
+            json!({"status":"completed","output":output}),
+            request,
+            true,
+        )?;
         if has_text && !ordered_text.is_empty() && response.content != ordered_text {
             return Err(Error::protocol(
                 "Responses done text differs from streamed text",
@@ -1217,6 +1251,11 @@ impl OpenAiResponsesSseDecoder {
             samples: 1,
             ..Usage::default()
         });
+        crate::validate_response_with_finish(
+            &response,
+            &request.tools,
+            crate::EmptyCompletionFinish::Stop,
+        )?;
         Ok(response)
     }
 }
@@ -1282,6 +1321,14 @@ fn extract_usage(value: &Value) -> Result<Usage, Error> {
     Ok(usage)
 }
 fn decode_json_response(value: Value, request: &Request) -> Result<Response, Error> {
+    decode_json_response_inner(value, request, false)
+}
+
+fn decode_json_response_inner(
+    value: Value,
+    request: &Request,
+    defer_empty: bool,
+) -> Result<Response, Error> {
     use microcrab_protocol::{AssistantPart, AssistantProviderMetadata, AssistantReplayHint};
     if value
         .get("error")
@@ -1311,10 +1358,10 @@ fn decode_json_response(value: Value, request: &Request) -> Result<Response, Err
     let mut parts = vec![];
     let mut replay_hints = vec![];
     for item in items {
-        if let Some(status) = item.get("status") {
-            if !matches!(status.as_str(), Some("completed")) {
-                return Err(Error::protocol("Responses output item is not completed"));
-            }
+        if let Some(status) = item.get("status")
+            && !matches!(status.as_str(), Some("completed"))
+        {
+            return Err(Error::protocol("Responses output item is not completed"));
         }
         match item.get("type").and_then(Value::as_str) {
             Some("message") => {
@@ -1437,7 +1484,17 @@ fn decode_json_response(value: Value, request: &Request) -> Result<Response, Err
         usage,
         provider_metadata: Some(metadata),
     };
-    crate::validate_response(&response, &request.tools)?;
+    if defer_empty {
+        crate::validate_response_shape(&response, &request.tools)?;
+    } else if value.get("status").and_then(Value::as_str) == Some("completed") {
+        crate::validate_response_with_finish(
+            &response,
+            &request.tools,
+            crate::EmptyCompletionFinish::Stop,
+        )?;
+    } else {
+        crate::validate_response(&response, &request.tools)?;
+    }
     Ok(response)
 }
 

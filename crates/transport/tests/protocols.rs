@@ -29,6 +29,7 @@ fn sample_request() -> Request {
                 }],
             },
             Message::Tool {
+                parts: vec![],
                 call_id: "call_123".into(),
                 content: json!({"temperature": 22}).to_string(),
             },

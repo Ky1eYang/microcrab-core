@@ -148,8 +148,15 @@ async fn compact_checkpoint_reopen_and_recover_preserve_pending_until_one_valid_
 #[tokio::test]
 async fn full_context_and_variable_budget_rejections_leave_pending_admission_reusable() {
     let client = Arc::new(Capture::default());
+    let baseline = Session::builder(Capture::default(), runtime())
+        .build()
+        .unwrap();
+    baseline.start().await.unwrap();
+    baseline.compact("summary", json!({})).await.unwrap();
+    let budget = baseline.context_measurement().unwrap().bytes + 2048;
+    baseline.close().await.unwrap();
     let limits = microcrab_session::Limits {
-        max_context_bytes: 4096,
+        max_context_bytes: budget,
         ..Default::default()
     };
     let session = Session::builder_arc(client.clone(), runtime())
@@ -160,14 +167,14 @@ async fn full_context_and_variable_budget_rejections_leave_pending_admission_reu
     session.compact("summary", json!({})).await.unwrap();
     let before = serde_json::to_value(session.checkpoint().await.unwrap()).unwrap();
     assert!(matches!(
-        session.submit("x".repeat(10_000)).await,
+        session.submit("x".repeat(budget * 2)).await,
         Err(Error::Limit(_))
     ));
     let mut input = SessionInput::text("large custom variable");
     input
         .variables
         .set
-        .insert("large".into(), json!("x".repeat(10_000)));
+        .insert("large".into(), json!("x".repeat(budget * 2)));
     assert!(matches!(session.submit(input).await, Err(Error::Limit(_))));
     assert_eq!(
         serde_json::to_value(session.checkpoint().await.unwrap()).unwrap(),

@@ -1,9 +1,10 @@
 //! Correlation and cancellation retain an effect's unknown status across route loss.
 use super::*;
+use microcrab_host_api::Bytes;
 use microcrab_host_api::{
     ErrorCategory, GlobOutput, GlobRequest, GrepOutput, GrepRequest, HostError, OpContext,
     ReadOutput, ReadRequest, WriteOutput, WriteRequest,
-    filesystem::{FileKind, FileMeta, FsApi},
+    filesystem::{FileHandle, FileKind, FileMeta, FsApi, OpenOptions},
 };
 use microcrab_host_protocol::{ErrorCode, HostRequest, WireError};
 use serde::de::DeserializeOwned;
@@ -941,14 +942,19 @@ impl Host for RemoteHost {
         max_bytes: usize,
         cancel: CancellationToken,
     ) -> Result<Vec<u8>, ToolError> {
-        self.typed(
-            HostRequest::ReadFile {
-                path: path_string(&path)?,
-                max_bytes: u32::try_from(max_bytes).map_err(|_| ToolError::FileLimit)?,
-            },
-            cancel,
-        )
-        .await
+        let bytes: Vec<u8> = self
+            .typed(
+                HostRequest::ReadFile {
+                    path: path_string(&path)?,
+                    max_bytes: u32::try_from(max_bytes).map_err(|_| ToolError::FileLimit)?,
+                },
+                cancel,
+            )
+            .await?;
+        if bytes.len() > max_bytes {
+            return Err(ToolError::FileLimit);
+        }
+        Ok(bytes)
     }
     async fn cache_point(
         &self,
@@ -1036,5 +1042,57 @@ impl FsApi for RemoteHost {
             size,
             modified,
         })
+    }
+    async fn open(
+        &self,
+        ctx: &OpContext,
+        path: &Path,
+        options: OpenOptions,
+    ) -> Result<FileHandle, HostError> {
+        ctx.check()?;
+        if !self.capabilities.supports("filesystem.open") {
+            return Err(HostError::unsupported_known("filesystem.open"));
+        }
+        if !options.read
+            || options.write
+            || options.create
+            || options.truncate
+            || options.append
+            || options.exclusive
+        {
+            return Err(HostError::unsupported_known("filesystem.open.mutable"));
+        }
+        let path_buf = path.to_path_buf();
+        let bytes = ctx
+            .run(async {
+                self.read_file(
+                    path_buf,
+                    20 * 1024 * 1024,
+                    ctx.cancel.clone(),
+                )
+                .await
+                .map_err(ToolError::into_host_error)
+            })
+            .await?;
+        self.files.insert(bytes.into(), ctx.clone())
+    }
+    async fn read(
+        &self,
+        ctx: &OpContext,
+        handle: FileHandle,
+        offset: u64,
+        len: usize,
+    ) -> Result<Bytes, HostError> {
+        ctx.check()?;
+        if !self.capabilities.supports("filesystem.read") {
+            return Err(HostError::unsupported_known("filesystem.read"));
+        }
+        self.files.read(ctx, handle, offset, len)
+    }
+    async fn close(&self, ctx: &OpContext, handle: FileHandle) -> Result<(), HostError> {
+        if !self.capabilities.supports("filesystem.close") {
+            return Err(HostError::unsupported_known("filesystem.close"));
+        }
+        self.files.close(ctx, handle)
     }
 }

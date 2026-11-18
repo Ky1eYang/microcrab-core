@@ -1,4 +1,8 @@
 //! Origin-tagged dispatch, schema validation and provider-default registration.
+#[cfg(test)]
+mod media_tests;
+#[cfg(test)]
+mod schema_tests;
 use super::*;
 use microcrab_protocol::ToolCall;
 use std::collections::BTreeMap;
@@ -7,6 +11,8 @@ struct Entry {
     tool: Arc<dyn Tool>,
     definition: ToolDefinition,
     schema: jsonschema::Validator,
+    media_output_bytes: usize,
+    secret_delivery: SecretDelivery,
 }
 pub(crate) struct ToolRegistry {
     entries: BTreeMap<String, Entry>,
@@ -18,6 +24,18 @@ impl ToolRegistry {
             let origin = registration.origin();
             let tool = registration.tool();
             let definition = tool.definition();
+            let media_output_bytes = tool.media_output_bytes();
+            let secret_delivery = match &registration {
+                ToolRegistration::Builtin(BuiltinTool::Job) => SecretDelivery::Resolve,
+                ToolRegistration::Builtin(_) => SecretDelivery::ForwardPlaceholders,
+                ToolRegistration::Wasm(_) => SecretDelivery::Resolve,
+                ToolRegistration::External(_) => tool.secret_delivery(),
+            };
+            crate::budget::check(
+                crate::LimitKind::AttachmentBytes,
+                media_output_bytes,
+                crate::admission::image::MAX_IMAGE_BYTES,
+            )?;
             if origin != ToolOrigin::Builtin && BuiltinTool::from_name(&definition.name).is_some() {
                 return Err(Error::config_with_private(
                     "builtin tool name is reserved",
@@ -49,6 +67,8 @@ impl ToolRegistry {
                         tool,
                         definition,
                         schema,
+                        media_output_bytes,
+                        secret_delivery,
                     },
                 )
                 .is_some()
@@ -60,6 +80,37 @@ impl ToolRegistry {
             }
         }
         Ok(Self { entries })
+    }
+    pub(crate) fn for_conversation(
+        &self,
+        identity: Option<&crate::state::communication::ConversationIdentity>,
+    ) -> Result<Self, Error> {
+        let mut registrations = self
+            .entries
+            .iter()
+            .filter_map(|(name, entry)| {
+                if matches!(name.as_str(), "send_message" | "escalate") {
+                    return None;
+                }
+                if name == "delegate" && identity.is_some_and(|identity| identity.depth != 0) {
+                    return None;
+                }
+                Some(match entry.origin {
+                    ToolOrigin::Builtin => ToolRegistration::Builtin(BuiltinTool::from_name(name)?),
+                    ToolOrigin::Wasm => ToolRegistration::Wasm(entry.tool.clone()),
+                    ToolOrigin::External => ToolRegistration::External(entry.tool.clone()),
+                })
+            })
+            .collect::<Vec<_>>();
+        if let Some(identity) = identity.filter(|identity| {
+            identity.interaction == crate::state::communication::SessionInteraction::Persistent
+        }) {
+            registrations.push(ToolRegistration::Builtin(BuiltinTool::SendMessage));
+            if identity.depth == 1 {
+                registrations.push(ToolRegistration::Builtin(BuiltinTool::Escalate));
+            }
+        }
+        Self::new(registrations)
     }
     pub(crate) fn replacing_external(&self, external: Vec<Arc<dyn Tool>>) -> Result<Self, Error> {
         let mut registrations = self
@@ -109,6 +160,13 @@ impl ToolRegistry {
             .component_identity()
             .map(str::to_owned)
     }
+    /// Snapshot captured at registration, never derived from tool names or arguments.
+    pub(crate) fn media_output_bytes(&self, name: &str) -> usize {
+        self.entries
+            .get(name)
+            .map_or(0, |entry| entry.media_output_bytes)
+    }
+
     pub(crate) fn origin(&self, name: &str) -> Option<ToolOrigin> {
         self.entries.get(name).map(|entry| entry.origin)
     }
@@ -131,12 +189,33 @@ impl ToolRegistry {
             .map(|e| e.definition.clone())
             .collect()
     }
-    pub(crate) fn validate(&self, call: &ToolCall) -> Result<(), Error> {
+    pub(crate) fn resolve_call(
+        &self,
+        call: &ToolCall,
+        invocation: &mut ToolContext,
+    ) -> Result<ToolCall, Error> {
         let entry = self
             .entries
             .get(&call.name)
             .ok_or_else(|| Error::tool("unknown tool"))?;
-        if let Err(error) = entry.schema.validate(&call.arguments) {
+        secret::resolve(call, invocation, entry.secret_delivery, |resolved| {
+            self.validate_inner(resolved, false)
+        })
+    }
+    pub(crate) fn validate(&self, call: &ToolCall) -> Result<(), Error> {
+        self.validate_inner(call, true)
+    }
+    fn validate_inner(&self, call: &ToolCall, permit_placeholders: bool) -> Result<(), Error> {
+        let entry = self
+            .entries
+            .get(&call.name)
+            .ok_or_else(|| Error::tool("unknown tool"))?;
+        let defer = permit_placeholders && entry.secret_delivery == SecretDelivery::Resolve;
+        if let Some(error) = entry
+            .schema
+            .iter_errors(&call.arguments)
+            .find(|error| !defer || !deferred_string_constraint(error))
+        {
             let mut diagnostic = crate::observation::diagnostics::ToolDiagnostic::new(
                 crate::observation::diagnostics::DiagnosticCode::InvalidArgument,
                 crate::observation::diagnostics::DiagnosticLayer::Runtime,
@@ -174,6 +253,19 @@ impl ToolRegistry {
         entry.tool.execute(call.arguments.clone(), invocation).await
     }
 }
+fn deferred_string_constraint(error: &jsonschema::error::ValidationError<'_>) -> bool {
+    use jsonschema::error::ValidationErrorKind as K;
+    // Object shape, unknown fields, branches and types are never bypassed.
+    // A constrained string is checked in full against its real resolved input.
+    error
+        .instance
+        .as_str()
+        .is_some_and(secret::contains_placeholder)
+        && matches!(
+            &error.kind,
+            K::Pattern { .. } | K::Format { .. } | K::MinLength { .. } | K::MaxLength { .. }
+        )
+}
 fn reject_external_refs(value: &Value) -> Result<(), Error> {
     match value {
         Value::Object(map) => {
@@ -202,7 +294,15 @@ fn schema_reason(error: &jsonschema::error::ValidationError<'_>) -> String {
     use jsonschema::error::ValidationErrorKind as K;
     use microcrab_protocol::diagnostic::{describe, sanitize};
     let cause = match &error.kind {
-        K::Type { kind } => format!("expected type {kind:?}"),
+        K::Type { kind } => {
+            let mut cause = format!("expected type {kind:?}");
+            if error.instance.is_null() {
+                cause.push_str(
+                    "; explicit null is invalid here; provide the required non-null value, or omit an unused optional field",
+                );
+            }
+            cause
+        }
         K::Required { property } => format!(
             "missing required field {}",
             sanitize(property.as_str().unwrap_or("field"), 128)

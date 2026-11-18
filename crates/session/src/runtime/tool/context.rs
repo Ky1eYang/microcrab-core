@@ -18,6 +18,10 @@ impl ToolContext {
         let state = state.for_agent();
         let snapshot = state.snapshot();
         let cache_scope = state.cache_points().scope();
+        let redaction = super::super::execution::InvocationRedaction::default();
+        let processes = processes
+            .for_invocation(redaction.clone())
+            .unwrap_or(processes);
         let wakeup = processes.wakeup();
         Self {
             subject: crate::policy::InvocationSubject::Tool,
@@ -38,6 +42,9 @@ impl ToolContext {
             interaction_timeout_ms: snapshot.limits.interaction_timeout_ms,
             execution_id: None,
             execution_progress: None,
+            resolved_arguments: None,
+            literal_mask: super::injection::LiteralMask::default(),
+            redaction,
             cache_scope,
         }
     }
@@ -49,6 +56,10 @@ impl ToolContext {
         let mode = state.selected_mode.clone();
         let processes: Arc<dyn crate::runtime::execution::process::ProcessControl> =
             crate::runtime::execution::process::ProcessRegistry::detached(state.limits.clone());
+        let redaction = super::super::execution::InvocationRedaction::default();
+        let processes = processes
+            .for_invocation(redaction.clone())
+            .unwrap_or(processes);
         let wakeup = processes.wakeup();
         let state = crate::State::from_snapshot(state).for_agent();
         // Direct embedding has an isolated synthetic round and no journal owner.
@@ -80,6 +91,9 @@ impl ToolContext {
             interaction_timeout_ms: state.snapshot().limits.interaction_timeout_ms,
             execution_id: None,
             execution_progress: None,
+            resolved_arguments: None,
+            literal_mask: super::injection::LiteralMask::default(),
+            redaction,
             admission: None,
             cache_scope,
         }

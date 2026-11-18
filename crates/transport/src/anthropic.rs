@@ -224,14 +224,36 @@ impl Anthropic {
                         push_role_block(&mut messages, "assistant", block);
                     }
                 }
-                Message::Tool { call_id, content } => {
+                Message::Tool {
+                    call_id,
+                    content,
+                    parts,
+                } => {
+                    let tool_content = if parts.is_empty() {
+                        json!(content)
+                    } else {
+                        let mut blocks = vec![json!({"type": "text", "text": content})];
+                        for part in parts {
+                            blocks.push(match part {
+                                InputPart::Text { text } => json!({"type": "text", "text": text}),
+                                InputPart::Image { source } => match source {
+                                    ImageSource::Data { media_type, data } => json!({
+                                        "type": "image", "source": {"type": "base64", "media_type": media_type, "data": STANDARD.encode(data)}
+                                    }),
+                                    ImageSource::Url { url } => json!({"type": "image", "source": {"type": "url", "url": url}}),
+                                    _ => return Err(Error::protocol("tool images require resolved Data or route URL hints")),
+                                },
+                            });
+                        }
+                        Value::Array(blocks)
+                    };
                     push_role_block(
                         &mut messages,
                         "user",
                         json!({
                             "type": "tool_result",
                             "tool_use_id": call_id,
-                            "content": content
+                            "content": tool_content
                         }),
                     );
                 }
@@ -585,12 +607,11 @@ impl AnthropicSseDecoder {
         if let (Some(a), Some(b)) = (
             value.get("type").and_then(Value::as_str),
             frame.event.as_deref(),
-        ) {
-            if a != b {
-                return Err(Error::protocol(
-                    "Anthropic event name differs from payload type",
-                ));
-            }
+        ) && a != b
+        {
+            return Err(Error::protocol(
+                "Anthropic event name differs from payload type",
+            ));
         }
         if kind == "ping" {
             return Ok(vec![]);
@@ -975,7 +996,19 @@ fn decode_json_response(value: Value, request: &Request) -> Result<Response, Err
         usage,
         provider_metadata: Some(metadata),
     };
-    crate::validate_response(&response, &request.tools)?;
+    match value.get("stop_reason").and_then(Value::as_str) {
+        Some("end_turn" | "stop_sequence") => crate::validate_response_with_finish(
+            &response,
+            &request.tools,
+            crate::EmptyCompletionFinish::Stop,
+        )?,
+        Some("max_tokens") => crate::validate_response_with_finish(
+            &response,
+            &request.tools,
+            crate::EmptyCompletionFinish::Length,
+        )?,
+        _ => crate::validate_response(&response, &request.tools)?,
+    }
     Ok(response)
 }
 

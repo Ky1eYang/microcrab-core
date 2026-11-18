@@ -89,6 +89,7 @@ pub fn describe(host: &HostInfo) -> Result<Vec<AgentInfo>, String> {
         .inject("hints", hints)
         .map_err(|e| e.to_string())?;
     Ok(vec![AgentInfo {
+        tool_media_output_bytes: Default::default(),
         name: "universal".into(),
         modes: vec![AgentMode {
             description: mode_description.into(),
@@ -285,6 +286,7 @@ mod component {
                 return Ok(ToolOutput::Final(FinalOutput {
                     content,
                     failure: reported,
+                    attachments: vec![],
                 }));
             }
             if initial.truncated {

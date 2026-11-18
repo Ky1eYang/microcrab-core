@@ -4,6 +4,7 @@
 use microcrab_protocol::ToolDefinition;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Map, Value};
+use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -11,6 +12,10 @@ pub struct AgentInfo {
     pub name: String,
     pub modes: Vec<AgentMode>,
     pub tools: Vec<ToolDefinition>,
+    /// Per-tool output declarations; Runtime validates and bounds these independently
+    /// from tool permissions and does not infer media capability from tool names.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub tool_media_output_bytes: BTreeMap<String, usize>,
     pub variables: Variable,
 }
 
@@ -166,6 +171,20 @@ pub enum OsFamily {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn legacy_agent_bytes_remain_exact_without_media_declarations() {
+        let bytes = r#"{"name":"legacy","modes":[],"tools":[],"variables":{}}"#;
+        let mut agent: super::AgentInfo = serde_json::from_str(bytes).unwrap();
+        assert!(agent.tool_media_output_bytes.is_empty());
+        assert_eq!(serde_json::to_string(&agent).unwrap(), bytes);
+        agent.tool_media_output_bytes.insert("vision".into(), 1024);
+        let encoded = serde_json::to_vec(&agent).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<super::AgentInfo>(&encoded).unwrap(),
+            agent
+        );
+    }
+
     use super::*;
     use serde_json::json;
 

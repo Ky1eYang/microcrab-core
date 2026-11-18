@@ -1,4 +1,5 @@
 //! External dependency assembly for Session-owned delegation.
+mod restore;
 #[cfg(test)]
 mod tests;
 use crate::{Children, DeclarativePermission, UsageAuditor, UsageLedger};
@@ -232,10 +233,10 @@ impl ChildFactory for NativeChildFactory {
         issuer_epoch: u64,
     ) -> Result<ChildSession, Error> {
         let mut captured = self.clone();
-        if let Some(factory) = &self.display_factory {
-            if let Some(scoped) = factory.for_epoch(issuer_epoch) {
-                captured.display_factory = Some(scoped);
-            }
+        if let Some(factory) = &self.display_factory
+            && let Some(scoped) = factory.for_epoch(issuer_epoch)
+        {
+            captured.display_factory = Some(scoped);
         }
         captured
             .create(
@@ -352,7 +353,7 @@ impl ChildFactory for NativeChildFactory {
             inherit_policy(Session::builder_arc(client, runtime), &config.permissions)?
                 .session_id(id.clone())
                 .processes_parent(parent_processes)
-                .catalog(config.catalog.clone())
+                .catalog(Vec::new())
                 .is_main(false)
                 .host(config.host.clone())
                 .limits(config.limits.clone())

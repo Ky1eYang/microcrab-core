@@ -570,6 +570,7 @@ async fn selecting_and_recovering_modes_preserves_catalogs_and_current_overrides
         release: Notify::new(),
     });
     let agent = AgentInfo {
+        tool_media_output_bytes: Default::default(),
         name: "coding".into(),
         modes: vec![
             AgentMode {
@@ -602,6 +603,8 @@ async fn selecting_and_recovering_modes_preserves_catalogs_and_current_overrides
         .build()
         .unwrap();
     assert_eq!(session.state().selected_mode.as_deref(), Some("plan"));
+    // New Sessions include native communication defaults alongside mode policy.
+    let initial_defaults = controller.snapshot().unwrap().config.defaults;
     let before = session.checkpoint().await.unwrap();
     session.select_mode("build").await.unwrap();
     assert_eq!(session.state().selected_mode.as_deref(), Some("build"));
@@ -618,9 +621,9 @@ async fn selecting_and_recovering_modes_preserves_catalogs_and_current_overrides
     assert_eq!(session.state().selected_mode.as_deref(), Some("plan"));
     let snapshot = controller.snapshot().unwrap();
     assert_eq!(snapshot.config.mode, "plan");
-    assert!(snapshot.config.defaults.is_empty());
+    assert_eq!(snapshot.config.defaults, initial_defaults);
     assert!(snapshot.config.provider_defaults.is_empty());
-    assert_eq!(snapshot.config.overrides.len(), 1);
+    assert_eq!(snapshot.config.overrides, vec![rule("write", Action::Deny)]);
     assert!(session.select_mode("unknown").await.is_err());
     assert!(session.select_mode("child-only").await.is_err());
     assert_eq!(session.state().selected_mode.as_deref(), Some("plan"));

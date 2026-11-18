@@ -277,7 +277,7 @@ fn result(session: &Session, id: &str) -> Value {
         .messages()
         .iter()
         .find_map(|item| match item {
-            ContentItem::Tool { call_id, content } if call_id == id => {
+            ContentItem::Tool { call_id, content, .. } if call_id == id => {
                 Some(serde_json::from_str(content).unwrap())
             }
             _ => None,

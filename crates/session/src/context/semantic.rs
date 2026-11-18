@@ -257,6 +257,7 @@ mod tests {
     fn user(text: &str) -> ContentItem {
         ContentItem::User {
             parts: vec![InputPart::Text { text: text.into() }],
+            envelope: None,
             source: None,
         }
     }
@@ -318,13 +319,12 @@ mod tests {
             source.undo_input_index(&live, 2, &live.items[2]).unwrap(),
             2
         );
-        if let ContentItem::User { parts, .. } = &mut live.items[1] {
-            if let InputPart::Image {
+        if let ContentItem::User { parts, .. } = &mut live.items[1]
+            && let InputPart::Image {
                 source: microcrab_protocol::ImageSource::Data { data, .. },
             } = &mut parts[1]
-            {
-                *data = vec![4, 5, 6];
-            }
+        {
+            *data = vec![4, 5, 6];
         }
         assert!(source.undo_input_index(&live, 2, &live.items[2]).is_err());
         live = source.clone();

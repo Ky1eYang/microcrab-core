@@ -163,6 +163,7 @@ impl Fixture {
                 ContentItem::Tool {
                     call_id: id,
                     content,
+                    ..
                 } if id == call_id => Some(content),
                 _ => None,
             })

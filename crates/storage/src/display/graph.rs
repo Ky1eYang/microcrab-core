@@ -246,18 +246,18 @@ impl DisplayGraph {
                 return Err(failure("display navigation head certificate mismatch"));
             }
         }
-        if record.event["phase"] == "display_head_selected" {
-            if let Some(known) = record.event.get("selected_head_known") {
-                let known = known
-                    .as_bool()
-                    .ok_or_else(|| failure("display selection knowledge is not boolean"))?;
-                if !known
-                    && transition
-                        .as_ref()
-                        .is_some_and(|head| head.selected_block_id.is_some())
-                {
-                    return Err(failure("unknown display selection cannot certify a head"));
-                }
+        if record.event["phase"] == "display_head_selected"
+            && let Some(known) = record.event.get("selected_head_known")
+        {
+            let known = known
+                .as_bool()
+                .ok_or_else(|| failure("display selection knowledge is not boolean"))?;
+            if !known
+                && transition
+                    .as_ref()
+                    .is_some_and(|head| head.selected_block_id.is_some())
+            {
+                return Err(failure("unknown display selection cannot certify a head"));
             }
         }
         if record.event["phase"] == "display_graph_import" {
@@ -309,10 +309,10 @@ impl DisplayGraph {
                     self.unresolved_selection = true;
                 }
             }
-            Some("selection_commit" | "selection_abort") => {
-                if self.selection_intents.remove(&record.attempt_id).is_none() {
-                    self.unresolved_selection = true;
-                }
+            Some("selection_commit" | "selection_abort")
+                if self.selection_intents.remove(&record.attempt_id).is_none() =>
+            {
+                self.unresolved_selection = true;
             }
             _ => {}
         }

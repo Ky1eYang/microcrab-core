@@ -103,7 +103,6 @@ fn graph_contract(source: DisplaySource) {
         .as_str()
         .unwrap()
         .to_owned();
-    drop(commit);
     let selection = ArchiveRecord {
         sequence: 4,
         attempt_id: "select".into(),

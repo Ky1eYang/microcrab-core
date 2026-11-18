@@ -197,7 +197,7 @@ async fn current_guest_launch_failure_retains_host_facts_in_context_and_audit() 
         .messages()
         .into_iter()
         .find_map(|item| match item {
-            ContentItem::Tool { call_id, content } if call_id == "denied-launch" => Some(content),
+            ContentItem::Tool { call_id, content, .. } if call_id == "denied-launch" => Some(content),
             _ => None,
         })
         .unwrap();

@@ -91,7 +91,7 @@ async fn configured_host_sources_disclose_expand_and_patch_after_explicit_refres
         .messages()
         .into_iter()
         .find_map(|item| match item {
-            ContentItem::Tool { call_id, content } if call_id == "expand-batch" => Some(content),
+            ContentItem::Tool { call_id, content, .. } if call_id == "expand-batch" => Some(content),
             _ => None,
         })
         .unwrap();
@@ -188,7 +188,7 @@ async fn default_h2_compact_catalog_uses_short_ids_and_expands_exact_sections() 
         .messages()
         .into_iter()
         .find_map(|item| match item {
-            ContentItem::Tool { call_id, content } if call_id == "expand-batch" => Some(content),
+            ContentItem::Tool { call_id, content, .. } if call_id == "expand-batch" => Some(content),
             _ => None,
         })
         .unwrap();

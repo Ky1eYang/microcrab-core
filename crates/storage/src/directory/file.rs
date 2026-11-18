@@ -397,6 +397,24 @@ impl Directory for FileDirectory {
         })
         .await
     }
+    async fn session_owner(&self, id: &str) -> Result<Option<String>, Error> {
+        identity(id)?;
+        let id = id.to_owned();
+        self.run(move |state| {
+            if let Some(record) = state.records.unavailable_sessions.get(&id) {
+                return Err(record.error());
+            }
+            let Some(record) = state.records.sessions.get(&id) else {
+                return Ok(None);
+            };
+            record.validate()?;
+            if record.id != id {
+                return Err(conflict());
+            }
+            Ok(Some(record.owner.clone()))
+        })
+        .await
+    }
     async fn get(&self, owner: &str, id: &str) -> Result<Option<SessionRecord>, Error> {
         identity(owner)?;
         identity(id)?;

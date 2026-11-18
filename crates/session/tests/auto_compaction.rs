@@ -214,7 +214,7 @@ async fn round_compaction_follows_tool_checkpoint_and_keeps_turn_round_and_calls
         assert_eq!(seen[2].turn_id, seen[0].turn_id);
         assert_eq!(seen[2].round, Some(2));
         assert_eq!(seen[2].epoch, seen[0].epoch);
-        assert!(seen[1].items.iter().any(|item| matches!(item, ContentItem::Tool { call_id, content } if call_id == "exact-call" && content.len() == 38_000)));
+        assert!(seen[1].items.iter().any(|item| matches!(item, ContentItem::Tool { call_id, content, .. } if call_id == "exact-call" && content.len() == 38_000)));
         let rows = log.rows.lock().unwrap();
         let settled = rows
             .iter()

@@ -46,6 +46,7 @@ fn agent() -> AgentInfo {
         )
         .unwrap();
     AgentInfo {
+        tool_media_output_bytes: Default::default(),
         name: "metadata-only-name".into(),
         modes: vec![],
         tools: vec![],
@@ -110,6 +111,11 @@ fn injected_strings_are_literal_and_nonempty_valid_templates_are_required() {
         render("", None).unwrap(),
         render(DEFAULT_SYSTEM, None).unwrap()
     );
+    let rendered = render(DEFAULT_SYSTEM, None).unwrap();
+    assert!(rendered.contains("**variable-injection**"));
+    assert!(rendered.contains("{{var:KEY}}"));
+    assert!(rendered.contains("{{secret:KEY}}"));
+    assert!(!rendered.contains("{{ \""));
     for template in [
         " \n\t",
         "{% if true %}",
@@ -162,6 +168,26 @@ fn arbitrary_structured_agent_values_render_exactly_without_stringification_or_a
     );
 }
 
+fn assert_variable_injection_hint_is_rendered(rendered: &str) {
+    assert_eq!(rendered.matches("**variable-injection**").count(), 1);
+    let mut without_grammar = rendered.to_owned();
+    for placeholder in [
+        "{{var:KEY}}",
+        "{{var:KEY:/a/b}}",
+        "{{var:string:KEY}}",
+        "{{var:number:KEY:/a/b}}",
+        "{{var:boolean:KEY}}",
+        "{{secret:KEY}}",
+    ] {
+        assert_eq!(rendered.matches(placeholder).count(), 1, "{placeholder}");
+        without_grammar = without_grammar.replace(placeholder, "");
+    }
+    assert!(
+        !without_grammar.contains("{{"),
+        "unexpanded Tera expression in rendered SYSTEM: {without_grammar}"
+    );
+}
+
 #[test]
 fn default_template_renders_description_and_each_rule_and_hint_once_in_order() {
     let rendered = render(DEFAULT_SYSTEM, Some(&agent())).unwrap();
@@ -177,7 +203,7 @@ fn default_template_renders_description_and_each_rule_and_hint_once_in_order() {
     assert!(rendered.find("first-rule").unwrap() < rendered.find("second-rule").unwrap());
     assert!(rendered.find("first-hint").unwrap() < rendered.find("second-hint").unwrap());
     assert!(!rendered.contains("metadata-only-name"));
-    assert!(!rendered.contains("{{"));
+    assert_variable_injection_hint_is_rendered(&rendered);
     assert!(!rendered.contains("{%"));
 }
 
@@ -336,14 +362,21 @@ async fn session_default_system_is_rendered_without_an_agent() {
     assert!(system.contains("# Rule Framework & Execution Hierarchy"));
     assert!(system.contains("clarification-and-decision"));
     assert!(!system.contains("# Agent"));
-    assert!(!system.contains("{{"));
+    assert_variable_injection_hint_is_rendered(&system);
     assert!(!system.contains("{%"));
     session.close().await.unwrap();
 }
 
 #[tokio::test]
 async fn session_variables_cannot_override_agent_system_and_same_epoch_stays_stable() {
-    let info = agent();
+    let mut info = agent();
+    info.modes = vec![microcrab_agent_types::AgentMode {
+        name: "root".into(),
+        description: String::new(),
+        prompt: String::new(),
+        role: microcrab_agent_types::AgentRole::Both,
+        permissions: vec![],
+    }];
     let template =
         "SYSTEM {{ agent.description }}: {% for rule in agent.rules %}{{ rule.name }};{% endfor %}";
     let expected = render(template, Some(&info)).unwrap();
@@ -353,6 +386,7 @@ async fn session_variables_cannot_override_agent_system_and_same_epoch_stays_sta
         .system(template)
         .build()
         .unwrap();
+    session.select_mode("root").await.unwrap();
     let state = session.state_handle();
     assert!(
         state

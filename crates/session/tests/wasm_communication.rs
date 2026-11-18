@@ -150,7 +150,7 @@ fn component(operations: &[(String, Operation)], shell: bool, missing_info: bool
     };
     let text = format!(
         r#"(component
-      (import "microcrab:agent/host-info@0.7.0" (instance $host
+      (import "microcrab:agent/host-info@0.8.0" (instance $host
         (type $code (enum "absent" "unavailable" "rejected" "cancelled"))
         (export "communication-error-code" (type $code_public (eq $code)))
         (type $error (record (field "code" $code_public) (field "message" string)))
@@ -358,7 +358,7 @@ impl Client for Script {
                 .items
                 .iter()
                 .find_map(|item| match item {
-                    ContentItem::Tool { call_id, content } if call_id == &expected => Some(content),
+                    ContentItem::Tool { call_id, content, .. } if call_id == &expected => Some(content),
                     _ => None,
                 })
                 .expect("previous tool result must reach the model");

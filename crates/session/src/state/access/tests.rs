@@ -682,12 +682,11 @@ fn initialization_evidence_is_invisible_persisted_and_owned_by_session() {
             cache_points: vec![],
         });
         // Historical custom entries must not shadow authoritative lifecycle facts.
-        snapshot
-            .variables
-            .insert("agent_init".into(), json!("legacy-shadow"));
-        snapshot
-            .variables
-            .insert("agent_initialization_pending".into(), json!(false));
+        snapshot.variables = serde_json::from_value(json!({
+            "agent_init": "legacy-shadow",
+            "agent_initialization_pending": false,
+        }))
+        .unwrap();
     });
     for key in ["agent_init", "agent_initialization_pending"] {
         assert!(state.model_variables().unwrap().get(key).is_none());

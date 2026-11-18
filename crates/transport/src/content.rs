@@ -33,10 +33,13 @@ pub enum ContentItem {
     State(StateFrame),
     User {
         parts: Vec<InputPart>,
-        /// Framework origin is trusted Session metadata, never caller input.
+        /// Carrier origin is trusted Session metadata, never caller-authored text.
         /// Absent on historical/user input so their serialized bytes stay stable.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         source: Option<UserSource>,
+        /// Missing on frozen history and functional helper inputs.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        envelope: Option<CarrierEnvelopeVersion>,
     },
     Assistant {
         content: String,
@@ -47,14 +50,47 @@ pub enum ContentItem {
     Tool {
         call_id: String,
         content: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        parts: Vec<InputPart>,
     },
 }
 
-/// Durable origin marker for framework-generated user-role turns.
+/// Explicit framing version; absence preserves historical rendering.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CarrierEnvelopeVersion {
+    V1,
+}
+
+/// Trusted, durable carrier origin. Missing source is ordinary user input.
+/// These labels never grant permission; Session authenticates them before admission.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UserSource {
     Framework,
+    Agent {
+        agent_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        exchange: Option<AgentExchange>,
+    },
+    External {
+        identity: String,
+    },
+}
+
+/// Session-authored exchange witness, kept out of the caller-authored body.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentExchange {
+    pub exchange_id: String,
+    pub intent: ExchangeIntent,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExchangeIntent {
+    Send,
+    Reply,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -123,6 +159,34 @@ mod provenance_tests {
     use super::*;
 
     #[test]
+    fn historical_tool_and_framework_bytes_remain_exact() {
+        let historical = br#"{"Tool":{"call_id":"old-call","content":"old output"}}"#;
+        let restored: ContentItem = serde_json::from_slice(historical).unwrap();
+        assert!(matches!(&restored, ContentItem::Tool { parts, .. } if parts.is_empty()));
+        assert_eq!(serde_json::to_vec(&restored).unwrap(), historical);
+
+        let historical = br#"{"role":"tool","call_id":"old-call","content":"old output"}"#;
+        let restored: microcrab_protocol::Message = serde_json::from_slice(historical).unwrap();
+        assert!(
+            matches!(&restored, microcrab_protocol::Message::Tool { parts, .. } if parts.is_empty())
+        );
+        assert_eq!(serde_json::to_vec(&restored).unwrap(), historical);
+
+        let historical =
+            br#"{"User":{"parts":[{"type":"text","text":"settled"}],"source":"framework"}}"#;
+        let restored: ContentItem = serde_json::from_slice(historical).unwrap();
+        assert!(matches!(
+            &restored,
+            ContentItem::User {
+                envelope: None,
+                source: Some(UserSource::Framework),
+                ..
+            }
+        ));
+        assert_eq!(serde_json::to_vec(&restored).unwrap(), historical);
+    }
+
+    #[test]
     fn historical_assistant_bytes_remain_exact_without_replay_metadata() {
         let historical = br#"{"Assistant":{"content":"answer","tool_calls":[]}}"#;
         let restored: ContentItem = serde_json::from_slice(historical).unwrap();
@@ -145,6 +209,7 @@ mod provenance_tests {
             parts: vec![InputPart::Text {
                 text: "Background execution settled".into(),
             }],
+            envelope: None,
             source: Some(UserSource::Framework),
         };
         let encoded = serde_json::to_vec(&framework).unwrap();

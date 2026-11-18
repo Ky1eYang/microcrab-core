@@ -50,6 +50,7 @@ impl std::fmt::Debug for GoogleConfig {
 pub struct Google {
     auth: crate::AuthMode,
     config: GoogleConfig,
+    function_response_media: bool,
     http: reqwest::Client,
     observer: Option<std::sync::Arc<dyn crate::ModelObserver>>,
     recording: Option<std::sync::Arc<dyn crate::ModelRecording>>,
@@ -107,10 +108,17 @@ impl Google {
         Ok(Self {
             auth: crate::AuthMode::default(),
             config,
+            function_response_media: false,
             http,
             observer: None,
             recording: None,
         })
+    }
+
+    /// Explicit API/model capability; legacy and unverified routes stay disabled.
+    pub fn with_function_response_media(mut self, enabled: bool) -> Self {
+        self.function_response_media = enabled;
+        self
     }
 
     pub fn with_auth_mode(mut self, auth: crate::AuthMode) -> Self {
@@ -269,7 +277,16 @@ impl Google {
                         last_model_has_evidence = provider_metadata.is_some();
                     }
                 }
-                Message::Tool { call_id, content } => {
+                Message::Tool {
+                    call_id,
+                    content,
+                    parts,
+                } => {
+                    if !parts.is_empty() && !self.function_response_media {
+                        return Err(Error::protocol(
+                            "Google route/model does not support multimodal function responses",
+                        ));
+                    }
                     let (name, wire_id) = calls.get(call_id.as_str()).ok_or_else(|| {
                         Error::protocol("Google tool result has no matching function call")
                     })?;
@@ -288,6 +305,28 @@ impl Google {
                     });
                     if let Some(wire_id) = wire_id {
                         part["functionResponse"]["id"] = json!(wire_id);
+                    }
+                    let mut media = Vec::new();
+                    let mut text = Vec::new();
+                    for input in parts {
+                        match input {
+                            InputPart::Text { text: value } => text.push(value.clone()),
+                            InputPart::Image { source } => media.push(match source {
+                                ImageSource::Data { media_type, data } => json!({"inlineData": {"mimeType": media_type, "data": STANDARD.encode(data)}}),
+                                // Url does not carry a MIME witness. FunctionResponseFileData
+                                // requires one; fail rather than guess from path suffixes.
+                                ImageSource::Url { .. } => return Err(Error::protocol("Google function response URL image requires a MIME witness; use canonical Data")),
+                                _ => return Err(Error::protocol("tool images require resolved Data")),
+                            }),
+                        }
+                    }
+                    if !text.is_empty() {
+                        let original = part["functionResponse"]["response"].take();
+                        part["functionResponse"]["response"] =
+                            json!({"output": original, "text": text});
+                    }
+                    if !media.is_empty() {
+                        part["functionResponse"]["parts"] = Value::Array(media);
                     }
                     push_role_content(&mut contents, "user", vec![part], true);
                 }
@@ -821,7 +860,15 @@ impl GoogleSseDecoder {
             usage,
             provider_metadata,
         };
-        crate::validate_response(&response, &request.tools)?;
+        crate::validate_response_with_finish(
+            &response,
+            &request.tools,
+            if self.finish_reason.as_deref() == Some("MAX_TOKENS") {
+                crate::EmptyCompletionFinish::Length
+            } else {
+                crate::EmptyCompletionFinish::Stop
+            },
+        )?;
         Ok(response)
     }
 }

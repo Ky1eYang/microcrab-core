@@ -123,27 +123,28 @@ async fn compacted_epoch_initial_precedes_input_variables_and_retains_summary() 
     let mut input = SessionInput::text("first new epoch input");
     input.variables.set.insert("input_only".into(), json!(7));
     session.submit(input).await.unwrap();
-    let records = journal.records.lock().unwrap();
-    let initials = records
-        .iter()
-        .filter(|(kind, _)| *kind == Some(NavigationBoundary::EpochInitial))
-        .collect::<Vec<_>>();
-    assert_eq!(initials.len(), 2);
-    let initial = &initials[1].1;
-    assert_eq!(initial.context.epoch, 1);
-    assert!(!initial.context.pending_epoch);
-    assert!(
-        initial
-            .state
-            .variables
-            .as_value()
-            .get("input_only")
-            .is_none()
-    );
-    assert_eq!(initial.state.variables.as_value()["baseline"], true);
-    assert!(initial.context.items.iter().any(|item| matches!(item, ContentItem::User { parts, .. } if parts == &SessionInput::text("certified summary").parts)));
-    assert!(!initial.context.items.iter().any(|item| matches!(item, ContentItem::User { parts, .. } if parts == &SessionInput::text("first new epoch input").parts)));
-    drop(records);
+    {
+        let records = journal.records.lock().unwrap();
+        let initials = records
+            .iter()
+            .filter(|(kind, _)| *kind == Some(NavigationBoundary::EpochInitial))
+            .collect::<Vec<_>>();
+        assert_eq!(initials.len(), 2);
+        let initial = &initials[1].1;
+        assert_eq!(initial.context.epoch, 1);
+        assert!(!initial.context.pending_epoch);
+        assert!(
+            initial
+                .state
+                .variables
+                .as_value()
+                .get("input_only")
+                .is_none()
+        );
+        assert_eq!(initial.state.variables.as_value()["baseline"], true);
+        assert!(initial.context.items.iter().any(|item| matches!(item, ContentItem::User { parts, .. } if parts == &SessionInput::text("certified summary").parts)));
+        assert!(!initial.context.items.iter().any(|item| matches!(item, ContentItem::User { parts, .. } if parts == &SessionInput::text("first new epoch input").parts)));
+    }
     session.close().await.unwrap();
 }
 
@@ -185,14 +186,15 @@ async fn prepared_continuation_is_internal_and_cannot_become_manual_checkpoint()
     let error = session.checkpoint_navigation().await.unwrap_err();
     assert!(error.to_string().contains("settled Turn"));
     assert_eq!(journal.records.lock().unwrap().len(), before);
-    let records = journal.records.lock().unwrap();
-    assert!(records.last().unwrap().1.continuation.is_some());
-    assert!(
-        !records
-            .iter()
-            .any(|(kind, _)| *kind == Some(NavigationBoundary::InterTurn))
-    );
-    drop(records);
+    {
+        let records = journal.records.lock().unwrap();
+        assert!(records.last().unwrap().1.continuation.is_some());
+        assert!(
+            !records
+                .iter()
+                .any(|(kind, _)| *kind == Some(NavigationBoundary::InterTurn))
+        );
+    }
     session.close().await.unwrap();
 }
 

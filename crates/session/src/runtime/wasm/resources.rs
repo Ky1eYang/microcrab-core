@@ -1,8 +1,9 @@
 //! Independent Host interfaces retain their supported Runtime mappings. Raw file
-//! reads and mutation primitives have no implemented execution adapter.
+//! reads use invocation-owned read-only handles; mutation primitives remain unsupported.
 //! Unmapped file/network operations remain typed Unsupported. General process
 //! and shell imports share one admitted Session-owned resource mapping.
 mod execution;
+pub(super) mod files;
 use super::microcrab::host::{filesystem as fs, net, process, types};
 use super::{ImportFailure, RuntimeState, ToolContext};
 use microcrab_host_api::{self as host, FsApi};
@@ -18,6 +19,9 @@ pub(super) fn supported_operation(name: &str) -> bool {
     matches!(
         name,
         "filesystem.stat"
+            | "filesystem.open"
+            | "filesystem.read"
+            | "filesystem.close"
             | "process.spawn"
             | "process.status"
             | "process.wait"
@@ -171,9 +175,8 @@ fn finish<T>(
                 .get_or_insert_with(|| diagnostic.clone());
         }
         state.operation_diagnostic = Some((diagnostic, failure.message.clone()));
-        match failure.category {
-            types::ErrorCategory::Cancelled => state.operation_cancelled = true,
-            _ => {}
+        if failure.category == types::ErrorCategory::Cancelled {
+            state.operation_cancelled = true;
         }
     } else {
         state.operation_diagnostic = None;
@@ -223,9 +226,8 @@ fn invocation_context(
     })
 }
 
-fn begin(
+fn begin_scope(
     state: &mut RuntimeState,
-    input_bytes: usize,
 ) -> Result<host::OpContext, ImportFailure<types::HostError>> {
     state.operation_diagnostic = None;
     state.operation_diagnostic_authoritative = false;
@@ -249,6 +251,15 @@ fn begin(
         return Err(error(C::Permission, "Host invocation scope absent"));
     }
     context.check().map_err(host_error)?;
+    Ok(context)
+}
+
+fn begin(
+    state: &mut RuntimeState,
+    input_bytes: usize,
+) -> Result<host::OpContext, ImportFailure<types::HostError>> {
+    let context = begin_scope(state)?;
+    use types::ErrorCategory as C;
     crate::budget::check(
         crate::LimitKind::HostOperations,
         1,
@@ -400,11 +411,8 @@ fn process_spec_bytes(spec: &process::ProcessSpec) -> usize {
 }
 
 unsupported!(list, (path: String, opts: fs::ListOptions), Vec<fs::DirEntry>, path.len().saturating_add(16));
-unsupported!(open, (path: String, flags: fs::OpenFlags), fs::FileHandle, path.len().saturating_add(16));
-unsupported!(file_read, (h: fs::FileHandle, offset: u64, len: u32), Vec<u8>, 24);
 unsupported!(file_write, (h: fs::FileHandle, offset: u64, data: Vec<u8>), u32, data.len().saturating_add(24));
 unsupported!(fsync, (h: fs::FileHandle), (), 8);
-unsupported!(close, (h: fs::FileHandle), (), 8);
 unsupported!(mkdir, (path: String, recursive: bool), (), path.len().saturating_add(16));
 unsupported!(rename, (from: String, to: String), (), from.len().saturating_add(to.len()).saturating_add(16));
 unsupported!(remove, (path: String, recursive: bool), (), path.len().saturating_add(16));
@@ -434,11 +442,11 @@ pub(super) fn add_to_linker(linker: &mut Linker<RuntimeState>) -> wasmtime::Resu
     let mut interface = linker.instance("microcrab:host/filesystem@0.1.0")?;
     interface.func_wrap("stat", stat)?;
     interface.func_wrap("list", list)?;
-    interface.func_wrap("open", open)?;
-    interface.func_wrap("read", file_read)?;
+    interface.func_wrap("open", files::open)?;
+    interface.func_wrap("read", files::read)?;
     interface.func_wrap("write", file_write)?;
     interface.func_wrap("fsync", fsync)?;
-    interface.func_wrap("close", close)?;
+    interface.func_wrap("close", files::close)?;
     interface.func_wrap("mkdir", mkdir)?;
     interface.func_wrap("rename", rename)?;
     interface.func_wrap("remove", remove)?;
@@ -461,10 +469,10 @@ pub(super) fn add_to_linker(linker: &mut Linker<RuntimeState>) -> wasmtime::Resu
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
 
-    pub(super) fn runtime_state(invoked: bool) -> RuntimeState {
+    pub(in crate::runtime::wasm) fn runtime_state(invoked: bool) -> RuntimeState {
         let mut snapshot = crate::SessionState::new(crate::Limits::default());
         snapshot.epoch_id = 7;
         snapshot.turn_id = Some(8);
@@ -476,6 +484,7 @@ mod tests {
             limits: wasmtime::StoreLimitsBuilder::new().build(),
             host: None,
             outputs: Default::default(),
+            file_reads: Default::default(),
             next_output: 1,
             borrowed_processes: Default::default(),
             admitted_process_scope: None,
@@ -496,6 +505,7 @@ mod tests {
             deadline: Instant::now() + std::time::Duration::from_secs(10),
             max_input_bytes: 1024,
             max_output_bytes: 1024,
+            max_media_output_bytes: crate::admission::image::MAX_IMAGE_BYTES,
             operation_calls_remaining: if invoked { 16 } else { 0 },
             cache_points_remaining: if invoked { 2 } else { 0 },
             patch_plan: None,
@@ -521,8 +531,6 @@ mod tests {
         assert_eq!(state.input_bytes_remaining, 1000);
         assert!(supported_operation("filesystem.stat"));
         for operation in [
-            "filesystem.read",
-            "filesystem.open",
             "filesystem.atomic-write",
             "filesystem.write",
             "net.connect-tcp",

@@ -21,6 +21,8 @@ pub(crate) struct OperationReservation {
     pending: Mutex<Option<PendingResume>>,
     pub(crate) submission_operation_id: Option<String>,
     resume_pending: bool,
+    pub(crate) user_target: Option<bool>,
+    pub(crate) carrier_run: Vec<crate::admission::inbox::IdleCarrier>,
     _operation: tokio::sync::OwnedMutexGuard<()>,
     _foreground: tokio::sync::OwnedMutexGuard<()>,
 }
@@ -53,10 +55,28 @@ impl OperationReservation {
             pending: Mutex::new(None),
             submission_operation_id: None,
             resume_pending: false,
+            user_target: None,
+            carrier_run: Vec::new(),
         }
     }
 }
 impl SessionInner {
+    pub(crate) async fn submit_user(
+        self: &Arc<Self>,
+        input: SessionInput,
+        targeted_child: bool,
+    ) -> Result<TurnOutcome, Error> {
+        self.require_user_input(targeted_child)?;
+        let mut reservation = self.reserve().await?;
+        reservation.user_target = Some(targeted_child);
+        self.submit_reserved(
+            Some(input),
+            None,
+            Arc::new(reservation),
+            CancellationToken::new(),
+        )
+        .await
+    }
     pub(crate) async fn submit(
         self: &Arc<Self>,
         input: SessionInput,
@@ -93,6 +113,8 @@ impl SessionInner {
             pending: Mutex::new(None),
             submission_operation_id: None,
             resume_pending: false,
+            user_target: None,
+            carrier_run: Vec::new(),
         })
     }
     pub(super) async fn reserve_replacement(
@@ -200,8 +222,11 @@ impl SessionInner {
     pub(super) async fn execute_queued(
         self: &Arc<Self>,
         entry: crate::admission::inbox::TurnEntry,
-        reservation: OperationReservation,
+        mut reservation: OperationReservation,
     ) -> Result<TurnOutcome, Error> {
+        if let crate::admission::inbox::TurnEntry::Carriers(run) = &entry {
+            reservation.carrier_run = run.clone();
+        }
         self.execute(
             Some(entry.input()?),
             None,
@@ -233,6 +258,7 @@ impl SessionInner {
             Some(owned) => owned,
             None => (Arc::new(self.reserve().await?), CancellationToken::new()),
         };
+        let mut selected_carriers = operation.carrier_run.clone();
         {
             // Publish cancellation while sharing interrupt's active mutex. Close
             // can seal before this lock or cancel the installed token afterward;
@@ -264,6 +290,9 @@ impl SessionInner {
                 && (!self.has_continuation() || (!explicit_retry && self.retry_ready()))
                 && let Some(entry) = inbox.next_turn()
             {
+                if let crate::admission::inbox::TurnEntry::Carriers(run) = &entry {
+                    selected_carriers = run.clone();
+                }
                 input = Some(entry.input()?);
                 queued = Some(entry.id());
                 framework = entry.framework();
@@ -301,6 +330,10 @@ impl SessionInner {
         let inner = self.clone();
         let worker_token = token.clone();
         let worker = tokio::spawn(async move {
+            let user_target = operation
+                .user_target
+                .or_else(|| (queued.is_some() && !framework).then_some(false));
+            let carrier_run = selected_carriers;
             let _operation = operation;
             let _claim = claim;
             let mut turn_guard = TurnGuard {
@@ -316,6 +349,8 @@ impl SessionInner {
                 queued,
                 framework,
                 submission_operation_id,
+                user_target,
+                carrier_run.clone(),
             ))
             .catch_unwind()
             .await;
@@ -454,6 +489,10 @@ impl SessionInner {
             .await
             .map_err(|_| Error::tool("session worker stopped unexpectedly"))?
     }
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Turn orchestration carries distinct input, cancellation, routing and durable carrier admission facts"
+    )]
     async fn run_turn(
         &self,
         input: Option<SessionInput>,
@@ -463,7 +502,14 @@ impl SessionInner {
         queued: Option<u64>,
         framework: bool,
         submission_operation_id: Option<String>,
+        user_target: Option<bool>,
+        carrier_run: Vec<crate::admission::inbox::IdleCarrier>,
     ) -> Result<TurnOutcome, Error> {
+        if input.is_some()
+            && let Some(targeted) = user_target
+        {
+            self.require_user_input(targeted)?;
+        }
         self.model_retry_ready.store(false, Ordering::Release);
         if input.is_none() && cancellation.is_cancelled() {
             // The retry never entered Runtime and has no new effects. Preserve
@@ -602,6 +648,7 @@ impl SessionInner {
             faulted: &self.faulted,
             armed: false,
         };
+        let mut communication_admission = None;
         if let Some(input) = input {
             if continuation.is_some() {
                 return Err(Error::config(
@@ -677,10 +724,21 @@ impl SessionInner {
             .await?;
             let mut changes = input.variables.clone();
             changes.overlay(&injection.variables);
+            communication_admission = if carrier_run.is_empty() {
+                None
+            } else {
+                Some(self.communication_transaction.lock().await)
+            };
             let fence = self.endpoint.fence().await?;
+            if cancellation.is_cancelled() {
+                return Err(Error::Cancelled);
+            }
             let mut staged = None;
             for _ in 0..3 {
                 let original = self.state.preview();
+                if let Some(targeted) = user_target {
+                    self.require_user_input_snapshot(&original.snapshot(), targeted)?;
+                }
                 let preview = original.preview();
                 preview.apply_change(changes.clone())?;
                 let turn_id = original
@@ -705,7 +763,20 @@ impl SessionInner {
                     Err(error) => return Err(crate::state::access::projection_error(error)),
                 };
                 let mut candidate = context.clone();
-                if framework {
+                if !carrier_run.is_empty() {
+                    let carriers = carrier_run
+                        .iter()
+                        .map(|entry| entry.input())
+                        .collect::<Result<Vec<_>, _>>()?;
+                    candidate.admit_carriers(carriers, &values)?;
+                    preview.update(|snapshot|{
+                        if let Some(communication)=&mut snapshot.communication{
+                            let consumed=carrier_run.iter().filter_map(|entry|match entry{crate::admission::inbox::IdleCarrier::Accepted(entry)=>Some(entry.operation_id.as_str()),_=>None}).collect::<Vec<_>>();
+                            for receipt in &mut communication.inbox.receipts{if consumed.contains(&receipt.receipt.operation_id.as_str()){receipt.receipt.status=crate::state::communication::inbox::DeliveryStatus::Consumed;}}
+                            communication.inbox.pending.retain(|entry|!consumed.contains(&entry.operation_id.as_str()));
+                        }
+                    });
+                } else if framework {
                     candidate.admit_framework(input.clone(), &values)?;
                 } else {
                     candidate.admit_user(input.clone(), &values)?;
@@ -731,7 +802,18 @@ impl SessionInner {
             drop(fence);
             if let Some(id) = queued {
                 let mut inbox = self.inbox.state.lock().unwrap_or_else(|e| e.into_inner());
-                if framework {
+                if !carrier_run.is_empty() {
+                    let notices = carrier_run
+                        .iter()
+                        .filter_map(|entry| match entry {
+                            crate::admission::inbox::IdleCarrier::Framework(entry) => {
+                                Some(entry.id)
+                            }
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>();
+                    inbox.acknowledge(&[], &notices);
+                } else if framework {
                     inbox.acknowledge(&[], &[id]);
                 } else {
                     inbox.acknowledge(&[id], &[]);
@@ -754,13 +836,26 @@ impl SessionInner {
             // Pin route and admitted input durably before any provider effect.
             // No model request exists yet. Runtime owns the first prepared
             // continuation; a crash here must permit a fresh new Turn.
-            if self.route.is_some() {
+            if self.route.is_some() || !carrier_run.is_empty() {
                 self.persist(&context, None).await?;
             }
             if let Some((generation, _)) = &catalog {
                 self.applied_tools.store(*generation, Ordering::Release);
             }
         }
+        if !carrier_run.is_empty() {
+            let accepted = carrier_run
+                .iter()
+                .filter_map(|entry| match entry {
+                    crate::admission::inbox::IdleCarrier::Accepted(entry) => {
+                        Some(entry.operation_id.clone())
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            self.acknowledge_carrier_run_locked(&accepted).await?;
+        }
+        drop(communication_admission);
         admission_transition.armed = false;
         if continuation
             .as_ref()

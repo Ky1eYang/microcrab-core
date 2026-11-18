@@ -93,7 +93,7 @@ fn result(session: &Session) -> String {
         .messages()
         .iter()
         .find_map(|item| match item {
-            ContentItem::Tool { call_id, content } if call_id == "producer-call" => {
+            ContentItem::Tool { call_id, content, .. } if call_id == "producer-call" => {
                 Some(content.clone())
             }
             _ => None,
@@ -586,14 +586,14 @@ impl Client for ReadPagesModel {
                 .items
                 .iter()
                 .find_map(|item| match item {
-                    ContentItem::Tool { call_id, content } if call_id == "producer-call" => {
+                    ContentItem::Tool { call_id, content, .. } if call_id == "producer-call" => {
                         Some(serde_json::from_str(content).unwrap())
                     }
                     _ => None,
                 })
                 .expect("producer receipt must be delivered to the model");
             let latest = content.items.iter().rev().find_map(|item| match item {
-                ContentItem::Tool { call_id, content } if call_id.starts_with("read-page-") => {
+                ContentItem::Tool { call_id, content, .. } if call_id.starts_with("read-page-") => {
                     Some(
                         serde_json::from_str::<OutputPage>(content)
                             .expect("every successful read page must reach Context as output"),
@@ -667,7 +667,7 @@ async fn builtin_read_budgets_alternating_chunk_envelopes_and_retains_until_expl
     let pages: Vec<_> = messages
         .iter()
         .filter_map(|item| match item {
-            ContentItem::Tool { call_id, content } if call_id.starts_with("read-page-") => {
+            ContentItem::Tool { call_id, content, .. } if call_id.starts_with("read-page-") => {
                 assert!(content.len() <= accepted_page_bytes);
                 Some(
                     serde_json::from_str::<OutputPage>(content)

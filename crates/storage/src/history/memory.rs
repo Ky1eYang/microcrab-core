@@ -15,8 +15,24 @@ struct State {
     head: Option<JournalCursor>,
     records: HashMap<String, HistoryNode>,
     redo: Vec<String>,
+    inbox: Option<super::communication::StoredInbox>,
 }
 impl MemoryJournal {
+    pub(super) async fn read_inbox(
+        &self,
+    ) -> Result<Option<super::communication::StoredInbox>, Error> {
+        Ok(self.state.lock().map_err(|_| conflict())?.inbox.clone())
+    }
+    pub(super) async fn store_inbox(
+        &self,
+        inbox: super::communication::StoredInbox,
+    ) -> Result<(), Error> {
+        let mut state = self.state.lock().map_err(|_| conflict())?;
+        if inbox.check_next(state.inbox.as_ref())? {
+            state.inbox = Some(inbox);
+        }
+        Ok(())
+    }
     pub fn new() -> Self {
         Self::default()
     }

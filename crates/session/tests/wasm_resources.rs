@@ -83,7 +83,7 @@ fn component(resource: Option<Resource>, invoke_probe: &str) -> Vec<u8> {
     };
     let text = format!(
         r#"(component
-      (import "microcrab:agent/host-info@0.7.0" (instance $host
+      (import "microcrab:agent/host-info@0.8.0" (instance $host
         (type $code (enum "absent" "unavailable" "rejected" "cancelled"))
         (export "communication-error-code" (type $code_public (eq $code)))
         (type $error (record (field "code" $code_public) (field "message" string)))
@@ -364,7 +364,7 @@ async fn linked_target_boundary_and_policy_denial_remain_distinct_in_context_and
             .messages()
             .into_iter()
             .find_map(|item| match item {
-                ContentItem::Tool { call_id, content } if call_id == "path-probe" => Some(content),
+                ContentItem::Tool { call_id, content, .. } if call_id == "path-probe" => Some(content),
                 _ => None,
             })
             .unwrap();

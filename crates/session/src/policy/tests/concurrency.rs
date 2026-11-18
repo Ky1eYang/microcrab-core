@@ -343,6 +343,7 @@ async fn successful_terminal_outcome_survives_release_and_history_replacement() 
             FinalOutput {
                 content: "done".into(),
                 failure: None,
+                attachments: Vec::new(),
             },
         )
         .await

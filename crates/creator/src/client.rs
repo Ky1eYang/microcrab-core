@@ -9,6 +9,8 @@ use std::{sync::Arc, time::Duration};
 use tokio::{sync::mpsc, time::sleep};
 use tokio_util::sync::CancellationToken;
 
+mod media;
+
 #[cfg(test)]
 mod tests;
 
@@ -16,10 +18,12 @@ mod tests;
 pub struct RetryingClient {
     inner: Arc<TransportClient>,
     policy: RetryPolicy,
+    media_projection: Option<Arc<microcrab_transport::MediaProjection>>,
 }
 #[derive(Clone, Copy)]
 pub struct RetryPolicy {
-    /// Total attempts, including the initial request.
+    /// Total attempts, including the initial request and any single media fallback.
+    /// One configured attempt disables all retries, including URL-to-Data fallback.
     pub attempts: u32,
     /// Initial exponential backoff between retryable failures.
     pub backoff_ms: u64,
@@ -58,8 +62,43 @@ impl RetryingClient {
         Ok(Self {
             inner: Arc::new(TransportClient::new(config)?),
             policy,
+            media_projection: None,
         })
     }
+    /// The projection instance belongs only to this client's selected route/model.
+    pub fn with_media_projection(
+        mut self,
+        projection: Arc<microcrab_transport::MediaProjection>,
+    ) -> Self {
+        self.media_projection = Some(projection);
+        self
+    }
+
+    /// Opt into a public URL uploader for this exact selected route/model.
+    /// Pass false for unverified routes (including Google without a MIME witness).
+    /// The same resolver may separately be installed on SessionBuilder for input
+    /// attachment resolution. This builder never changes frozen canonical Data.
+    pub fn with_attachment_uploader(
+        self,
+        resolver: Arc<dyn microcrab_session::admission::image::AttachmentResolver>,
+        supports_external_image_urls: bool,
+    ) -> Self {
+        self.with_media_projection(Arc::new(microcrab_transport::MediaProjection::new(
+            Arc::new(media::AttachmentImageUrlResolver(resolver)),
+            supports_external_image_urls,
+        )))
+    }
+
+    pub fn with_function_response_media(mut self, enabled: bool) -> Self {
+        self.inner = Arc::new(match self.inner.as_ref().clone() {
+            TransportClient::Google(client) => {
+                TransportClient::Google(client.with_function_response_media(enabled))
+            }
+            client => client,
+        });
+        self
+    }
+
     pub fn with_request_options(
         mut self,
         options: microcrab_transport::OpenAiCompatibleRequestOptions,
@@ -134,20 +173,44 @@ impl Client for RetryingClient {
         variables: &dyn VariableView,
         cancellation: CancellationToken,
     ) -> Result<Response, Error> {
-        for attempt in 0..self.policy.attempts {
+        let projected = match &self.media_projection {
+            Some(projection) => {
+                projection
+                    .project_tool_images(content, cancellation.clone())
+                    .await?
+            }
+            None => None,
+        };
+        let mut use_data = false;
+        let mut attempt = 0;
+        loop {
+            let attempt_content = if use_data {
+                content
+            } else {
+                projected.as_ref().unwrap_or(content)
+            };
             let result = tokio::select! {
                 biased;
                 _ = cancellation.cancelled() => return Err(Error::Cancelled),
-                result = self.inner.complete(content, auditor, variables, cancellation.clone()) => result,
+                result = self.inner.complete(attempt_content, auditor, variables, cancellation.clone()) => result,
             };
             match result {
+                Err(error)
+                    if error.is_remote_image_fetch_rejection()
+                        && projected.is_some()
+                        && !use_data
+                        && attempt + 1 < self.policy.attempts =>
+                {
+                    use_data = true;
+                    attempt += 1;
+                }
                 Err(error) if retryable(&error) && attempt + 1 < self.policy.attempts => {
-                    self.delay(attempt, &cancellation).await?
+                    self.delay(attempt, &cancellation).await?;
+                    attempt += 1;
                 }
                 result => return result,
             }
         }
-        unreachable!("validated positive attempt count")
     }
     async fn stream(
         &self,
@@ -157,10 +220,25 @@ impl Client for RetryingClient {
         cancellation: CancellationToken,
         events: Option<mpsc::Sender<ModelEvent>>,
     ) -> Result<Response, Error> {
-        for attempt in 0..self.policy.attempts {
+        let projected = match &self.media_projection {
+            Some(projection) => {
+                projection
+                    .project_tool_images(content, cancellation.clone())
+                    .await?
+            }
+            None => None,
+        };
+        let mut use_data = false;
+        let mut attempt = 0;
+        loop {
+            let attempt_content = if use_data {
+                content
+            } else {
+                projected.as_ref().unwrap_or(content)
+            };
             let (sender, mut receiver) = mpsc::channel(16);
             let future = self.inner.stream(
-                content,
+                attempt_content,
                 auditor,
                 variables,
                 cancellation.clone(),
@@ -203,13 +281,23 @@ impl Client for RetryingClient {
             }
             match result {
                 Err(error)
+                    if error.is_remote_image_fetch_rejection()
+                        && !published
+                        && projected.is_some()
+                        && !use_data
+                        && attempt + 1 < self.policy.attempts =>
+                {
+                    use_data = true;
+                    attempt += 1;
+                }
+                Err(error)
                     if !published && retryable(&error) && attempt + 1 < self.policy.attempts =>
                 {
-                    self.delay(attempt, &cancellation).await?
+                    self.delay(attempt, &cancellation).await?;
+                    attempt += 1;
                 }
                 result => return result,
             }
         }
-        unreachable!("validated positive attempt count")
     }
 }

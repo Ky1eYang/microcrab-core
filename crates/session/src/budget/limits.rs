@@ -19,6 +19,9 @@ pub struct Limits {
     /// instead of failing the turn.
     pub max_context_bytes: usize,
     pub max_tool_output_bytes: usize,
+    /// Per-invocation encoded image bytes; independent of the UTF-8 text ceiling.
+    #[serde(skip_serializing_if = "is_default_tool_image_bytes")]
+    pub max_tool_image_bytes: usize,
     pub max_output_tokens: u32,
     pub interaction_timeout_ms: u64,
     pub max_pending_executions: usize,
@@ -44,6 +47,8 @@ impl<'de> Deserialize<'de> for Limits {
             max_tool_calls_per_round: usize,
             max_context_bytes: usize,
             max_tool_output_bytes: usize,
+            #[serde(default = "default_tool_image_bytes")]
+            max_tool_image_bytes: usize,
             max_output_tokens: u32,
             #[serde(default = "default_interaction_timeout_ms")]
             interaction_timeout_ms: u64,
@@ -72,6 +77,7 @@ impl<'de> Deserialize<'de> for Limits {
             max_tool_calls_per_round: wire.max_tool_calls_per_round,
             max_context_bytes: wire.max_context_bytes,
             max_tool_output_bytes: wire.max_tool_output_bytes,
+            max_tool_image_bytes: wire.max_tool_image_bytes,
             max_output_tokens: wire.max_output_tokens,
             interaction_timeout_ms: wire.interaction_timeout_ms,
             max_pending_executions: wire.max_pending_executions,
@@ -93,6 +99,7 @@ impl Default for Limits {
             max_tool_calls_per_round: 16,
             max_context_bytes: 64 * 1024 * 1024,
             max_tool_output_bytes: 16 * 1024,
+            max_tool_image_bytes: default_tool_image_bytes(),
             max_output_tokens: 4096,
             interaction_timeout_ms: default_interaction_timeout_ms(),
             max_pending_executions: default_execution_count(),
@@ -105,6 +112,13 @@ impl Default for Limits {
             sleep_max_ms: default_sleep_max_ms(),
         }
     }
+}
+
+fn default_tool_image_bytes() -> usize {
+    1024 * 1024
+}
+fn is_default_tool_image_bytes(value: &usize) -> bool {
+    *value == default_tool_image_bytes()
 }
 
 fn default_interaction_timeout_ms() -> u64 {
@@ -120,13 +134,74 @@ fn default_sleep_max_ms() -> u64 {
     3_600_000
 }
 
+#[cfg(test)]
+mod media_tests {
+    use super::*;
+    #[test]
+    fn default_image_limit_is_one_mib_without_changing_historical_json() {
+        let limits = Limits::default();
+        assert_eq!(limits.max_tool_image_bytes, 1024 * 1024);
+        let value = serde_json::to_value(&limits).unwrap();
+        assert!(value.get("max_tool_image_bytes").is_none());
+        let restored: Limits = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(restored, limits);
+        assert_eq!(serde_json::to_value(restored).unwrap(), value);
+    }
+    #[test]
+    fn image_limit_has_an_independent_explicit_source_ceiling() {
+        let mut limits = Limits {
+            max_tool_image_bytes: crate::admission::image::MAX_IMAGE_BYTES,
+            ..Default::default()
+        };
+        limits.validate().unwrap();
+        limits.max_tool_image_bytes += 1;
+        assert!(
+            limits
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("20 MiB")
+        );
+        limits.max_tool_image_bytes = 0;
+        assert!(limits.validate().is_err());
+    }
+}
+
 impl Limits {
-    pub(crate) fn validate(&self) -> Result<(), Error> {
+    /// Compare typed runtime values; persistence omission never removes a ceiling.
+    pub fn ensure_within_parent(&self, parent: &Self) -> Result<(), Error> {
+        macro_rules! ceiling {($($field:ident),+) => {$({ if self.$field>parent.$field {return Err(Error::config(concat!("child exceeds parent ",stringify!($field)," ceiling")));} })+};}
+        ceiling!(
+            max_rounds,
+            max_tool_calls_per_round,
+            max_context_bytes,
+            max_tool_output_bytes,
+            max_tool_image_bytes,
+            max_output_tokens,
+            interaction_timeout_ms,
+            max_pending_executions,
+            max_retained_executions,
+            lifecycle_timeout_ms,
+            max_processes,
+            max_execution_buffers,
+            max_retained_processes,
+            output_buffer_bytes,
+            sleep_max_ms
+        );
+        Ok(())
+    }
+    pub fn validate(&self) -> Result<(), Error> {
+        if self.max_tool_image_bytes > crate::admission::image::MAX_IMAGE_BYTES {
+            return Err(Error::config(
+                "tool image byte limit exceeds the 20 MiB admission ceiling",
+            ));
+        }
         if [
             self.max_rounds,
             self.max_tool_calls_per_round,
             self.max_context_bytes,
             self.max_tool_output_bytes,
+            self.max_tool_image_bytes,
             self.max_processes,
             self.max_execution_buffers,
             self.max_pending_executions,
@@ -143,5 +218,25 @@ impl Limits {
             return Err(Error::config("all execution limits must be positive"));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod ceiling_tests {
+    use super::*;
+    #[test]
+    fn default_omitted_image_budget_still_obeys_the_typed_parent_ceiling() {
+        let parent = Limits {
+            max_tool_image_bytes: 256 * 1024,
+            ..Default::default()
+        };
+        let child = Limits::default();
+        assert!(child.ensure_within_parent(&parent).is_err());
+        let parent = Limits::default();
+        let child = Limits {
+            max_tool_image_bytes: 512 * 1024,
+            ..Default::default()
+        };
+        child.ensure_within_parent(&parent).unwrap();
     }
 }

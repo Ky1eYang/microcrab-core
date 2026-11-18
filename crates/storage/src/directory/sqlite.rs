@@ -144,6 +144,23 @@ impl Directory for SqliteDirectory {
         })
         .await
     }
+    async fn session_owner(&self, id: &str) -> Result<Option<String>, Error> {
+        identity(id)?;
+        let id = id.to_owned();
+        self.run(move |connection| {
+            let owner: Option<Option<String>> = connection.query_row(
+                "SELECT CASE WHEN length(owner)<=1024 THEN owner ELSE NULL END FROM directory_sessions WHERE id=?1",
+                [&id],
+                |row| row.get(0),
+            ).optional().map_err(failure)?;
+            let Some(owner) = owner else { return Ok(None) };
+            let owner = owner.ok_or_else(|| Error::config("directory owner exceeds identity budget"))?;
+            identity(&owner)?;
+            let record = session(connection, &owner, &id)?.ok_or_else(conflict)?;
+            Ok(Some(record.owner))
+        })
+        .await
+    }
     async fn get(&self, owner: &str, id: &str) -> Result<Option<SessionRecord>, Error> {
         identity(owner)?;
         identity(id)?;

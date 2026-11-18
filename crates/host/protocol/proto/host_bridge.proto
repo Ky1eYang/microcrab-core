@@ -6,6 +6,8 @@ package microcrab.host.v1;
 // Routing fields and chunk bytes are protobuf. Method, descriptor, receipt,
 // diagnostic and success bodies keep their existing serde JSON encoding.
 service HostBridge {
+  // Authenticated availability only; never creates a controller or Execute capability.
+  rpc Inspect(HostFrame) returns (HostFrame);
   rpc Control(stream HostFrame) returns (stream HostFrame);
   rpc Execute(HostFrame) returns (stream HostFrame);
 }
@@ -27,6 +29,9 @@ message HostFrame {
     Pong pong = 13;
     TransferChunk transfer_chunk = 14;
     Detach detach = 15;
+    Inspect inspect = 16;
+    Inspected inspected = 17;
+    HandshakeRejected handshake_rejected = 18;
   }
 }
 
@@ -36,6 +41,8 @@ message Pair {
   optional string directory = 3;
   optional string expected_host_id = 4;
   optional string expected_workspace_id = 5;
+  optional string expected_descriptor_digest = 6;
+  optional string expected_workspace_root = 7;
 }
 
 message Resume {
@@ -44,6 +51,8 @@ message Resume {
   optional string directory = 3;
   optional string expected_host_id = 4;
   optional string expected_workspace_id = 5;
+  optional string expected_descriptor_digest = 6;
+  optional string expected_workspace_root = 7;
 }
 
 message WorkspaceBound {
@@ -126,3 +135,21 @@ message TransferChunk {
 message Detach {
   string lease_generation = 1;
 }
+
+// Pair/Resume payload is inspected without consuming its authorization capability.
+message Inspect {
+  string request_id = 1;
+  oneof authentication {
+    Pair pair = 2;
+    Resume resume = 3;
+  }
+}
+message Inspected {
+  string request_id = 1;
+  oneof result {
+    bytes descriptor_json = 2;
+    WireError error = 3;
+  }
+}
+// This reply proves controller admission was rejected before authority mutation.
+message HandshakeRejected { WireError error = 1; }

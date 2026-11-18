@@ -57,6 +57,7 @@ impl microcrab_session::DelegateExecutor for Available {
 }
 fn catalog() -> Vec<microcrab_agent_types::AgentInfo> {
     vec![microcrab_agent_types::AgentInfo {
+        tool_media_output_bytes: Default::default(),
         name: "child".into(),
         modes: vec![microcrab_agent_types::AgentMode {
             description: String::new(),
@@ -176,7 +177,22 @@ async fn current_job_descriptor_restores_exactly() {
         .unwrap();
     source.submit("current descriptor").await.unwrap();
     let recover = journal.latest().unwrap();
-    assert_eq!(recover.context.tools, vec![BuiltinTool::Job.definition()]);
+    let frozen_tools = source.context_snapshot().unwrap().tools;
+    assert_eq!(recover.context.tools, frozen_tools);
+    assert_eq!(
+        frozen_tools
+            .iter()
+            .filter(|tool| tool.name == "job")
+            .collect::<Vec<_>>(),
+        vec![&BuiltinTool::Job.definition()]
+    );
+    assert_eq!(
+        frozen_tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<Vec<_>>(),
+        ["job", "send_message"]
+    );
     let frozen = serde_json::to_value(&recover.context).unwrap();
     let restored = Session::restore(
         Session::builder(Answer { hidden: false }, job_runtime()),
@@ -188,6 +204,7 @@ async fn current_job_descriptor_restores_exactly() {
         serde_json::to_value(restored.context_snapshot().unwrap()).unwrap(),
         frozen
     );
+    assert_eq!(restored.context_snapshot().unwrap().tools, frozen_tools);
     restored.close().await.unwrap();
     source.close().await.unwrap();
 }

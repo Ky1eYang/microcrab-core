@@ -154,6 +154,12 @@ pub(super) async fn execute(
     if context.cancellation.is_cancelled() {
         return Err(Error::Cancelled);
     }
+    if parsed.action == "write" {
+        let redaction = context.redaction_handle();
+        for id in &ids {
+            registry.merge_redaction(*id, &redaction)?;
+        }
+    }
     // Capture every target's baseline together, before the bounded scheduler can
     // delay later waits behind earlier targets. No per-target revision is invented.
     let revisions = if parsed.action == "wait" {

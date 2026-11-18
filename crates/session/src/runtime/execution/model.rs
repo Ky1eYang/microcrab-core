@@ -61,6 +61,27 @@ impl ToolFailure {
             retryable: false,
         }
     }
+    pub(crate) fn redacted(
+        mut self,
+        redaction: &super::InvocationRedaction,
+    ) -> Result<Self, crate::Error> {
+        self.validate()?;
+        self.code = redaction.redact_text(&self.code);
+        self.message = redaction.redact_text(&self.message);
+        for (text, max) in [
+            (&mut self.code, Self::MAX_CODE_BYTES),
+            (&mut self.message, Self::MAX_MESSAGE_BYTES),
+        ] {
+            if text.len() > max {
+                let mut boundary = max;
+                while !text.is_char_boundary(boundary) {
+                    boundary -= 1;
+                }
+                text.truncate(boundary);
+            }
+        }
+        Ok(self)
+    }
     pub(crate) fn validate(&self) -> Result<(), crate::Error> {
         if self.code.is_empty()
             || self.code.len() > Self::MAX_CODE_BYTES
@@ -71,11 +92,65 @@ impl ToolFailure {
         Ok(())
     }
 }
+/// Validated at the runtime boundary before admission; never a display DTO.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MediaAttachment {
+    pub media_type: String,
+    pub data: Vec<u8>,
+}
+impl std::fmt::Debug for MediaAttachment {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MediaAttachment")
+            .field("media_type", &self.media_type)
+            .field("byte_len", &self.data.len())
+            .finish()
+    }
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FinalOutput {
     pub content: String,
     pub failure: Option<ToolFailure>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<MediaAttachment>,
+}
+/// Typed completion travels to Session admission; it is not an execution snapshot.
+#[derive(Debug)]
+pub(crate) struct ResolvedOutput {
+    pub content: String,
+    pub attachments: Vec<MediaAttachment>,
+}
+impl ResolvedOutput {
+    pub(crate) fn text(content: String) -> Self {
+        Self {
+            content,
+            attachments: Vec::new(),
+        }
+    }
+    /// Display/audit projection carries only encoded-image metadata, never bytes.
+    pub(crate) fn observation_text(
+        content: &str,
+        attachments: &[MediaAttachment],
+    ) -> Result<String, crate::Error> {
+        if attachments.is_empty() {
+            return Ok(content.to_owned());
+        }
+        let images = attachments.iter().map(|attachment| {
+            let metadata = crate::admission::image::validate_image(&attachment.media_type, &attachment.data)?;
+            Ok(serde_json::json!({"media_type": attachment.media_type, "width": metadata.width, "height": metadata.height, "byte_len": attachment.data.len()}))
+        }).collect::<Result<Vec<_>, crate::Error>>()?;
+        Ok(serde_json::json!({"content":content,"images":images}).to_string())
+    }
+
+    pub(crate) fn into_text(self) -> Result<String, crate::Error> {
+        if !self.attachments.is_empty() {
+            return Err(crate::Error::tool(
+                "image output requires typed Session admission",
+            ));
+        }
+        Ok(self.content)
+    }
 }
 #[derive(Debug)]
 pub enum ToolOutput {
@@ -87,12 +162,14 @@ impl ToolOutput {
         Self::Final(FinalOutput {
             content: content.into(),
             failure: None,
+            attachments: Vec::new(),
         })
     }
     pub fn failed(content: impl Into<String>, failure: ToolFailure) -> Self {
         Self::Final(FinalOutput {
             content: content.into(),
             failure: Some(failure),
+            attachments: Vec::new(),
         })
     }
 }

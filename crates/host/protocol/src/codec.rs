@@ -131,18 +131,44 @@ pub fn frame_from_proto(frame: pb::HostFrame) -> Result<WireFrame, WireError> {
 pub fn encode_frame(frame: &WireFrame) -> Result<Vec<u8>, WireError> {
     use pb::host_frame::Body;
     let body = match frame {
+        WireFrame::Inspect { request } => {
+            request.validate()?;
+            let authentication = match frame_to_proto(&request.handshake())?.body {
+                Some(Body::Pair(pair)) => pb::inspect::Authentication::Pair(pair),
+                Some(Body::Resume(resume)) => pb::inspect::Authentication::Resume(resume),
+                _ => return Err(invalid("inspection requires authentication")),
+            };
+            Body::Inspect(pb::Inspect {
+                request_id: request.request_id.clone(),
+                authentication: Some(authentication),
+            })
+        }
+        WireFrame::Inspected { request_id, result } => Body::Inspected(pb::Inspected {
+            request_id: request_id.clone(),
+            result: Some(match result {
+                Ok(descriptor) => pb::inspected::Result::DescriptorJson(json_bytes(descriptor)?),
+                Err(error) => pb::inspected::Result::Error(proto_error(error)?),
+            }),
+        }),
+        WireFrame::HandshakeRejected { error } => Body::HandshakeRejected(pb::HandshakeRejected {
+            error: Some(proto_error(error)?),
+        }),
         WireFrame::Pair {
             token,
             scope,
             directory,
             expected_host_id,
             expected_workspace_id,
+            expected_descriptor_digest,
+            expected_workspace_root,
         } => Body::Pair(pb::Pair {
             token: token.clone(),
             scope_json: json_bytes(scope)?,
             directory: directory.clone(),
             expected_host_id: expected_host_id.clone(),
             expected_workspace_id: expected_workspace_id.clone(),
+            expected_descriptor_digest: expected_descriptor_digest.clone(),
+            expected_workspace_root: expected_workspace_root.clone(),
         }),
         WireFrame::Resume {
             credential,
@@ -150,12 +176,16 @@ pub fn encode_frame(frame: &WireFrame) -> Result<Vec<u8>, WireError> {
             directory,
             expected_host_id,
             expected_workspace_id,
+            expected_descriptor_digest,
+            expected_workspace_root,
         } => Body::Resume(pb::Resume {
             credential: credential.clone(),
             scope_json: json_bytes(scope)?,
             directory: directory.clone(),
             expected_host_id: expected_host_id.clone(),
             expected_workspace_id: expected_workspace_id.clone(),
+            expected_descriptor_digest: expected_descriptor_digest.clone(),
+            expected_workspace_root: expected_workspace_root.clone(),
         }),
         WireFrame::WorkspaceBound {
             descriptor,
@@ -275,12 +305,42 @@ pub fn decode_frame(bytes: &[u8]) -> Result<WireFrame, WireError> {
     };
     use pb::host_frame::Body;
     Ok(match body {
+        Body::Inspect(frame) => {
+            let body = match frame.authentication {
+                Some(pb::inspect::Authentication::Pair(pair)) => Body::Pair(pair),
+                Some(pb::inspect::Authentication::Resume(resume)) => Body::Resume(resume),
+                None => return Err(invalid("inspection has no authentication")),
+            };
+            let handshake = frame_from_proto(pb::HostFrame { body: Some(body) })?;
+            WireFrame::Inspect {
+                request: crate::InspectRequest::new(frame.request_id, &handshake)?,
+            }
+        }
+        Body::Inspected(frame) => WireFrame::Inspected {
+            request_id: frame.request_id,
+            result: match frame.result {
+                Some(pb::inspected::Result::DescriptorJson(bytes)) => {
+                    Ok(json_from_slice::<HostDescriptor>(&bytes)?)
+                }
+                Some(pb::inspected::Result::Error(error)) => Err(rust_error(error)?),
+                None => return Err(invalid("inspection reply has no result")),
+            },
+        },
+        Body::HandshakeRejected(frame) => WireFrame::HandshakeRejected {
+            error: rust_error(
+                frame
+                    .error
+                    .ok_or_else(|| invalid("handshake rejection has no error"))?,
+            )?,
+        },
         Body::Pair(frame) => WireFrame::Pair {
             token: frame.token,
             scope: json_from_slice::<BindingScope>(&frame.scope_json)?,
             directory: frame.directory,
             expected_host_id: frame.expected_host_id,
             expected_workspace_id: frame.expected_workspace_id,
+            expected_descriptor_digest: frame.expected_descriptor_digest,
+            expected_workspace_root: frame.expected_workspace_root,
         },
         Body::Resume(frame) => WireFrame::Resume {
             credential: frame.credential,
@@ -288,6 +348,8 @@ pub fn decode_frame(bytes: &[u8]) -> Result<WireFrame, WireError> {
             directory: frame.directory,
             expected_host_id: frame.expected_host_id,
             expected_workspace_id: frame.expected_workspace_id,
+            expected_descriptor_digest: frame.expected_descriptor_digest,
+            expected_workspace_root: frame.expected_workspace_root,
         },
         Body::WorkspaceBound(frame) => WireFrame::WorkspaceBound {
             descriptor: json_from_slice::<HostDescriptor>(&frame.descriptor_json)?,
@@ -405,6 +467,8 @@ mod tests {
                 directory: Some(".".into()),
                 expected_host_id: None,
                 expected_workspace_id: None,
+                expected_descriptor_digest: None,
+                expected_workspace_root: None,
             },
         ];
         for frame in frames {
@@ -527,6 +591,62 @@ mod tests {
         }))
         .unwrap();
         assert!(!omitted.include_directories);
+    }
+
+    #[test]
+    fn inspection_negotiates_separately_and_legacy_pair_fields_stay_optional() {
+        // Build the historical protobuf payload directly: new optional fields
+        // must decode as absent, while an unknown inspection body cannot be Pair.
+        let pair = WireFrame::Pair {
+            token: "secret".into(),
+            scope: BindingScope::project("backend".into(), "binding".into(), "project".into()),
+            directory: None,
+            expected_host_id: None,
+            expected_workspace_id: None,
+            expected_descriptor_digest: None,
+            expected_workspace_root: None,
+        };
+        let value = serde_json::to_value(&pair).unwrap();
+        assert!(value.get("expected_descriptor_digest").is_none());
+        assert!(value.get("expected_workspace_root").is_none());
+        let request = crate::InspectRequest::new("inspect-1".into(), &pair).unwrap();
+        assert!(!format!("{:?}", request.authentication).contains("secret"));
+        let frames = [
+            WireFrame::Inspect { request },
+            WireFrame::Inspected {
+                request_id: "inspect-1".into(),
+                result: Err(WireError::new(ErrorCode::PairingDenied, "pairing denied")),
+            },
+            WireFrame::HandshakeRejected {
+                error: WireError::new(ErrorCode::BindingMismatch, "descriptor changed"),
+            },
+        ];
+        for frame in frames {
+            let bytes = encode_frame(&frame).unwrap();
+            assert_eq!(bytes, encode_frame(&decode_frame(&bytes).unwrap()).unwrap());
+        }
+        let mut guarded = pair.clone();
+        if let WireFrame::Pair {
+            expected_descriptor_digest,
+            expected_workspace_root,
+            ..
+        } = &mut guarded
+        {
+            *expected_descriptor_digest = Some("a".repeat(64));
+            *expected_workspace_root = Some("/workspace".into());
+        }
+        let bytes = encode_frame(&guarded).unwrap();
+        assert_eq!(bytes, encode_frame(&decode_frame(&bytes).unwrap()).unwrap());
+        assert!(crate::InspectRequest::new("bad/request".into(), &pair).is_err());
+        assert!(
+            crate::InspectRequest::new(
+                "inspect-2".into(),
+                &WireFrame::Ping {
+                    lease_generation: "1".into()
+                }
+            )
+            .is_err()
+        );
     }
 
     #[test]

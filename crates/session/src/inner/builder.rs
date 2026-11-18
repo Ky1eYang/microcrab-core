@@ -15,6 +15,11 @@ impl SessionInner {
             }
             None => parts.prompt_config.render_system(parts.agent.as_ref())?,
         };
+        if parts.kind != crate::SessionKind::OneShot {
+            parts.runtime.configure_conversation_tools(
+                parts.communication.as_ref().map(|value| &value.identity),
+            )?;
+        }
         let context = Context::new(
             system,
             parts.runtime.definitions(),
@@ -63,7 +68,10 @@ impl SessionInner {
         state.install_processes(process_control);
         state.install_catalog(parts.catalog.clone(), parts.is_main);
         state.install_agent_metadata(parts.agent.clone());
-        state.update(|snapshot| snapshot.session_kind = Some(parts.kind));
+        state.update(|snapshot| {
+            snapshot.session_kind = Some(parts.kind);
+            snapshot.communication = parts.communication;
+        });
         state.install_delegate_availability(parts.runtime.delegate_available());
         state.install_references(crate::state::reference::References::new(parts.references)?)?;
         let auditor = Arc::new(crate::observation::hooks::BoundAuditor {
@@ -163,6 +171,16 @@ impl SessionInner {
             .map_err(|e| Error::config_with_private(e.public_reason(), e.to_string()))?;
         state.refresh_preview(Boundary::SessionCreated)?;
         let inbox = Arc::new(crate::admission::inbox::Inbox::default());
+        if let Some(communication) = state.snapshot().communication {
+            inbox
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .install_carriers(
+                    communication.inbox.pending,
+                    communication.inbox.next_ordinal,
+                );
+        }
         state.install_inbox(Arc::downgrade(&inbox));
         let notice_sink: Arc<dyn crate::runtime::execution::ExecutionNoticeSink> =
             Arc::new(super::insertion::SessionNoticeSink {
@@ -176,7 +194,7 @@ impl SessionInner {
         controller
             .bind_lifetime(task_persistence_cancel.clone())
             .map_err(|e| Error::config_with_private(e.public_reason(), e.to_string()))?;
-        Ok(Arc::new_cyclic(|weak: &std::sync::Weak<Self>| {
+        let inner = Arc::new_cyclic(|weak: &std::sync::Weak<Self>| {
             let control: std::sync::Weak<dyn crate::runtime::tool::switch_mode::SessionControl> =
                 weak.clone();
             parts.runtime.bind_controls(control);
@@ -186,6 +204,13 @@ impl SessionInner {
             Self {
                 prompt_config: parts.prompt_config,
                 kind: parts.kind,
+                directory: std::sync::RwLock::new(Arc::new(
+                    crate::runtime::messaging::LineageDirectory::default(),
+                )),
+                communication_transaction: Arc::new(tokio::sync::Mutex::new(())),
+                communication_loaded: AtomicBool::new(false),
+                durable_carrier_consumption: Mutex::new(Default::default()),
+                recovered_child_reservations: Mutex::new(Default::default()),
                 one_shot_claimed: AtomicBool::new(false),
                 delegation_completion: Mutex::new(None),
                 _notice_sink: notice_sink,
@@ -246,6 +271,8 @@ impl SessionInner {
                 task_persistence_cancel,
                 close_result: Mutex::new(None),
             }
-        }))
+        });
+        inner.register_communication_self()?;
+        Ok(inner)
     }
 }

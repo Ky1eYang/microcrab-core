@@ -118,6 +118,19 @@ impl SessionInner {
         token: &CancellationToken,
         retry: bool,
     ) -> Result<(), Error> {
+        if self
+            .state()
+            .communication
+            .as_ref()
+            .is_some_and(|communication| {
+                communication.identity.depth == 1
+                    && communication.identity.parent_session_id.is_none()
+            })
+        {
+            return Err(Error::denied(
+                "new derived Session requires acknowledged parent adoption before initialization",
+            ));
+        }
         self.start_task_persistence();
         if self.started.load(Ordering::SeqCst) {
             return if retry {
@@ -126,6 +139,7 @@ impl SessionInner {
                 self.agent_initialization_status()
             };
         }
+        self.restore_communication_inbox().await?;
         self.load_references(token).await?;
         let mut transition = FaultOnDrop {
             faulted: &self.faulted,
@@ -406,6 +420,7 @@ impl SessionInner {
                                 FinalOutput {
                                     content: "Agent initialization ready".into(),
                                     failure: None,
+                                    attachments: Vec::new(),
                                 },
                             )
                             .await?
@@ -600,6 +615,7 @@ impl SessionInner {
                     tokio::spawn(async move {
                         let retry = previous.is_some();
                         let result = AssertUnwindSafe(async {
+                            inner.interrupt_communication().await;
                             inner.close_rename().await;
                             let helpers = crate::runtime::subagents::OneShotExecutor::close(
                                 inner.one_shots.as_ref(),
@@ -643,11 +659,17 @@ impl SessionInner {
                             // close, so it skips the full terminal checkpoint instead of
                             // writing bytes that are deleted immediately. Hooks, audit
                             // and Journal release still fail closed.
-                            let persistence_failed = if boundary.is_ok() && !discard_snapshot {
-                                inner.persist_terminal().await.is_err()
-                            } else {
-                                false
-                            };
+                            let unpublished_child = inner.kind == crate::SessionKind::Delegated
+                                && !inner.started.load(Ordering::Acquire)
+                                && inner.state().communication.as_ref().is_some_and(|value| {
+                                    value.identity.parent_session_id.is_none()
+                                });
+                            let persistence_failed =
+                                if boundary.is_ok() && !discard_snapshot && !unpublished_child {
+                                    inner.persist_terminal().await.is_err()
+                                } else {
+                                    false
+                                };
                             let audit = inner.auditor.flush().await.map_err(|error| {
                                 Error::Audit(
                                     format!(

@@ -37,6 +37,54 @@ fn missing() -> Error {
 }
 
 impl SqliteJournal {
+    /// Read exact sidecar receipts without schema creation or Session activation.
+    pub async fn inspect_communication(
+        path: impl AsRef<Path>,
+        session_id: String,
+        agent_id: microcrab_session::state::communication::AgentId,
+    ) -> Result<Option<microcrab_session::state::communication::inbox::DurableInbox>, Error> {
+        let path = path.as_ref().to_owned();
+        tokio::task::spawn_blocking(move||{
+            if !path.try_exists()?{return Ok(None);}
+            let connection=Connection::open_with_flags(path,rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY|rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX).map_err(failure)?;
+            connection.execute_batch("PRAGMA query_only=ON; BEGIN DEFERRED;").map_err(failure)?;
+            let exists:bool=connection.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='journal_communication')",[],|row|row.get(0)).map_err(failure)?;
+            if !exists{return Ok(None);}
+            let Some(stored)=read_inbox(&connection,&session_id)? else{return Ok(None);};
+            let head=read_head(&connection,&session_id)?;
+            let selected=head.cursor.map(|cursor|point(&connection,&session_id,&cursor.checkpoint_id,JournalOptions::default().max_checkpoint_bytes)).transpose()?;
+            super::communication::reconcile_inspected(stored,&session_id,&agent_id,selected.as_ref().map(|point|&point.checkpoint.recover)).map(Some)
+        }).await.map_err(|_|Error::protocol("SQLite communication inspection worker failed"))?
+    }
+    pub(super) async fn read_inbox(
+        &self,
+    ) -> Result<Option<super::communication::StoredInbox>, Error> {
+        self.run(|db| {
+            let session_id = db.session_id.clone();
+            let transaction = db
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Deferred)
+                .map_err(failure)?;
+            read_inbox(&transaction, &session_id)
+        })
+        .await
+    }
+    pub(super) async fn store_inbox(
+        &self,
+        inbox: super::communication::StoredInbox,
+    ) -> Result<(), Error> {
+        self.run(move|db|{
+            if !db.writable{return Err(Error::config("SQLite journal is no longer writable"));}
+            inbox.validate(&db.session_id,&inbox.agent_id)?;
+            let transaction=db.connection.transaction_with_behavior(TransactionBehavior::Immediate).map_err(failure)?;
+            let previous=read_inbox(&transaction,&db.session_id)?;
+            if !inbox.check_next(previous.as_ref())?{return Ok(());}
+            let body=serde_json::to_vec(&inbox)?;
+            transaction.execute("INSERT INTO journal_communication(session_id,body) VALUES(?1,?2) ON CONFLICT(session_id) DO UPDATE SET body=excluded.body",params![db.session_id,body]).map_err(failure)?;
+            if let Err(error)=transaction.commit(){db.writable=false;return Err(failure(error));}
+            Ok(())
+        }).await
+    }
     /// Inspect the selected immutable node in a read transaction. No schema setup,
     /// writer registration, checkpoint movement, or Session assembly occurs.
     pub async fn inspect_head(
@@ -204,7 +252,8 @@ impl SqliteJournal {
                 session_id TEXT PRIMARY KEY, cursor BLOB, redo BLOB NOT NULL);
                 CREATE TABLE IF NOT EXISTS journal_nodes(
                 session_id TEXT NOT NULL, id TEXT NOT NULL, body BLOB NOT NULL,
-                PRIMARY KEY(session_id,id));",
+                PRIMARY KEY(session_id,id));
+                CREATE TABLE IF NOT EXISTS journal_communication(session_id TEXT PRIMARY KEY,body BLOB NOT NULL);",
                 )
                 .map_err(failure)?;
             let db = Database {
@@ -552,4 +601,33 @@ impl History for SqliteJournal {
         })
         .await
     }
+}
+fn read_inbox(
+    connection: &Connection,
+    session_id: &str,
+) -> Result<Option<super::communication::StoredInbox>, Error> {
+    let length: Option<i64> = connection
+        .query_row(
+            "SELECT length(body) FROM journal_communication WHERE session_id=?1",
+            [session_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(failure)?;
+    let Some(length) = length else {
+        return Ok(None);
+    };
+    if length < 0 || length as u64 > super::communication::MAX_INBOX_STORAGE_BYTES as u64 {
+        return Err(Error::Limit(
+            "communication sidecar byte budget exceeded".into(),
+        ));
+    }
+    let body: Vec<u8> = connection
+        .query_row(
+            "SELECT body FROM journal_communication WHERE session_id=?1",
+            [session_id],
+            |row| row.get(0),
+        )
+        .map_err(failure)?;
+    Ok(Some(serde_json::from_slice(&body)?))
 }

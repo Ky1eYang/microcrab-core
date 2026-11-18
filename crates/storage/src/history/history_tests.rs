@@ -36,6 +36,7 @@ async fn display_lineage_proves_appends_and_invalidates_same_head_travel() {
         .items
         .push(microcrab_session::context::ContentItem::User {
             parts: vec![microcrab_session::protocol::InputPart::Text { text: "two".into() }],
+            envelope: None,
             source: None,
         });
     journal.commit(appended).await.unwrap();

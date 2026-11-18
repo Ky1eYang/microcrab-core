@@ -1,4 +1,6 @@
 use super::*;
+#[path = "tests/owner_lookup.rs"]
+mod owner_lookup;
 use std::{path::PathBuf, sync::Arc};
 
 fn root() -> PathBuf {

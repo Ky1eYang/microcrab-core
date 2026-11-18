@@ -118,6 +118,7 @@ pub(crate) struct UserEntry {
 #[derive(Clone)]
 pub(crate) struct NoticeEntry {
     pub id: u64,
+    pub ordinal: u64,
     pub lane: Lane,
     pub notice: StateNotice,
     bytes: usize,
@@ -235,6 +236,8 @@ pub(crate) struct InboxState {
     pub retired: bool,
     pub retiring: bool,
     next_id: u64,
+    carriers: Vec<crate::state::communication::inbox::AcceptedCarrier>,
+    communication_enabled: bool,
     users: VecDeque<UserEntry>,
     notices: Vec<NoticeEntry>,
     user_bytes: usize,
@@ -291,11 +294,40 @@ impl Default for Inbox {
 pub(crate) enum TurnEntry {
     User(UserEntry),
     Framework(NoticeEntry),
+    Carriers(Vec<IdleCarrier>),
+}
+#[derive(Clone)]
+pub(crate) enum IdleCarrier {
+    Framework(NoticeEntry),
+    Accepted(crate::state::communication::inbox::AcceptedCarrier),
+}
+impl IdleCarrier {
+    pub fn id(&self) -> u64 {
+        match self {
+            Self::Framework(entry) => entry.ordinal,
+            Self::Accepted(entry) => entry.ordinal,
+        }
+    }
+    pub fn input(&self) -> Result<(SessionInput, microcrab_transport::UserSource), Error> {
+        match self {
+            Self::Framework(entry) => Ok((
+                TurnEntry::Framework(entry.clone()).input()?,
+                microcrab_transport::UserSource::Framework,
+            )),
+            Self::Accepted(entry) => {
+                Ok((SessionInput::text(entry.body.clone()), entry.source.clone()))
+            }
+        }
+    }
 }
 impl TurnEntry {
     pub fn input(&self) -> Result<SessionInput, Error> {
         match self {
             Self::User(entry) => Ok(entry.input.clone()),
+            Self::Carriers(entries) => entries
+                .first()
+                .ok_or_else(|| Error::config("empty carrier run"))
+                .and_then(|entry| entry.input().map(|(input, _)| input)),
             Self::Framework(entry) => Ok(SessionInput::text(format!(
                 "Framework execution notice. Inspect output with job when needed.\n{}",
                 serde_json::to_string(&(&entry.notice.key, &entry.notice.fact))?
@@ -305,11 +337,12 @@ impl TurnEntry {
     pub fn id(&self) -> u64 {
         match self {
             Self::User(entry) => entry.id,
+            Self::Carriers(entries) => entries[0].id(),
             Self::Framework(entry) => entry.id,
         }
     }
     pub fn framework(&self) -> bool {
-        matches!(self, Self::Framework(_))
+        matches!(self, Self::Framework(_) | Self::Carriers(_))
     }
 }
 #[derive(Default)]
@@ -346,7 +379,7 @@ impl InboxState {
             used_bytes: self.user_bytes,
         }
     }
-    fn id(&mut self) -> Result<u64, Error> {
+    pub(crate) fn id(&mut self) -> Result<u64, Error> {
         self.next_id = self.next_id.checked_add(1).ok_or_else(|| {
             crate::budget::reject(crate::LimitKind::Arithmetic, "inbox ordinal overflow")
         })?;
@@ -569,6 +602,7 @@ impl InboxState {
             NOTICE_BYTES.saturating_sub(self.notice_bytes - previous),
         )?;
         let id = self.id()?;
+        let ordinal = old.map(|index| self.notices[index].ordinal).unwrap_or(id);
         // Idle Wake is NextTurn. During a live turn it shares the settled
         // Continue boundary, never a user message inside a pending tool batch.
         let mut lane = match (self.active, notice.delivery) {
@@ -595,6 +629,7 @@ impl InboxState {
         }
         let entry = NoticeEntry {
             id,
+            ordinal,
             lane,
             notice,
             bytes,
@@ -671,7 +706,9 @@ impl InboxState {
         self.users.iter().map(|entry| entry.input.clone()).collect()
     }
     pub fn ready(&self) -> bool {
-        !self.users.is_empty() || self.notices.iter().any(|entry| entry.lane != Lane::Observe)
+        !self.users.is_empty()
+            || !self.carriers.is_empty()
+            || self.notices.iter().any(|entry| entry.lane != Lane::Observe)
     }
     pub fn has_next_turn(&self) -> bool {
         !self.paused
@@ -679,6 +716,7 @@ impl InboxState {
             && !self.retired
             && !self.retiring
             && (!self.users.is_empty()
+                || !self.carriers.is_empty()
                 || self
                     .notices
                     .iter()
@@ -688,14 +726,36 @@ impl InboxState {
         if !self.has_next_turn() {
             return None;
         }
+        if self.communication_enabled {
+            let user_id = self.users.front().map(|entry| entry.id).unwrap_or(u64::MAX);
+            let mut run = self
+                .carriers
+                .iter()
+                .filter(|entry| entry.ordinal < user_id)
+                .cloned()
+                .map(IdleCarrier::Accepted)
+                .chain(
+                    self.notices
+                        .iter()
+                        .filter(|entry| entry.lane == Lane::NextTurn && entry.ordinal < user_id)
+                        .cloned()
+                        .map(IdleCarrier::Framework),
+                )
+                .collect::<Vec<_>>();
+            run.sort_by_key(IdleCarrier::id);
+            run.truncate(32);
+            if !run.is_empty() {
+                return Some(TurnEntry::Carriers(run));
+            }
+        }
         let user = self.users.front().filter(|entry| !entry.claimed);
         let notice = self
             .notices
             .iter()
             .filter(|entry| entry.lane == Lane::NextTurn)
-            .min_by_key(|entry| entry.id);
+            .min_by_key(|entry| entry.ordinal);
         let selected = match (user, notice) {
-            (Some(user), Some(notice)) if notice.id < user.id => {
+            (Some(user), Some(notice)) if notice.ordinal < user.id => {
                 Some(TurnEntry::Framework(notice.clone()))
             }
             (Some(user), _) => Some(TurnEntry::User(user.clone())),
@@ -710,6 +770,15 @@ impl InboxState {
                 .claimed = true;
         }
         selected
+    }
+    pub(crate) fn install_carriers(
+        &mut self,
+        pending: Vec<crate::state::communication::inbox::AcceptedCarrier>,
+        next_ordinal: u64,
+    ) {
+        self.communication_enabled = true;
+        self.next_id = self.next_id.max(next_ordinal);
+        self.carriers = pending;
     }
     pub fn acknowledge(&mut self, users: &[u64], notices: &[u64]) {
         self.users.retain(|entry| {
@@ -768,5 +837,88 @@ impl InboxState {
         for entry in &mut self.notices {
             entry.lane = Lane::Observe;
         }
+    }
+}
+
+#[cfg(test)]
+mod carrier_order_tests {
+    use super::*;
+    fn carrier(id: u64) -> crate::state::communication::inbox::AcceptedCarrier {
+        crate::state::communication::inbox::AcceptedCarrier {
+            operation_id: format!("operation{id}"),
+            ordinal: id,
+            body: format!("body{id}"),
+            source: microcrab_transport::UserSource::External {
+                identity: "speaker".into(),
+            },
+            correspondent: None,
+            speaker: Some(crate::state::communication::ExternalSpeaker {
+                identity: "speaker".into(),
+            }),
+        }
+    }
+    fn notice() -> StateNotice {
+        StateNotice {
+            delivery: StateDelivery::Wake,
+            key: NoticeKey::Execution {
+                session_id: "session".into(),
+                execution_id: ExecutionId(1),
+                change: NoticeKind::Metadata,
+            },
+            fact: NoticeFact {
+                status: ExecutionStatus::Running,
+                failure: None,
+                exit_code: None,
+            },
+        }
+    }
+    #[test]
+    fn repeated_carriers_and_coalesced_wake_keep_actual_first_ordinal_before_user() {
+        let mut inbox = InboxState::default();
+        inbox.install_carriers(vec![], 0);
+        inbox.post(notice()).unwrap();
+        let ordinal = inbox.id().unwrap();
+        inbox.install_carriers(vec![carrier(ordinal)], ordinal);
+        inbox.post(notice()).unwrap();
+        inbox.enqueue("direct user".into(), false).unwrap();
+        let late = inbox.id().unwrap();
+        inbox.install_carriers(vec![carrier(ordinal), carrier(late)], late);
+        let TurnEntry::Carriers(run) = inbox.next_turn().unwrap() else {
+            panic!("leading carrier run")
+        };
+        assert_eq!(
+            run.iter().map(IdleCarrier::id).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert!(matches!(&run[0], IdleCarrier::Framework(_)));
+        let ack = run
+            .iter()
+            .filter_map(|entry| match entry {
+                IdleCarrier::Framework(entry) => Some(entry.id),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        inbox.acknowledge(&[], &ack);
+        inbox.install_carriers(vec![carrier(late)], late);
+        assert!(matches!(inbox.next_turn().unwrap(), TurnEntry::User(_)));
+    }
+    #[test]
+    fn busy_and_continue_or_observe_never_enter_idle_carrier_run() {
+        let mut inbox = InboxState::default();
+        inbox.install_carriers(vec![carrier(1)], 1);
+        inbox.begin_turn();
+        let mut continuing = notice();
+        continuing.delivery = StateDelivery::Continue;
+        inbox.post(continuing).unwrap();
+        assert!(inbox.next_turn().is_none());
+        assert_eq!(inbox.step(true, false).notices.len(), 1);
+        inbox.end_turn(false);
+        let TurnEntry::Carriers(run) = inbox.next_turn().unwrap() else {
+            panic!("agent/external alone")
+        };
+        assert_eq!(run.len(), 1);
+        assert!(matches!(&run[0], IdleCarrier::Accepted(_)));
+        inbox.paused = true;
+        assert!(inbox.next_turn().is_none());
     }
 }

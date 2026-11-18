@@ -277,7 +277,12 @@ fn descriptor() -> HostDescriptor {
             description: None,
         },
         tool_capabilities: vec!["read".into(), "write".into()],
-        supported_primitives: vec!["filesystem.stat".into()],
+        supported_primitives: vec![
+            "filesystem.stat".into(),
+            "filesystem.open".into(),
+            "filesystem.read".into(),
+            "filesystem.close".into(),
+        ],
         descriptor_digest: String::new(),
     };
     descriptor.descriptor_digest = descriptor_fingerprint(&descriptor).unwrap();
@@ -802,5 +807,116 @@ async fn cache_points_validate_fresh_content_and_do_not_request_workspace_scans(
         }
         assert!(host.is_ready());
     }
+    host.detach(1);
+}
+
+#[tokio::test]
+async fn remote_file_reads_enforce_requested_byte_budget() {
+    let host = Arc::new(RemoteHost::new(descriptor()).unwrap());
+    let mut receiver = ready(&host, 1).await;
+    for (limit, bytes) in [
+        (0usize, vec![]),
+        (0, vec![1u8]),
+        (3, vec![1, 2, 3]),
+        (2, vec![1, 2, 3]),
+    ] {
+        let reader = host.clone();
+        let read = tokio::spawn(async move {
+            reader
+                .read_file("bounded.bin".into(), limit, CancellationToken::new())
+                .await
+        });
+        let HostFrame::Request {
+            request_id,
+            operation_id,
+            method: HostRequest::ReadFile { max_bytes, .. },
+            ..
+        } = next_request(&mut receiver).await
+        else {
+            panic!("expected bounded ReadFile request");
+        };
+        assert_eq!(max_bytes as usize, limit);
+        host.receive(
+            1,
+            HostFrame::Response {
+                request_id,
+                operation_id,
+                result: Ok(json!(bytes)),
+            },
+        )
+        .unwrap();
+        let result = read.await.unwrap();
+        if bytes.len() > limit {
+            assert!(matches!(result, Err(ToolError::FileLimit)));
+        } else {
+            assert_eq!(result.unwrap(), bytes);
+        }
+    }
+    host.detach(1);
+}
+
+#[tokio::test]
+async fn remote_fs_api_open_read_close() {
+    use microcrab_host_api::{OpContext, filesystem::{FsApi, OpenOptions}};
+    let host = Arc::new(RemoteHost::new(descriptor()).unwrap());
+    let mut receiver = ready(&host, 1).await;
+    let ctx = OpContext::default();
+    let host_clone = host.clone();
+    let ctx_clone = ctx.clone();
+    let open_task = tokio::spawn(async move {
+        host_clone
+            .open(&ctx_clone, std::path::Path::new("image.png"), OpenOptions { read: true, ..Default::default() })
+            .await
+    });
+    let HostFrame::Request {
+        request_id,
+        operation_id,
+        method: HostRequest::ReadFile { path, max_bytes },
+        ..
+    } = next_request(&mut receiver).await
+    else {
+        panic!("expected ReadFile request");
+    };
+    assert_eq!(path, "image.png");
+    assert_eq!(max_bytes, 20 * 1024 * 1024);
+    host.receive(
+        1,
+        HostFrame::Response {
+            request_id,
+            operation_id,
+            result: Ok(json!([1, 2, 3, 4, 5, 6, 7, 8])),
+        },
+    )
+    .unwrap();
+    let handle = open_task.await.unwrap().unwrap();
+    let r_host: &RemoteHost = &host;
+    let chunk = FsApi::read(r_host, &ctx, handle, 2, 4).await.unwrap();
+    assert_eq!(&chunk[..], &[3, 4, 5, 6]);
+    let eof_chunk = FsApi::read(r_host, &ctx, handle, 8, 4).await.unwrap();
+    assert!(eof_chunk.is_empty());
+    let foreign = OpContext {
+        principal: "other".into(),
+        ..Default::default()
+    };
+    assert_eq!(
+        FsApi::read(r_host, &foreign, handle, 0, 1).await.unwrap_err().category,
+        microcrab_host_api::ErrorCategory::Permission
+    );
+    assert_eq!(
+        FsApi::close(r_host, &foreign, handle).await.unwrap_err().category,
+        microcrab_host_api::ErrorCategory::Permission
+    );
+    ctx.cancel.cancel();
+    let fresh = OpContext::default();
+    assert_eq!(
+        FsApi::read(r_host, &fresh, handle, 0, 1).await.unwrap_err().category,
+        microcrab_host_api::ErrorCategory::Cancelled
+    );
+    FsApi::close(r_host, &ctx, handle).await.unwrap();
+    // After close, a fresh same-principal context sees the exact retired identity.
+    assert_eq!(
+        FsApi::read(r_host, &fresh, handle, 0, 2).await.unwrap_err().category,
+        microcrab_host_api::ErrorCategory::NotFound
+    );
     host.detach(1);
 }

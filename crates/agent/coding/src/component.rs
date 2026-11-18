@@ -2,8 +2,8 @@
 use crate::host::*;
 include!(concat!(env!("OUT_DIR"), "/guest-bindings.rs"));
 use microcrab::host::{
-    cache_points, file_mutation, glob, grep, process, shell, text_read, text_write, tool_types,
-    types,
+    cache_points, file_mutation, filesystem, glob, grep, process, shell, text_read, text_write,
+    tool_types, types,
 };
 
 struct Coding;
@@ -96,7 +96,31 @@ fn mutation_from_abi(request: file_mutation::FileMutation) -> FileMutation {
         }),
     }
 }
+impl crate::image::ImageFiles for ImportedHost {
+    type Handle = u64;
+    fn image_stat(&mut self, path: &str) -> Result<(u64, bool), OperationError> {
+        let metadata = filesystem::stat(path).map_err(host_error)?;
+        Ok((
+            metadata.size,
+            matches!(metadata.kind, filesystem::FileKind::File),
+        ))
+    }
+    fn image_open(&mut self, path: &str) -> Result<u64, OperationError> {
+        filesystem::open(path, filesystem::OpenFlags::READ)
+            .map(|handle| handle.id)
+            .map_err(host_error)
+    }
+    fn image_read(&mut self, id: u64, offset: u64, len: u32) -> Result<Vec<u8>, OperationError> {
+        filesystem::read(filesystem::FileHandle { id }, offset, len).map_err(host_error)
+    }
+    fn image_close(&mut self, id: u64) -> Result<(), OperationError> {
+        filesystem::close(filesystem::FileHandle { id }).map_err(host_error)
+    }
+}
 impl Host for ImportedHost {
+    fn read_image(&mut self, path: &str) -> Result<MediaAttachment, OperationError> {
+        crate::image::read(self, path)
+    }
     fn preflight_mutations(
         &mut self,
         requests: Vec<FileMutation>,
@@ -326,8 +350,23 @@ impl Guest for Coding {
             state: None,
             truncated: false,
         };
-        let content =
+        let result =
             crate::invoke(&checked, &name, &arguments, &mut host).map_err(reported_failure)?;
+        let content = result.content;
+        if !result.attachments.is_empty() {
+            return Ok(ToolOutput::Final(FinalOutput {
+                content,
+                failure: None,
+                attachments: result
+                    .attachments
+                    .into_iter()
+                    .map(|attachment| execution::MediaAttachment {
+                        media_type: attachment.media_type,
+                        data: attachment.data,
+                    })
+                    .collect(),
+            }));
+        }
         let reserved = host
             .output
             .take()
@@ -344,6 +383,7 @@ impl Guest for Coding {
             return Ok(ToolOutput::Final(FinalOutput {
                 content,
                 failure: None,
+                attachments: vec![],
             }));
         };
         if matches!(host.state, Some(ProcessState::Running)) || host.truncated {
@@ -391,7 +431,11 @@ impl Guest for Coding {
             }));
         }
         let content = serde_json::to_string(&serde_json::json!({"stdout":output.stdout,"stderr":output.stderr,"exit_code":match host.state { Some(ProcessState::Exited {code}) => code, _ => None }})).map_err(|e| reported_failure(e.to_string()))?;
-        Ok(ToolOutput::Final(FinalOutput { content, failure }))
+        Ok(ToolOutput::Final(FinalOutput {
+            content,
+            failure,
+            attachments: vec![],
+        }))
     }
     fn drive(
         output: &microcrab::agent::execution::Buffer,

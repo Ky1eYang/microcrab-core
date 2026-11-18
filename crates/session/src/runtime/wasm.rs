@@ -2,10 +2,14 @@
 //! Discovery can read frozen HostInfo but cannot execute Host capabilities.
 //! Tool execution follows the Session permission gate; no WASI linker is installed.
 
+#[cfg(test)]
+mod cleanup_tests;
 mod communication;
 mod driver;
 mod epoch;
 mod lifecycle;
+#[cfg(test)]
+mod media_tests;
 pub use lifecycle::AgentLifecycle;
 mod operations;
 mod output;
@@ -144,6 +148,7 @@ impl WasmAgent {
 pub struct WasmTool {
     compiled: Arc<Compiled>,
     definition: ToolDefinition,
+    media_output_bytes: usize,
 }
 impl WasmTool {
     pub fn load(
@@ -252,7 +257,7 @@ fn load_agent(bytes: &[u8], limits: WasmLimits, host: Arc<dyn Host>) -> Result<W
         .any(|(name, _)| name == "init")
     {
         return Err(Error::wasm(
-            "unsupported Agent ABI: required init export is absent (expected 0.7.0)",
+            "unsupported Agent ABI: required init export is absent (expected 0.8.0)",
         ));
     }
     let mut capabilities = Vec::new();
@@ -272,7 +277,7 @@ fn load_agent(bytes: &[u8], limits: WasmLimits, host: Arc<dyn Host>) -> Result<W
             | "microcrab:host/types@0.1.0"
             | "microcrab:host/tool-types@0.1.0"
             | "microcrab:host/cache-points@0.1.0"
-            | "microcrab:agent/execution@0.7.0" => None,
+            | "microcrab:agent/execution@0.8.0" => None,
             "microcrab:host/text-read@0.1.0" => Some("read"),
             "microcrab:host/file-mutation@0.1.0" => Some("file_mutation"),
             "microcrab:host/text-write@0.1.0" => Some("write"),
@@ -449,6 +454,11 @@ fn load_agent(bytes: &[u8], limits: WasmLimits, host: Arc<dyn Host>) -> Result<W
         .map(|definition| {
             Arc::new(WasmTool {
                 compiled: compiled.clone(),
+                media_output_bytes: agents
+                    .iter()
+                    .find_map(|agent| agent.tool_media_output_bytes.get(&definition.name))
+                    .copied()
+                    .unwrap_or(0),
                 definition,
             }) as Arc<dyn Tool>
         })
@@ -476,6 +486,24 @@ fn validate_agents(agents: &[AgentInfo]) -> Result<(), Error> {
     for agent in agents {
         if !valid_name(&agent.name) || !names.insert(&agent.name) {
             return Err(Error::wasm("invalid or duplicate agent name"));
+        }
+        if agent.tools.len() > 128 || agent.tool_media_output_bytes.len() > 128 {
+            return Err(Error::wasm(
+                "agent tool/output declaration count exceeds128",
+            ));
+        }
+        for (tool, bytes) in &agent.tool_media_output_bytes {
+            if *bytes == 0
+                || *bytes > crate::admission::image::MAX_IMAGE_BYTES
+                || !agent
+                    .tools
+                    .iter()
+                    .any(|definition| &definition.name == tool)
+            {
+                return Err(Error::wasm(
+                    "invalid tool media output declaration: expected a known tool and1..=20MiB",
+                ));
+            }
         }
         let mut modes = HashSet::new();
         if agent.modes.is_empty()
@@ -559,9 +587,11 @@ struct RuntimeState {
     deadline: Instant,
     max_input_bytes: usize,
     max_output_bytes: usize,
+    max_media_output_bytes: usize,
     // Shared invocation bounds permit pagination and conditional-write edits.
     // Discovery and instantiation have no operation context or allowance.
     outputs: HashMap<u32, output::Entry>,
+    file_reads: resources::files::Reads,
     next_output: u32,
     operation_calls_remaining: u8,
     input_bytes_remaining: usize,
@@ -599,6 +629,14 @@ struct Instance {
     failure_evidence: Option<u64>,
 }
 
+fn report_untransferred_process_cleanup_failure(
+    error: &Error,
+    redaction: &super::execution::InvocationRedaction,
+) {
+    let reason = redaction.redact_text(&error.diagnostic_reason());
+    tracing::warn!(reason = %reason, "Untransferred WASM process cleanup failed");
+}
+
 /// A cached store must never retain the Session (or its command endpoint) while
 /// idle. This guard also runs if a Host implementation unwinds on the worker.
 struct InvocationScope<'a>(&'a mut Instance);
@@ -606,6 +644,8 @@ impl Drop for InvocationScope<'_> {
     fn drop(&mut self) {
         let state = self.0.store.data_mut();
         state.outputs.clear();
+        state.file_reads.detach();
+        state.max_media_output_bytes = 0;
         if let (Some(runtime), Some(context)) = (&state.runtime, &state.tool_context) {
             let processes = context.processes.clone();
             let handles: Vec<_> = state
@@ -615,6 +655,7 @@ impl Drop for InvocationScope<'_> {
                 .copied()
                 .collect();
             if !handles.is_empty() {
+                let redaction = context.redaction_handle();
                 runtime.spawn(async move {
                     for id in handles {
                         let handle = microcrab_host_api::process::ProcessHandle(
@@ -625,7 +666,7 @@ impl Drop for InvocationScope<'_> {
                                 .release_process(handle, CancellationToken::new())
                                 .await
                         {
-                            tracing::warn!(reason=%error.diagnostic_reason(), "Untransferred WASM process cleanup failed");
+                            report_untransferred_process_cleanup_failure(&error, &redaction);
                         }
                     }
                 });
@@ -710,6 +751,7 @@ impl Compiled {
                     .build(),
                 host: self.host.clone(),
                 outputs: HashMap::new(),
+                file_reads: Default::default(),
                 next_output: 1,
                 binding: None,
                 tool_context: None,
@@ -730,6 +772,7 @@ impl Compiled {
                 deadline,
                 max_input_bytes: self.limits.max_input_bytes,
                 max_output_bytes: self.limits.max_output_bytes,
+                max_media_output_bytes: 0,
                 operation_calls_remaining: 0,
                 input_bytes_remaining: 0,
                 output_bytes_remaining: 0,
@@ -962,6 +1005,9 @@ impl Compiled {
             .expect("successful initialization installs an instance");
         let scope = InvocationScope(instance);
         let state = scope.0.store.data_mut();
+        // Failed read-handle cleanup remains owned by the retained instance. No
+        // new guest work may replace that owner until cleanup is acknowledged.
+        resources::files::cleanup(state)?;
         state.cancellation = cancellation.clone();
         state.cooperative_driver_cancellation = false;
         state.epoch_cancellation = epoch_cancellation.clone();
@@ -987,20 +1033,27 @@ impl Compiled {
         state.operation_diagnostic = None;
         state.operation_diagnostic_authoritative = false;
         state.known_write_committed = false;
+        state.file_reads.reset();
         state.operation_calls_remaining = if state.tool_context.is_some() { 240 } else { 0 };
         state.input_bytes_remaining = self.limits.max_input_bytes;
         state.output_bytes_remaining = self.limits.max_output_bytes;
         state.cache_points_remaining = if state.tool_context.is_some() { 2 } else { 0 };
         state.patch_plan = None;
         state.patch_receipts.clear();
+        scope
+            .0
+            .store
+            .set_hostcall_fuel(self.limits.max_output_bytes);
         // Wasmtime 47 TypedFunc::call (used by bindgen) automatically runs
         // canonical post-return before returning the owned result to the host.
         let result = call(&scope.0.bindings, &mut scope.0.store, &boundary);
         // Cleanup is independent of caller cancellation and must settle before ready.
-        let cleanup = lifecycle::cleanup_init_processes(scope.0.store.data_mut());
+        let files_cleanup = resources::files::cleanup(scope.0.store.data_mut());
+        let processes_cleanup = lifecycle::cleanup_init_processes(scope.0.store.data_mut());
+        let cleanup = files_cleanup.and(processes_cleanup);
         let cleanup_succeeded = cleanup.is_ok();
         let result = match (result, cleanup) {
-            (Err(error), _) | (Ok(_), Err(error)) => Err(error),
+            (_, Err(error)) | (Err(error), Ok(())) => Err(error),
             (Ok(value), Ok(())) => Ok(value),
         };
         scope.0.failure_evidence = result
@@ -1015,10 +1068,11 @@ impl Compiled {
             return Err(Error::Cancelled);
         }
         let state = scope.0.store.data();
-        if state.operation_scope.is_some() {
-            if state.operation_cancelled && !state.has_mutation_outcome() {
-                return Err(Error::Cancelled);
-            }
+        if state.operation_scope.is_some()
+            && state.operation_cancelled
+            && !state.has_mutation_outcome()
+        {
+            return Err(Error::Cancelled);
         }
 
         if Instant::now() >= state.deadline {
@@ -1092,6 +1146,9 @@ impl Drop for EpochTicker {
 
 #[async_trait]
 impl Tool for WasmTool {
+    fn media_output_bytes(&self) -> usize {
+        self.media_output_bytes
+    }
     fn definition(&self) -> ToolDefinition {
         self.definition.clone()
     }
@@ -1166,6 +1223,7 @@ impl WasmTool {
         })?;
         let compiled = self.compiled.clone();
         let name = self.definition.name.clone();
+        let media_output_bytes = self.media_output_bytes;
         let cancellation = invocation.cancellation.child_token();
         let guard = CancelOnDrop(cancellation.clone());
         let runtime = tokio::runtime::Handle::current();
@@ -1194,6 +1252,18 @@ impl WasmTool {
                         Some(invocation),
                         Some((name.clone(), effective_arguments)),
                         |bindings, store, boundary| {
+                            store.data_mut().max_media_output_bytes = media_output_bytes;
+                            let media_limit = store
+                                .data()
+                                .tool_context
+                                .as_ref()
+                                .map_or(0, |context| {
+                                    context.state.snapshot().limits.max_tool_image_bytes
+                                })
+                                .min(media_output_bytes);
+                            store.set_hostcall_fuel(
+                                compiled.limits.max_output_bytes.saturating_add(media_limit),
+                            );
                             let value = bindings
                                 .call_invoke(
                                     &mut *store,

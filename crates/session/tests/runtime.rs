@@ -132,7 +132,7 @@ async fn expand_selector_xor_is_a_concrete_pre_effect_diagnostic() {
         );
         assert!(rows[0].output.is_none());
         assert!(session.messages().iter().any(|item| matches!(item,
-            ContentItem::Tool { call_id, content } if call_id == "expand-invalid" && content == &diagnostic.result_json()
+            ContentItem::Tool { call_id, content, .. } if call_id == "expand-invalid" && content == &diagnostic.result_json()
         )));
         session.close().await.unwrap();
     }
@@ -278,6 +278,7 @@ async fn invalid_delegate_schema_records_failed_call_without_dispatch() {
         });
         let session = microcrab_session::Session::builder_arc(client, runtime)
             .catalog(vec![microcrab_agent_types::AgentInfo {
+                tool_media_output_bytes: Default::default(),
                 name: "review".into(),
                 modes: vec![microcrab_agent_types::AgentMode {
                     description: String::new(),
@@ -312,7 +313,7 @@ async fn invalid_delegate_schema_records_failed_call_without_dispatch() {
         let results: Vec<_> = messages
             .iter()
             .filter_map(|item| match item {
-                ContentItem::Tool { call_id, content } if call_id == &call.id => Some(content),
+                ContentItem::Tool { call_id, content, .. } if call_id == &call.id => Some(content),
                 _ => None,
             })
             .collect();
@@ -382,7 +383,7 @@ async fn permission_denial_is_a_tool_result_and_does_not_execute_the_tool() {
         .items()
         .iter()
         .find_map(|item| match item {
-            ContentItem::Tool { call_id, content } if call_id == "call-one" => {
+            ContentItem::Tool { call_id, content, .. } if call_id == "call-one" => {
                 Some(serde_json::from_str::<Value>(content).unwrap())
             }
             _ => None,

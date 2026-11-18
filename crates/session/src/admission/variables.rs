@@ -19,6 +19,8 @@ pub(crate) fn is_reserved_key(key: &str) -> bool {
             | "permission"
             | "subagents"
             | "delegatable_agents"
+            | "correspondents"
+            | "external_speakers"
             | "mode_prompt"
             | "executions"
             | "tool_tasks"
@@ -46,6 +48,20 @@ pub(crate) fn validate_change(change: &VariablesChange) -> Result<(), Error> {
         }
     }
     for entry in &change.scoped_set {
+        if entry.visibility == microcrab_protocol::VariableVisibility::Secret {
+            validate_secret(&entry.name, &entry.value)?;
+            if entry.persistence != microcrab_protocol::VariablePersistence::Ephemeral
+                || entry.editors.as_ref().is_some_and(|editors| {
+                    editors
+                        .iter()
+                        .any(|role| *role != microcrab_protocol::VariableRole::Client)
+                })
+            {
+                return Err(Error::config(
+                    "Secret variables require Ephemeral persistence and Client-only editors",
+                ));
+            }
+        }
         if entry.visibility == microcrab_protocol::VariableVisibility::Visible
             && entry.persistence == microcrab_protocol::VariablePersistence::Ephemeral
         {
@@ -53,6 +69,20 @@ pub(crate) fn validate_change(change: &VariablesChange) -> Result<(), Error> {
                 "model-visible ephemeral variables are not supported",
             ));
         }
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_secret(key: &str, value: &serde_json::Value) -> Result<(), Error> {
+    if !microcrab_protocol::valid_secret_key(key) {
+        return Err(Error::config("invalid Secret variable key"));
+    }
+    let Some(value) = value.as_str() else {
+        return Err(Error::config("Secret variable value must be a string"));
+    };
+    let bytes = value.len();
+    if !(1..=8192).contains(&bytes) {
+        return Err(Error::config("Secret variable value must be 1..8192 bytes"));
     }
     Ok(())
 }

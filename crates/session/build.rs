@@ -15,7 +15,7 @@ fn main() -> std::io::Result<()> {
     std::fs::write(
         out.join("runtime-bindings.rs"),
         format!(
-            "wasmtime::component::bindgen!({{ path: {:?}, world: \"runtime\", with: {{ \"microcrab:agent/execution@0.7.0.buffer\": crate::runtime::wasm::output::BufferResource }} }});\n",
+            "wasmtime::component::bindgen!({{ path: {:?}, world: \"runtime\", with: {{ \"microcrab:agent/execution@0.8.0.buffer\": crate::runtime::wasm::output::BufferResource }} }});\n",
             staged
         ),
     )?;

@@ -51,7 +51,7 @@ impl Script {
             .rev()
             .find_map(|request| {
                 request.items.iter().find_map(|item| match item {
-                    microcrab_session::context::ContentItem::Tool { call_id, content }
+                    microcrab_session::context::ContentItem::Tool { call_id, content, .. }
                         if call_id == id =>
                     {
                         Some(content.clone())
@@ -356,7 +356,7 @@ async fn declarative_child_job_permissions_keep_the_live_parent_ceiling() {
 
         let root = tempfile::tempdir().unwrap();
         let host: Arc<dyn microcrab_host_api::Host> = Arc::new(LocalHost::new(root.path(), ShellLimits::default()).unwrap());
-        let agent = AgentInfo { name: "policy-worker".into(), modes: vec![AgentMode {
+        let agent = AgentInfo { tool_media_output_bytes: Default::default(), name: "policy-worker".into(), modes: vec![AgentMode {
             name: "execute".into(), description: "Inspect the owned producer.".into(),
             prompt: "Follow parent assignments without exceeding the parent permission ceiling.".into(),
             role: AgentRole::SubAgent, permissions: vec![],

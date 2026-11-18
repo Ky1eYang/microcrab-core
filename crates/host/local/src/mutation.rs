@@ -317,6 +317,10 @@ fn commit(
                     // read-only bit so cleanup can remove it on Windows.
                     let mut permissions = file.as_file().metadata()?.permissions();
                     if permissions.readonly() {
+                        #[expect(
+                            clippy::permissions_set_readonly_false,
+                            reason = "Windows-only cleanup clears the read-only attribute; Unix permissions are not compiled here"
+                        )]
                         permissions.set_readonly(false);
                         file.as_file().set_permissions(permissions)?;
                     }

@@ -17,8 +17,6 @@ WebAssembly agents.
 | [`xtask`](crates/xtask) | Architecture checks and WASM agent builds |
 
 Server applications, the web UI and Python bindings are maintained separately.
-This repository is the core extracted from microcrab v0.1.16; APIs may change
-before v1.0.
 
 ## Use
 

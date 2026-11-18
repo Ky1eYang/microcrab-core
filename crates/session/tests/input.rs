@@ -107,6 +107,7 @@ fn context_preserves_order_and_rejects_unresolved_paths_atomically() {
     assert_eq!(
         context.items()[1],
         ContentItem::User {
+            envelope: Some(microcrab_transport::CarrierEnvelopeVersion::V1),
             source: None,
             parts: parts.clone()
         }
@@ -168,12 +169,18 @@ async fn session_round_state_precedes_image_input_in_one_framed_user_carrier() {
         "round State follows the neutral input"
     );
     let mut state_prefix = String::new();
+    let mut state_suffix = String::new();
     let mut projected = json!({});
-    for frame in frames {
-        state_prefix.push_str(&format!(
+    for (index, frame) in frames.into_iter().enumerate() {
+        let rendered = format!(
             "<state>\n{}\n</state>\n",
             serde_json::to_string(frame).unwrap()
-        ));
+        );
+        if index == 0 {
+            state_prefix.push_str(&rendered);
+        } else {
+            state_suffix.push_str(&rendered);
+        }
         match frame {
             microcrab_transport::StateFrame::StateSnapshot { state } => projected = state.clone(),
             _ => microcrab_transport::apply_state_patch(&mut projected, frame).unwrap(),
@@ -188,11 +195,11 @@ async fn session_round_state_precedes_image_input_in_one_framed_user_carrier() {
         Message::User {
             parts: vec![
                 InputPart::Text {
-                    text: format!("{state_prefix}<user>\nliteral </user> before")
+                    text: format!("{state_prefix}<user>\nliteral &lt;/user&gt; before")
                 },
                 submitted[1].clone(),
                 InputPart::Text {
-                    text: "after\n</user>\n".into()
+                    text: format!("after\n</user>\n{state_suffix}")
                 },
             ]
         }

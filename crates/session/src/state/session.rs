@@ -18,6 +18,7 @@ pub struct SessionState {
     /// None preserves the absence in frozen historical checkpoints.
     pub session_kind: Option<crate::SessionKind>,
     pub parent_relationship: Option<crate::DelegationRelationship>,
+    pub communication: Option<super::communication::CommunicationState>,
     pub limits: Limits,
     pub variables: Variables,
     /// Bounded observations only. Pending rows restore as interrupted, never replayed futures.
@@ -60,6 +61,8 @@ impl Serialize for SessionState {
             session_kind: &'a Option<crate::SessionKind>,
             #[serde(skip_serializing_if = "Option::is_none")]
             parent_relationship: &'a Option<crate::DelegationRelationship>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            communication: &'a Option<super::communication::CommunicationState>,
             limits: LimitsEncoding<'a>,
             variables: &'a Variables,
             #[serde(skip_serializing_if = "serde_json::Map::is_empty")]
@@ -87,6 +90,7 @@ impl Serialize for SessionState {
             selected_mode: &self.selected_mode,
             session_kind: &self.session_kind,
             parent_relationship: &self.parent_relationship,
+            communication: &self.communication,
             limits,
             variables: &self.variables,
             invisible_variables: self.variables.persisted_invisible(),
@@ -114,6 +118,8 @@ impl<'de> Deserialize<'de> for SessionState {
             session_kind: Option<crate::SessionKind>,
             #[serde(default)]
             parent_relationship: Option<crate::DelegationRelationship>,
+            #[serde(default)]
+            communication: Option<super::communication::CommunicationState>,
             limits: serde_json::Value,
             variables: Variables,
             #[serde(default)]
@@ -153,6 +159,7 @@ impl<'de> Deserialize<'de> for SessionState {
             selected_mode: wire.selected_mode,
             session_kind: wire.session_kind,
             parent_relationship: wire.parent_relationship,
+            communication: wire.communication,
             limits,
             variables: wire.variables,
             executions: wire.executions,
@@ -185,6 +192,7 @@ impl SessionState {
             selected_mode: None,
             session_kind: None,
             parent_relationship: None,
+            communication: None,
             limits,
             variables: Variables::default(),
             executions: Vec::new(),

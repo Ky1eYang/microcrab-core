@@ -13,6 +13,7 @@ fn agent(rules: usize, payload: Value) -> AgentInfo {
         .unwrap();
     variables.inject("payload", payload).unwrap();
     AgentInfo {
+        tool_media_output_bytes: Default::default(),
         name: "test".into(),
         modes: vec![],
         tools: vec![],

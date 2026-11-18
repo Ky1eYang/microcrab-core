@@ -1,4 +1,4 @@
-//! Typed 0.7 fixture ABI for Final-only handwritten components.
+//! Typed 0.8 fixture ABI for Final-only handwritten components.
 //!
 //! Older fixture bodies deliberately exercise small core functions. This adapter
 //! preserves their content/trap/import behavior while lifting the actual typed
@@ -183,14 +183,17 @@ pub fn component_with_init(text: &str, init_body: &str) -> Vec<u8> {
         invoke.find("(realloc (core func ").expect("invoke realloc") + "(realloc (core func ".len();
     let realloc_instance = invoke[realloc_start..].split_whitespace().next().unwrap();
     let types = r#"
-      (import "microcrab:agent/execution@0.7.0" (instance $fixture_execution
+      (import "microcrab:agent/execution@0.8.0" (instance $fixture_execution
         (export "buffer" (type $buffer (sub resource)))
         (type $kind_raw (enum "failed" "timeout" "cancelled"))
         (export "failure-kind" (type $kind (eq $kind_raw)))
         (type $failure_raw (record (field "kind" $kind)
           (field "code" string) (field "message" string) (field "retryable" bool)))
         (export "tool-failure" (type $failure (eq $failure_raw)))
-        (type $final_raw (record (field "content" string) (field "failure" (option $failure))))
+        (type $media_raw (record (field "media-type" string) (field "data" (list u8))))
+        (export "media-attachment" (type $media (eq $media_raw)))
+        (type $final_raw (record (field "content" string) (field "failure" (option $failure))
+          (field "attachments" (list $media))))
         (export "final-output" (type $final (eq $final_raw)))
         (type $buffered_raw (record (field "output" (own $buffer)) (field "include-initial" bool)))
         (export "buffered-output" (type $buffered (eq $buffered_raw)))
@@ -221,22 +224,22 @@ pub fn component_with_init(text: &str, init_body: &str) -> Vec<u8> {
           (local $old i32) (local $new i32)
           local.get 0 local.get 1 local.get 2 local.get 3 local.get 4 local.get 5
           call $invoke local.set $old
-          i32.const 0 i32.const 0 i32.const 4 i32.const 64 call $realloc
+          i32.const 0 i32.const 0 i32.const 4 i32.const 80 call $realloc
           i32.const 3 i32.add i32.const -4 i32.and local.set $new
-          local.get $new i32.const 0 i32.const 44 memory.fill
+          local.get $new i32.const 0 i32.const 52 memory.fill
           local.get $old i32.load8_u
           if
             ;; Typed Err(tool-failure), fixed code and original fixture message.
             local.get $new i32.const 1 i32.store8
-            local.get $new i32.const 44 i32.add i64.const 0x5f65727574786966 i64.store
-            local.get $new i32.const 52 i32.add i32.const 0x6c696166 i32.store
-            local.get $new i32.const 56 i32.add i32.const 0x6465 i32.store16
-            local.get $new i32.const 8 i32.add local.get $new i32.const 44 i32.add i32.store
+            local.get $new i32.const 52 i32.add i64.const 0x5f65727574786966 i64.store
+            local.get $new i32.const 60 i32.add i32.const 0x6c696166 i32.store
+            local.get $new i32.const 64 i32.add i32.const 0x6465 i32.store16
+            local.get $new i32.const 8 i32.add local.get $new i32.const 52 i32.add i32.store
             local.get $new i32.const 12 i32.add i32.const 14 i32.store
             local.get $new i32.const 16 i32.add local.get $old i32.const 4 i32.add i32.load i32.store
             local.get $new i32.const 20 i32.add local.get $old i32.const 8 i32.add i32.load i32.store
           else
-            ;; Outer Ok, tool-output Final, content pointer/length, failure None.
+            ;; Outer Ok, tool-output Final, content pointer/length, failure None, empty attachments.
             local.get $new i32.const 8 i32.add local.get $old i32.const 4 i32.add i32.load i32.store
             local.get $new i32.const 12 i32.add local.get $old i32.const 8 i32.add i32.load i32.store
           end
@@ -278,5 +281,5 @@ pub fn component_with_init(text: &str, init_body: &str) -> Vec<u8> {
     typed.push_str(&adapter);
     typed.push_str(&invoke);
     typed = typed.replacen("(component", &format!("(component{types}"), 1);
-    wat::parse_str(typed).expect("valid typed 0.7 fixture component")
+    wat::parse_str(typed).expect("valid typed 0.8 fixture component")
 }

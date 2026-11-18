@@ -111,6 +111,7 @@ fn setup_with_parent(
     let model = Arc::new(Model::default());
     let defaults = |action| vec![rule(Action::Allow), patch_rule(action)];
     let agent = AgentInfo {
+        tool_media_output_bytes: Default::default(),
         name: "coding".into(),
         modes: vec![
             AgentMode {
@@ -363,6 +364,27 @@ async fn model_groups_equivalent_tools_while_management_rows_keep_exact_owner_wi
             .find(|row| row["kind"] == "static" && row["action"] == "allow")
             .unwrap();
         assert_eq!(allowed["tools"], json!(["job", "read", "sleep"]));
+        let communication = groups
+            .iter()
+            .filter(|group| {
+                group["tools"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|tool| tool == "send_message")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(communication.len(), 1);
+        assert_eq!(communication[0]["tools"], json!(["send_message"]));
+        let policy = compiled(&requests[0], "send_message");
+        assert_eq!(
+            evaluate_compiled(&policy, &json!({"intent":"send"})).unwrap(),
+            Action::Ask
+        );
+        assert_eq!(
+            evaluate_compiled(&policy, &json!({"intent":"reply"})).unwrap(),
+            Action::Allow
+        );
         assert!(
             groups
                 .iter()
@@ -372,7 +394,28 @@ async fn model_groups_equivalent_tools_while_management_rows_keep_exact_owner_wi
     let inventory = session.permission_inventory().unwrap();
     for mode in inventory["modes"].as_array().unwrap() {
         let rows = mode["compiled"].as_array().unwrap();
-        assert_eq!(rows.len(), 4);
+        let fixture_tools = ["job", "patch", "read", "sleep"];
+        let fixture_rows = rows
+            .iter()
+            .filter(|row| fixture_tools.contains(&row["tool"]["value"].as_str().unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(fixture_rows.len(), fixture_tools.len());
+        for name in fixture_tools {
+            assert_eq!(
+                fixture_rows
+                    .iter()
+                    .filter(|row| row["tool"]["value"] == name)
+                    .count(),
+                1
+            );
+        }
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row["tool"]["value"] == "send_message")
+                .count(),
+            1
+        );
+        assert_eq!(rows.len(), fixture_rows.len() + 1);
         for row in rows {
             assert_eq!(row["tool"]["kind"], "exact");
             assert!(

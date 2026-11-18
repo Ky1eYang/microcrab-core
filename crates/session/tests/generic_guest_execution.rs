@@ -88,7 +88,7 @@ async fn fixture(root: &tempfile::TempDir, command: &str) -> (Session, Arc<Local
         .messages()
         .iter()
         .find_map(|item| match item {
-            ContentItem::Tool { call_id, content } if call_id == "continued-guest" => {
+            ContentItem::Tool { call_id, content, .. } if call_id == "continued-guest" => {
                 Some(serde_json::from_str::<Value>(content).unwrap())
             }
             _ => None,

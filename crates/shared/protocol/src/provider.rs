@@ -137,12 +137,10 @@ impl AssistantProviderMetadata {
         for part in parts {
             match part {
                 AssistantPart::Text { text: value } => text.push_str(value),
-                AssistantPart::ToolCall { call_id } => {
-                    if refs.next().is_none_or(|call| &call.id != call_id) {
-                        return Err(
-                            "assistant replay differs from ordered tool call projection".into()
-                        );
-                    }
+                AssistantPart::ToolCall { call_id }
+                    if refs.next().is_none_or(|call| &call.id != call_id) =>
+                {
+                    return Err("assistant replay differs from ordered tool call projection".into());
                 }
                 _ => {}
             }

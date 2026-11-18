@@ -2,7 +2,7 @@ package microcrab:session@0.1.1;
 
 /// Explicit scoped variable capability. Values and attributes remain separate.
 interface variables {
-  use microcrab:agent/host-info@0.7.0.{communication-error};
+  use microcrab:agent/host-info@0.8.0.{communication-error};
   /// Legacy visible-only single-value inspection.
   variable-get: func(name: string) -> result<string, communication-error>;
   /// Trusted full State inspection, including live ephemeral values, as pure KV JSON.

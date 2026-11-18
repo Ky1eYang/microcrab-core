@@ -226,6 +226,61 @@ fn validate_body(body: &Value) -> Result<(), Error> {
             {
                 return Err(Error::protocol("invalid Google function call"));
             }
+            if let Some(parts) = part
+                .get("functionResponse")
+                .and_then(|result| result.get("parts"))
+            {
+                let media = parts
+                    .as_array()
+                    .filter(|parts| !parts.is_empty())
+                    .ok_or_else(|| {
+                        Error::protocol("Google function response media parts missing")
+                    })?;
+                for item in media {
+                    canonical_fields(item)?;
+                    let inline = item.get("inlineData");
+                    let file = item.get("fileData");
+                    if inline.is_some() == file.is_some()
+                        || item.as_object().is_none_or(|object| {
+                            object
+                                .keys()
+                                .any(|key| !matches!(key.as_str(), "inlineData" | "fileData"))
+                        })
+                    {
+                        return Err(Error::protocol(
+                            "Google function response part requires one media member",
+                        ));
+                    }
+                    let value = inline
+                        .or(file)
+                        .ok_or_else(|| Error::protocol("Google function response media missing"))?;
+                    canonical_fields(value)?;
+                    let nonempty = |key| {
+                        value
+                            .get(key)
+                            .and_then(Value::as_str)
+                            .is_some_and(|s| !s.is_empty())
+                    };
+                    if !nonempty("mimeType")
+                        || (inline.is_some()
+                            && (!nonempty("data")
+                                || value
+                                    .get("data")
+                                    .and_then(Value::as_str)
+                                    .is_none_or(|data| {
+                                        use base64::Engine as _;
+                                        base64::engine::general_purpose::STANDARD
+                                            .decode(data)
+                                            .is_err()
+                                    })))
+                        || (file.is_some() && !nonempty("fileUri"))
+                    {
+                        return Err(Error::protocol(
+                            "Google function response media requires MIME and source",
+                        ));
+                    }
+                }
+            }
             if let Some(result) = part.get("functionResponse")
                 && (result
                     .get("name")

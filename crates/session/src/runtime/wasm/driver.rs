@@ -1,57 +1,30 @@
 //! Real epoch-bound guest continuations. Runtime storage never borrows linear memory.
 use super::{Compiled, Instance, SessionBinding, ToolContext, epoch::Slot, output};
-use crate::{
-    Error, State,
-    policy::{AdmittedInvocation, InvocationSubject},
-    runtime::execution::{ExecutionId, OutputWriter, process::ProcessControl},
-};
+use crate::{Error, runtime::execution::OutputWriter};
 use std::{sync::Arc, time::Duration};
 use tokio_util::sync::CancellationToken;
 use wasmtime::component::Resource;
 
-/// Rebuild a fresh invocation conduit per step. Only immutable identity, the
-/// original admission proof, and the live Session ports survive between steps.
+/// Rebind the live counters and producer cancellation per step while retaining
+/// the exact invocation conduit. Reconstructing through `ToolContext::new` would
+/// mint a different process wrapper and lose the sealed argument/redaction binding.
 pub(super) struct Scope {
-    state: State,
-    processes: Arc<dyn ProcessControl>,
-    call_id: String,
-    tool: String,
-    session_id: String,
-    agent: String,
-    mode: Option<String>,
-    admission: Option<Arc<AdmittedInvocation>>,
-    subject: InvocationSubject,
-    execution_id: Option<ExecutionId>,
+    invocation: ToolContext,
 }
 impl Scope {
     pub fn capture(context: &ToolContext) -> Self {
-        Self {
-            state: context.state.clone(),
-            processes: context.processes.clone(),
-            call_id: context.call_id.clone(),
-            tool: context.tool.clone(),
-            session_id: context.session_id.clone(),
-            agent: context.agent.clone(),
-            mode: context.mode.clone(),
-            admission: context.admission.clone(),
-            subject: context.subject.clone(),
-            execution_id: context.execution_id,
-        }
+        let mut invocation = context.clone();
+        // Progress is supplied by the execution owner, not borrowed by a later
+        // guest step. The original admission and execution identities remain.
+        invocation.execution_progress = None;
+        Self { invocation }
     }
     fn context(&self, cancel: CancellationToken) -> ToolContext {
-        let mut context = ToolContext::new(
-            self.state.clone(),
-            self.processes.clone(),
-            cancel,
-            self.call_id.clone(),
-            self.tool.clone(),
-            self.session_id.clone(),
-            self.agent.clone(),
-            self.mode.clone(),
-        );
-        context.admission = self.admission.clone();
-        context.subject = self.subject.clone();
-        context.execution_id = self.execution_id;
+        let mut context = self.invocation.clone();
+        let snapshot = context.state.snapshot();
+        context.cancellation = cancel;
+        context.turn_id = snapshot.turn_id;
+        context.round_id = snapshot.round_id;
         context
     }
 }
@@ -230,6 +203,55 @@ mod cancellation_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn guest_step_retains_shared_redaction_when_original_scope_rotates() {
+        use crate::runtime::execution::InvocationRedaction;
+        use std::collections::BTreeMap;
+        use std::sync::atomic::AtomicBool;
+        let (state, _endpoint) = crate::State::new(Default::default()).bind_writer(
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        );
+        state
+            .prepare_secret_write(BTreeMap::from([("token".into(), "PRIVATE_OLD".into())]))
+            .await
+            .unwrap()
+            .commit()
+            .unwrap();
+        let original = ToolContext::new(
+            state.clone(),
+            state.processes(),
+            CancellationToken::new(),
+            "call".into(),
+            "tool".into(),
+            "session".into(),
+            "agent".into(),
+            None,
+        );
+        original
+            .redaction_handle()
+            .merge(&InvocationRedaction::from_snapshot(state.secret_snapshot()).unwrap())
+            .unwrap();
+        let scope = Scope::capture(&original);
+        let continued = scope.context(CancellationToken::new());
+        state
+            .prepare_secret_write(BTreeMap::from([("token".into(), "PRIVATE_NEW".into())]))
+            .await
+            .unwrap()
+            .commit()
+            .unwrap();
+        original
+            .redaction_handle()
+            .merge(&InvocationRedaction::from_snapshot(state.secret_snapshot()).unwrap())
+            .unwrap();
+        assert!(Arc::ptr_eq(&original.processes, &continued.processes));
+        assert_eq!(
+            continued
+                .redaction_handle()
+                .redact_text("PRIVATE_OLD PRIVATE_NEW"),
+            "{{secret:token}} {{secret:token}}"
+        );
+    }
     #[test]
     fn guest_step_rebinds_live_state_and_producer_cancellation() {
         let invocation = ToolContext::detached(
@@ -257,6 +279,7 @@ mod tests {
 #[cfg(test)]
 mod proof_tests {
     use super::*;
+    use crate::policy::InvocationSubject;
     #[test]
     fn continuation_retains_original_component_subject_and_exact_proof() {
         let mut original = ToolContext::detached(
@@ -271,6 +294,7 @@ mod proof_tests {
             snapshot.turn_id = Some(123);
         });
         let continued = scope.context(CancellationToken::new());
+        assert!(Arc::ptr_eq(&original.processes, &continued.processes));
         assert!(Arc::ptr_eq(
             original.admission.as_ref().unwrap(),
             continued.admission.as_ref().unwrap()

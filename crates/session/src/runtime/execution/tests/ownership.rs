@@ -37,6 +37,7 @@ async fn execution_retention_uses_its_cap_independently_of_process_history() {
                     FinalOutput {
                         content: format!("completed-{index}"),
                         failure: None,
+                        attachments: Vec::new(),
                     },
                 )
                 .await

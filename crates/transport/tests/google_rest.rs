@@ -20,6 +20,7 @@ fn content() -> Content {
         subagent: None,
         system: "frozen system".into(),
         items: vec![ContentItem::User {
+            envelope: None,
             source: None,
             parts: vec![InputPart::Text {
                 text: "lookup".into(),
@@ -269,6 +270,7 @@ async fn real_google_round_trip_has_single_canonical_system_tools_config_and_fun
         tool_calls: response.tool_calls,
     });
     content.items.push(ContentItem::Tool {
+        parts: vec![],
         call_id: "provider-call".into(),
         content: "[1,2]".into(),
     });
@@ -411,6 +413,7 @@ async fn full_sse_audit_and_native_signed_tail_survive_a_restored_continuation()
         provider_metadata: response.provider_metadata,
     });
     history.items.push(ContentItem::User {
+        envelope: None,
         source: None,
         parts: vec![InputPart::Text {
             text: "continue".into(),

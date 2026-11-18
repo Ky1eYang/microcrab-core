@@ -37,7 +37,7 @@ impl Client for Model {
         _: CancellationToken,
     ) -> Result<Response, microcrab_transport::Error> {
         for item in &content.items {
-            if let ContentItem::Tool { call_id, content } = item
+            if let ContentItem::Tool { call_id, content, .. } = item
                 && call_id.starts_with(&format!("{}-", self.prefix))
                 && self.captured.lock().unwrap().insert(call_id.clone())
             {

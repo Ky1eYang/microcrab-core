@@ -105,9 +105,11 @@ impl OneShotExecutor for SessionOneShot {
         let prompt_config = self.prompt_config.clone();
         tokio::spawn(async move {
             let runtime = Runtime::new(vec![], Arc::new(crate::runtime::tool::DenyAll))?;
-            let mut limits = Limits::default();
-            limits.max_context_bytes = context.max_bytes();
-            limits.max_output_tokens = output_tokens;
+            let limits = Limits {
+                max_context_bytes: context.max_bytes(),
+                max_output_tokens: output_tokens,
+                ..Limits::default()
+            };
             let session = crate::Session::builder_arc(client, runtime)
                 .kind(crate::SessionKind::OneShot)
                 .prompt_config(prompt_config)

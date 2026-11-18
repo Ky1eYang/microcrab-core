@@ -131,6 +131,9 @@ impl Tool for Job {
         let execution_id = resolve(id, &context.session_id)?;
         let registry = context.state.executions();
         let maximum = output_budget(&context.state.snapshot().limits);
+        if action == "write" {
+            registry.merge_redaction(execution_id, &context.redaction_handle())?;
+        }
         let operation = batch::operate::<false>(
             &registry,
             execution_id,

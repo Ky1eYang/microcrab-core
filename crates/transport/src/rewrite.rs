@@ -296,7 +296,19 @@ fn responses_body(body: &Value) -> bool {
                     }
                     Some("function_call_output") => {
                         nonempty(item.get("call_id"))
-                            && item.get("output").is_some_and(Value::is_string)
+                            && (item.get("output").is_some_and(Value::is_string)
+                                || array(item.get("output"), |part| {
+                                    match part.get("type").and_then(Value::as_str) {
+                                        Some("input_text") => {
+                                            part.get("text").is_some_and(Value::is_string)
+                                        }
+                                        Some("input_image") => {
+                                            nonempty(part.get("image_url"))
+                                                || nonempty(part.get("file_id"))
+                                        }
+                                        _ => false,
+                                    }
+                                }))
                     }
                     Some("reasoning") => {
                         item.get("summary")

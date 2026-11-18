@@ -345,10 +345,10 @@ pub fn sanitize(text: &str, max_bytes: usize) -> String {
         };
         let keep = max_bytes.saturating_sub(marker.len());
         let mut keep = boundary(&out, keep);
-        if let Some(open) = out[..keep].rfind('[') {
-            if !out[open..keep].contains(']') {
-                keep = open;
-            }
+        if let Some(open) = out[..keep].rfind('[')
+            && !out[open..keep].contains(']')
+        {
+            keep = open;
         }
         out.truncate(keep);
         out.push_str(&marker[..boundary(marker, max_bytes.saturating_sub(out.len()))]);

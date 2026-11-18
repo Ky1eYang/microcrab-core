@@ -21,13 +21,103 @@ pub struct PromptConfig {
     pub action_review_template: String,
     pub client_prompt: String,
 }
+impl Default for PromptConfig {
+    fn default() -> Self {
+        Self {
+            system_template: DEFAULT_SYSTEM.into(),
+            compact_template: DEFAULT_COMPACT.into(),
+            auto_compact_template: DEFAULT_AUTO_COMPACT.into(),
+            rename_template: DEFAULT_RENAME.into(),
+            action_review_template: DEFAULT_ACTION_REVIEW.into(),
+            client_prompt: String::new(),
+        }
+    }
+}
+impl PromptConfig {
+    /// Empty template slots explicitly select the embedded baseline. Client text
+    /// stays byte-for-byte intact; empty client text deliberately disables it.
+    pub fn resolved(mut self) -> Self {
+        for (slot, baseline) in [
+            (&mut self.system_template, DEFAULT_SYSTEM),
+            (&mut self.compact_template, DEFAULT_COMPACT),
+            (&mut self.auto_compact_template, DEFAULT_AUTO_COMPACT),
+            (&mut self.rename_template, DEFAULT_RENAME),
+            (&mut self.action_review_template, DEFAULT_ACTION_REVIEW),
+        ] {
+            if slot.is_empty() {
+                *slot = baseline.into();
+            }
+        }
+        self
+    }
+    fn validate_bounds(&self) -> Result<(), Error> {
+        let fields = [
+            &self.system_template,
+            &self.compact_template,
+            &self.auto_compact_template,
+            &self.rename_template,
+            &self.action_review_template,
+            &self.client_prompt,
+        ];
+        if fields.iter().any(|field| field.len() > MAX_PROMPT_BYTES)
+            || fields.iter().map(|field| field.len()).sum::<usize>() > MAX_PROMPT_CONFIG_BYTES
+        {
+            return Err(Error::config("prompt configuration byte limit exceeded"));
+        }
+        Ok(())
+    }
+    /// Syntax-only validation is safe before Agent selection or durable effects.
+    pub fn validate(&self) -> Result<(), Error> {
+        self.validate_bounds()?;
+        let config = self.clone().resolved();
+        config.validate_bounds()?;
+        if config.system_template.trim().is_empty() {
+            return Err(Error::config("SYSTEM template must be nonempty"));
+        }
+        super::syntax::validate(&config.system_template)?;
+        let mut engine = tera::Tera::new();
+        engine.register_filter("json_encode", super::json_encode);
+        engine
+            .add_raw_template("SYSTEM", &config.system_template)
+            .map_err(|error| {
+                Error::config_with_private(
+                    "SYSTEM template syntax failed",
+                    format!("SYSTEM template syntax failed: {error}"),
+                )
+            })?;
+        for (template, bindings) in [
+            (config.compact_template.as_str(), &["user_input"][..]),
+            (config.auto_compact_template.as_str(), &[][..]),
+            (config.rename_template.as_str(), &["user_input"][..]),
+            (
+                config.action_review_template.as_str(),
+                &["user_input", "tool", "tool_name", "tool_args"][..],
+            ),
+        ] {
+            crate::runtime::subagents::validate_template(
+                template,
+                bindings,
+                MAX_PROMPT_CONFIG_BYTES,
+            )?;
+        }
+        Ok(())
+    }
+    pub fn render_system(&self, agent: Option<&AgentInfo>) -> Result<String, Error> {
+        self.validate()?;
+        let config = self.clone().resolved();
+        super::render_with_client(&config.system_template, agent, Some(&config.client_prompt))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     #[test]
     fn validates_all_slots_before_agent_render() {
-        let mut config = PromptConfig::default();
-        config.system_template = "{{ agent.required }}".into();
+        let mut config = PromptConfig {
+            system_template: "{{ agent.required }}".into(),
+            ..Default::default()
+        };
         assert!(config.validate().is_ok());
         assert!(config.render_system(None).is_err());
         config.system_template = "{% if broken".into();
@@ -116,8 +206,10 @@ mod tests {
     }
     #[test]
     fn rejects_bounds_and_blank_helpers() {
-        let mut config = PromptConfig::default();
-        config.client_prompt = "x".repeat(MAX_PROMPT_BYTES + 1);
+        let mut config = PromptConfig {
+            client_prompt: "x".repeat(MAX_PROMPT_BYTES + 1),
+            ..Default::default()
+        };
         assert!(config.validate().is_err());
         config.client_prompt.clear();
         config.system_template = "  \n\t".into();
@@ -125,9 +217,11 @@ mod tests {
         config.system_template = DEFAULT_SYSTEM.into();
         config.rename_template = "  \n".into();
         assert!(config.validate().is_err());
-        let mut config = PromptConfig::default();
-        config.system_template =
-            "{% for i in range(end=100000) %}01234567890123456789{% endfor %}".into();
+        let mut config = PromptConfig {
+            system_template: "{% for i in range(end=100000) %}01234567890123456789{% endfor %}"
+                .into(),
+            ..Default::default()
+        };
         assert!(config.validate().is_err());
         assert!(config.render_system(None).is_err());
         config.system_template = "x".repeat(MAX_PROMPT_BYTES);
@@ -136,93 +230,5 @@ mod tests {
         config.rename_template = "x".repeat(MAX_PROMPT_BYTES);
         config.client_prompt = "x".into();
         assert!(config.validate().is_err());
-    }
-}
-
-impl Default for PromptConfig {
-    fn default() -> Self {
-        Self {
-            system_template: DEFAULT_SYSTEM.into(),
-            compact_template: DEFAULT_COMPACT.into(),
-            auto_compact_template: DEFAULT_AUTO_COMPACT.into(),
-            rename_template: DEFAULT_RENAME.into(),
-            action_review_template: DEFAULT_ACTION_REVIEW.into(),
-            client_prompt: String::new(),
-        }
-    }
-}
-impl PromptConfig {
-    /// Empty template slots explicitly select the embedded baseline. Client text
-    /// stays byte-for-byte intact; empty client text deliberately disables it.
-    pub fn resolved(mut self) -> Self {
-        for (slot, baseline) in [
-            (&mut self.system_template, DEFAULT_SYSTEM),
-            (&mut self.compact_template, DEFAULT_COMPACT),
-            (&mut self.auto_compact_template, DEFAULT_AUTO_COMPACT),
-            (&mut self.rename_template, DEFAULT_RENAME),
-            (&mut self.action_review_template, DEFAULT_ACTION_REVIEW),
-        ] {
-            if slot.is_empty() {
-                *slot = baseline.into();
-            }
-        }
-        self
-    }
-    fn validate_bounds(&self) -> Result<(), Error> {
-        let fields = [
-            &self.system_template,
-            &self.compact_template,
-            &self.auto_compact_template,
-            &self.rename_template,
-            &self.action_review_template,
-            &self.client_prompt,
-        ];
-        if fields.iter().any(|field| field.len() > MAX_PROMPT_BYTES)
-            || fields.iter().map(|field| field.len()).sum::<usize>() > MAX_PROMPT_CONFIG_BYTES
-        {
-            return Err(Error::config("prompt configuration byte limit exceeded"));
-        }
-        Ok(())
-    }
-    /// Syntax-only validation is safe before Agent selection or durable effects.
-    pub fn validate(&self) -> Result<(), Error> {
-        self.validate_bounds()?;
-        let config = self.clone().resolved();
-        config.validate_bounds()?;
-        if config.system_template.trim().is_empty() {
-            return Err(Error::config("SYSTEM template must be nonempty"));
-        }
-        super::syntax::validate(&config.system_template)?;
-        let mut engine = tera::Tera::new();
-        engine.register_filter("json_encode", super::json_encode);
-        engine
-            .add_raw_template("SYSTEM", &config.system_template)
-            .map_err(|error| {
-                Error::config_with_private(
-                    "SYSTEM template syntax failed",
-                    format!("SYSTEM template syntax failed: {error}"),
-                )
-            })?;
-        for (template, bindings) in [
-            (config.compact_template.as_str(), &["user_input"][..]),
-            (config.auto_compact_template.as_str(), &[][..]),
-            (config.rename_template.as_str(), &["user_input"][..]),
-            (
-                config.action_review_template.as_str(),
-                &["user_input", "tool", "tool_name", "tool_args"][..],
-            ),
-        ] {
-            crate::runtime::subagents::validate_template(
-                template,
-                bindings,
-                MAX_PROMPT_CONFIG_BYTES,
-            )?;
-        }
-        Ok(())
-    }
-    pub fn render_system(&self, agent: Option<&AgentInfo>) -> Result<String, Error> {
-        self.validate()?;
-        let config = self.clone().resolved();
-        super::render_with_client(&config.system_template, agent, Some(&config.client_prompt))
     }
 }

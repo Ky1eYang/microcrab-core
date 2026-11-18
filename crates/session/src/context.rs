@@ -81,10 +81,8 @@ impl Context {
                         context.pending_calls.insert(call.id.clone());
                     }
                 }
-                ContentItem::Tool { call_id, .. } => {
-                    if !context.pending_calls.remove(call_id) {
-                        return Err(Error::protocol("orphan functional tool result"));
-                    }
+                ContentItem::Tool { call_id, .. } if !context.pending_calls.remove(call_id) => {
+                    return Err(Error::protocol("orphan functional tool result"));
                 }
                 _ => {}
             }
@@ -226,11 +224,11 @@ impl Context {
         }
         // A prepared retry retains its Turn/round and semantic State. Only its
         // live epoch witness advances; the next ordinary State remains a patch.
-        if let Some(mut state) = next.committed_state.clone() {
-            if let Some(session) = state.get_mut("session").and_then(Value::as_object_mut) {
-                session.insert("epoch".into(), Value::from(next.epoch));
-                next.synchronize_state(&state)?;
-            }
+        if let Some(mut state) = next.committed_state.clone()
+            && let Some(session) = state.get_mut("session").and_then(Value::as_object_mut)
+        {
+            session.insert("epoch".into(), Value::from(next.epoch));
+            next.synchronize_state(&state)?;
         }
         next.check_budget(&next.items)?;
         *self = next;
@@ -302,21 +300,7 @@ impl Context {
         input: impl Into<SessionInput>,
         state: &Value,
     ) -> Result<(), Error> {
-        self.require_settled()?;
-        let input = input.into();
-        crate::admission::input::validate_resolved(&input, self.max_bytes)?;
-        let mut items = self.items.clone();
-        if let Some(frame) = self.state_frame(state)? {
-            items.push(ContentItem::State(frame));
-        }
-        items.push(ContentItem::User {
-            parts: input.parts,
-            source: None,
-        });
-        self.check_budget(&items)?;
-        self.items = items;
-        self.committed_state = Some(state.clone());
-        Ok(())
+        self.admit_input_run(vec![(input.into(), None)], state)
     }
 
     pub(crate) fn admit_framework(
@@ -324,16 +308,61 @@ impl Context {
         input: SessionInput,
         state: &Value,
     ) -> Result<(), Error> {
-        let mut candidate = self.clone();
-        candidate.admit_user(input, state)?;
-        if let Some(ContentItem::User { source, .. }) = candidate.items.last_mut() {
-            *source = Some(microcrab_transport::UserSource::Framework);
+        self.admit_carriers(
+            vec![(input, microcrab_transport::UserSource::Framework)],
+            state,
+        )
+    }
+
+    /// Admit an authenticated Session-owned carrier run atomically. The caller
+    /// supplies trusted origin metadata after authentication, never from body text.
+    /// Direct user input uses admit_user and cannot absorb this non-user run.
+    pub(crate) fn admit_carriers(
+        &mut self,
+        carriers: Vec<(SessionInput, microcrab_transport::UserSource)>,
+        state: &Value,
+    ) -> Result<(), Error> {
+        self.admit_input_run(
+            carriers
+                .into_iter()
+                .map(|(input, source)| (input, Some(source)))
+                .collect(),
+            state,
+        )
+    }
+
+    fn admit_input_run(
+        &mut self,
+        inputs: Vec<(SessionInput, Option<microcrab_transport::UserSource>)>,
+        state: &Value,
+    ) -> Result<(), Error> {
+        self.require_settled()?;
+        if inputs.is_empty() {
+            return Err(Error::config("carrier admission must not be empty"));
         }
-        candidate.check_budget(&candidate.items)?;
+        let mut items = self.items.clone();
+        // A real admission always owns one frame. Equal State produces an empty
+        // patch without inventing a clock update or rewriting retained history.
+        let frame = self
+            .state_frame(state)?
+            .unwrap_or_else(|| StateFrame::patch(Map::new(), Vec::new(), None));
+        items.push(ContentItem::State(frame));
+        for (input, source) in inputs {
+            crate::admission::input::validate_resolved(&input, self.max_bytes)?;
+            items.push(ContentItem::User {
+                parts: input.parts,
+                source,
+                envelope: Some(microcrab_transport::CarrierEnvelopeVersion::V1),
+            });
+        }
+        let mut candidate = self.clone();
+        candidate.items = items;
+        candidate.committed_state = Some(state.clone());
+        // Validate disclosed addresses and escaped wire size before publication.
+        microcrab_transport::render_ast(&candidate.content(1)?)?;
         *self = candidate;
         Ok(())
     }
-
     /// Commit only changed state keys before a model round, retaining the epoch baseline.
     pub fn synchronize_state(&mut self, state: &Value) -> Result<(), Error> {
         self.require_settled()?;
@@ -425,11 +454,23 @@ impl Context {
     }
 
     pub fn append_tool_result(&mut self, call_id: String, content: String) -> Result<(), Error> {
+        self.append_tool_result_with_parts(call_id, content, Vec::new())
+    }
+
+    /// Preserve typed self-contained tool media in the frozen model-facing history.
+    pub fn append_tool_result_with_parts(
+        &mut self,
+        call_id: String,
+        content: String,
+        parts: Vec<InputPart>,
+    ) -> Result<(), Error> {
+        crate::admission::image::validate_tool_parts(&parts)?;
         if !self.pending_calls.contains(&call_id) {
             return Err(Error::protocol("tool result has no pending call"));
         }
         let mut items = self.items.clone();
         items.push(ContentItem::Tool {
+            parts,
             call_id: call_id.clone(),
             content,
         });
@@ -469,6 +510,7 @@ impl Context {
         let items = vec![
             ContentItem::State(state_snapshot(state)?),
             ContentItem::User {
+                envelope: None,
                 source: None,
                 parts: vec![InputPart::Text {
                     text: summary.clone(),
@@ -1066,3 +1108,9 @@ mod protocol_epoch_tests {
         assert_eq!(candidate.next_model_epoch().unwrap(), context.epoch() + 1);
     }
 }
+
+#[cfg(test)]
+mod tool_media_tests;
+
+#[cfg(test)]
+mod carrier_tests;

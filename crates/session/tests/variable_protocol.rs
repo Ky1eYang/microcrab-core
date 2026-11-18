@@ -912,17 +912,18 @@ async fn live_ephemeral_survives_turn_round_compaction_and_environment_boundarie
             .get("lifecycle_private")
             .is_none()
     );
-    let requests = client.requests.lock().unwrap();
-    assert_eq!(
-        requests.last().unwrap().tools[0].description,
-        "after environment update"
-    );
-    assert!(
-        !serde_json::to_string(&*requests)
-            .unwrap()
-            .contains("live-lifecycle-fixture")
-    );
-    drop(requests);
+    {
+        let requests = client.requests.lock().unwrap();
+        assert_eq!(
+            requests.last().unwrap().tools[0].description,
+            "after environment update"
+        );
+        assert!(
+            !serde_json::to_string(&*requests)
+                .unwrap()
+                .contains("live-lifecycle-fixture")
+        );
+    }
     assert!(
         session
             .checkpoint()

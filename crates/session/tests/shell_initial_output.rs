@@ -207,7 +207,7 @@ mod maintained_guests {
         .await;
         let messages = session.messages();
         let receipt = messages.iter().find_map(|item| match item {
-            ContentItem::Tool { call_id, content } if call_id == "guest-retained-terminal" => {
+            ContentItem::Tool { call_id, content, .. } if call_id == "guest-retained-terminal" => {
                 serde_json::from_str::<Value>(content)
                     .ok()
                     .map(|value| (content.len(), value))

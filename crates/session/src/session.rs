@@ -14,6 +14,20 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+/// Parent-owned exclusivity for one exact restored child, held before native
+/// Session/process registration until the new endpoint is published or rejected.
+#[must_use]
+pub struct RecoveredChildReservation {
+    pub(crate) parent: Arc<SessionInner>,
+    pub(crate) session_id: String,
+    pub(crate) agent_id: crate::state::communication::AgentId,
+}
+impl Drop for RecoveredChildReservation {
+    fn drop(&mut self) {
+        self.parent
+            .release_recovered_child_reservation(&self.session_id, &self.agent_id);
+    }
+}
 /// Safe interruption facts supplied by the embedding owner. This vocabulary
 /// carries no provider bodies, Host messages, or caller-controlled detail text.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -95,6 +109,8 @@ pub trait TurnRouting: Send + Sync {
 
 pub struct SessionBuilder {
     kind: Option<SessionKind>,
+    communication: Option<Option<crate::state::communication::CommunicationState>>,
+    interaction: crate::state::communication::SessionInteraction,
     route: Option<Arc<dyn TurnRouting>>,
     client: Arc<dyn Client>,
     auto_compaction: Option<(
@@ -168,6 +184,8 @@ impl Session {
     pub fn builder_arc(client: Arc<dyn Client>, runtime: Runtime) -> SessionBuilder {
         SessionBuilder {
             kind: None,
+            communication: None,
+            interaction: crate::state::communication::SessionInteraction::Persistent,
             route: None,
             client,
             auto_compaction: None,
@@ -266,12 +284,118 @@ impl Session {
         Arc::new(crate::inner::functional::one_shot::SessionOneShot::default())
     }
     fn require_interactive(&self) -> Result<(), Error> {
-        if self.kind() != SessionKind::Interactive {
+        self.inner.require_user_input(false)
+    }
+    pub fn communication_identity(
+        &self,
+    ) -> Option<crate::state::communication::ConversationIdentity> {
+        self.state()
+            .communication
+            .map(|communication| communication.identity)
+    }
+    /// The caller must authenticate access to this exact parent. Inspection grants
+    /// no persistent unlock; every targeted submission checks the child's current mode.
+    pub async fn submit_child_user(
+        &self,
+        child_id: &str,
+        input: impl Into<crate::SessionInput>,
+    ) -> Result<TurnOutcome, Error> {
+        let child = self.inner.owned_child_by_id(child_id)?;
+        child.inner.require_user_input(true)?;
+        child.inner.submit_user(input.into(), true).await
+    }
+    /// Authenticated parent-scoped streaming input; the reservation carries this
+    /// single submission's authority through asynchronous preparation.
+    pub async fn stream_child_user_with_settlement(
+        &self,
+        child_id: &str,
+        input: crate::SessionInput,
+        operation_id: Option<String>,
+        cancellation: CancellationToken,
+    ) -> Result<(SessionStream, SettlementGuard), Error> {
+        let child = self.inner.owned_child_by_id(child_id)?;
+        child.inner.require_user_input(true)?;
+        let mut reservation = tokio::select! { biased;
+            result = child.inner.reserve() => result?,
+            _ = cancellation.cancelled() => return Err(Error::Cancelled),
+        };
+        reservation.user_target = Some(true);
+        reservation.submission_operation_id = operation_id;
+        Ok(child.stream_reserved(Some(input), Arc::new(reservation), cancellation))
+    }
+    pub fn child_accepts_user_input(&self, child_id: &str) -> Result<bool, Error> {
+        Ok(self
+            .inner
+            .owned_child_by_id(child_id)?
+            .inner
+            .require_user_input(true)
+            .is_ok())
+    }
+    /// Resolve the selected Agent mode's current role under this Session's input gate.
+    pub fn current_agent_role(&self) -> Result<microcrab_agent_types::AgentRole, Error> {
+        self.inner.current_agent_role()
+    }
+    /// Normal root input availability. Child input uses its exact parent's gate.
+    pub fn accepts_user_input(&self) -> bool {
+        self.inner.require_user_input(false).is_ok()
+    }
+    pub fn reserve_recovered_child(
+        &self,
+        session_id: &str,
+        agent_id: &crate::state::communication::AgentId,
+    ) -> Result<RecoveredChildReservation, Error> {
+        self.inner.reserve_recovered_child(session_id, agent_id)
+    }
+    pub async fn attach_reserved_child(
+        &self,
+        child: &Session,
+        reservation: &RecoveredChildReservation,
+    ) -> Result<(), Error> {
+        if !Arc::ptr_eq(&self.inner, &reservation.parent)
+            || child.process_control().session_id() != reservation.session_id
+            || child
+                .communication_identity()
+                .as_ref()
+                .is_none_or(|identity| identity.agent_id != reservation.agent_id)
+        {
             return Err(Error::denied(
-                "direct user input requires an interactive Session; use the owning parent control port",
+                "recovered child reservation does not match this parent and child",
             ));
         }
-        Ok(())
+        self.inner.attach_recovered_child(child).await
+    }
+    /// Explicitly bind a restored persistent child after validating its recorded
+    /// parent identities and current native ownership and permission ceilings.
+    /// Does not restore the former delegate Job or any exchange approval.
+    pub async fn attach_recovered_child(&self, child: &Session) -> Result<(), Error> {
+        let identity = child
+            .communication_identity()
+            .ok_or_else(|| Error::denied("legacy child has no reattachment identity"))?;
+        let reservation =
+            self.reserve_recovered_child(child.process_control().session_id(), &identity.agent_id)?;
+        self.attach_reserved_child(child, &reservation).await
+    }
+    pub async fn replace_external_speakers(
+        &self,
+        speakers: Vec<crate::state::communication::ExternalSpeaker>,
+    ) -> Result<(), Error> {
+        self.inner.replace_external_speakers(speakers).await
+    }
+    pub async fn enqueue_external(
+        &self,
+        operation_id: String,
+        identity: String,
+        body: String,
+    ) -> Result<crate::state::communication::inbox::QueuedReceipt, Error> {
+        self.inner
+            .enqueue_external(operation_id, identity, body)
+            .await
+    }
+    pub async fn delivery_receipt(
+        &self,
+        operation_id: &str,
+    ) -> Result<Option<crate::state::communication::inbox::QueuedReceipt>, Error> {
+        self.inner.delivery_receipt(operation_id).await
     }
     /// User edits affect only explicit overrides/review, never native/provider declarations.
     /// Creator supplies the prepared review client; None deliberately follows main.
@@ -425,7 +549,7 @@ impl Session {
         input: impl Into<crate::SessionInput>,
     ) -> Result<TurnOutcome, Error> {
         self.require_interactive()?;
-        self.inner.submit(input.into(), None).await
+        self.inner.submit_user(input.into(), false).await
     }
     /// Ordered pending user input and effective lane from the shared insertion owner.
     pub fn inbox_snapshot(&self) -> crate::InboxSnapshot {
@@ -591,6 +715,7 @@ impl Session {
             _ = cancellation.cancelled() => return Err(Error::Cancelled),
         };
         reservation.submission_operation_id = submission_operation_id;
+        reservation.user_target = input.as_ref().map(|_| false);
         let reservation = Arc::new(reservation);
         if input.is_none() && !self.inner.retry_ready() {
             return Err(Error::config("no failed model request to retry"));
@@ -790,6 +915,10 @@ impl Session {
         // A fork is a new Session invocation owner, not a replay of source init.
         recover.state.agent_init.clear();
         recover.state.parent_relationship = None;
+        recover.state.communication = Some(crate::state::communication::CommunicationState::fresh(
+            0,
+            crate::state::communication::SessionInteraction::Persistent,
+        ));
         recover.state.session_kind = Some(builder.kind.unwrap_or(SessionKind::Interactive));
         #[cfg(feature = "wasm")]
         {
@@ -822,6 +951,7 @@ impl Session {
         // replacement SYSTEM or require Agent values no longer present in it.
         builder.prompt_config = recover.prompt_config.clone().unwrap_or_default();
         builder.materialized_system = Some(recover.context.system.clone());
+        builder.communication = Some(recover.state.communication.clone());
         if let Some(kind) = recover.state.session_kind {
             if builder.kind.is_some_and(|configured| configured != kind) {
                 return Err(Error::config(
@@ -840,6 +970,13 @@ impl Session {
     }
 }
 impl SessionBuilder {
+    pub fn interaction(
+        mut self,
+        interaction: crate::state::communication::SessionInteraction,
+    ) -> Self {
+        self.interaction = interaction;
+        self
+    }
     pub fn kind(mut self, kind: SessionKind) -> Self {
         self.kind = Some(kind);
         self
@@ -981,8 +1118,32 @@ impl SessionBuilder {
                 "one-shot functional Sessions cannot install Agent/tool dispatch",
             ));
         }
+        let kind = self.kind.unwrap_or(if is_main {
+            SessionKind::Interactive
+        } else {
+            SessionKind::Delegated
+        });
+        if (kind == SessionKind::Interactive && !is_main)
+            || (kind == SessionKind::Delegated && is_main)
+        {
+            return Err(Error::config(
+                "Session kind and Agent lineage role disagree",
+            ));
+        }
+        let communication = self.communication.unwrap_or_else(|| {
+            (kind != SessionKind::OneShot).then(|| {
+                crate::state::communication::CommunicationState::fresh(
+                    if is_main { 0 } else { 1 },
+                    self.interaction,
+                )
+            })
+        });
+        if let Some(communication) = &communication {
+            communication.validate()?;
+        }
         Ok(Session {
             inner: SessionInner::new(SessionParts {
+                communication,
                 kind: self.kind.unwrap_or(if is_main {
                     SessionKind::Interactive
                 } else {

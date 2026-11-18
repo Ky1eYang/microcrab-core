@@ -147,6 +147,7 @@ async fn two_rounds(
         subagent: None,
         system: "Frozen synthetic system".into(),
         items: vec![ContentItem::User {
+            envelope: None,
             source: None,
             parts: vec![InputPart::Text {
                 text: "First question".into(),
@@ -178,6 +179,7 @@ async fn two_rounds(
             provider_metadata: response.provider_metadata,
         });
         content.items.push(ContentItem::User {
+            envelope: None,
             source: None,
             parts: vec![InputPart::Text {
                 text: "Next question".into(),
@@ -305,6 +307,7 @@ async fn rejected_json_response_never_publishes_its_reasoning_as_display_evidenc
             subagent: None,
             system: "synthetic".into(),
             items: vec![ContentItem::User {
+                envelope: None,
                 source: None,
                 parts: vec![InputPart::Text {
                     text: "question".into(),

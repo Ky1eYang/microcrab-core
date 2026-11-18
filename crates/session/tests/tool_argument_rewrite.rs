@@ -339,7 +339,7 @@ async fn permission_and_execution_receive_restored_nested_arguments_while_histor
     let tool_results = messages
         .iter()
         .filter_map(|item| match item {
-            ContentItem::Tool { call_id, content } => Some((call_id.as_str(), content.as_str())),
+            ContentItem::Tool { call_id, content, .. } => Some((call_id.as_str(), content.as_str())),
             _ => None,
         })
         .collect::<Vec<_>>();
@@ -823,7 +823,7 @@ async fn rewriting_a_finite_sleep_to_job_wait_defers_it_once_until_a_sibling_lau
     let wait_result = messages
         .iter()
         .find_map(|item| match item {
-            ContentItem::Tool { call_id, content } if call_id == "rewritten-wait" => Some(content),
+            ContentItem::Tool { call_id, content, .. } if call_id == "rewritten-wait" => Some(content),
             _ => None,
         })
         .expect("rewritten wait must have a settled result");

@@ -1,6 +1,7 @@
 //! Session owns child construction, parent control and acknowledged cleanup.
 mod background;
 mod control;
+mod focus;
 #[cfg(test)]
 mod lifecycle_tests;
 #[cfg(test)]
@@ -172,6 +173,38 @@ impl DelegateExecutor for OwnedDelegateExecutor {
             receipt.to_string(),
         ))
     }
+    async fn execute_focused_output(
+        &self,
+        target: &str,
+        input: &str,
+        mode: Option<&str>,
+        context_mode: &str,
+        timeout_ms: Option<u64>,
+        interaction: crate::state::communication::SessionInteraction,
+        references: Vec<crate::state::reference::focus::FocusSelection>,
+        invocation: ToolContext,
+    ) -> Result<crate::runtime::execution::ToolOutput, Error> {
+        let parent = self
+            .parent
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
+            .ok_or(Error::Closed)?;
+        let focus = parent.capture_focus(references, &invocation).await?;
+        background::start(
+            self,
+            target,
+            input,
+            mode,
+            context_mode,
+            timeout_ms,
+            interaction,
+            focus,
+            invocation,
+        )
+        .await
+    }
     async fn execute_output(
         &self,
         target: &str,
@@ -188,6 +221,8 @@ impl DelegateExecutor for OwnedDelegateExecutor {
             mode,
             context_mode,
             timeout_ms,
+            crate::state::communication::SessionInteraction::Persistent,
+            vec![],
             invocation,
         )
         .await

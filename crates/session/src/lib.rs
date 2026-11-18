@@ -32,8 +32,9 @@ pub use observation::activity::{
     CompletedTurn, InboxFailure, InboxFailureKind, RoundLimitStop, SessionActivity,
 };
 pub use session::{
-    DelegateRequest, DelegationRelationship, HostDetachCode, InterruptReason, Session,
-    SessionBuilder, SessionEvent, SessionKind, SessionStream, SettlementGuard, TurnRouting,
+    DelegateRequest, DelegationRelationship, HostDetachCode, InterruptReason,
+    RecoveredChildReservation, Session, SessionBuilder, SessionEvent, SessionKind, SessionStream,
+    SettlementGuard, TurnRouting,
 };
 pub use state::{
     DynReference, ListedReference, Reference, ReferenceContent, ReferenceInfo, SessionState, State,

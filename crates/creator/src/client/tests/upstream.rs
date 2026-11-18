@@ -1,4 +1,5 @@
 //! Real HTTP acceptance for upstream failures, including incomplete error bodies.
+mod empty_completion;
 use super::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -264,6 +265,7 @@ fn protocol_client(endpoint: String, protocol: Protocol) -> RetryingClient {
 fn request() -> Content {
     let mut request = content();
     request.items.push(microcrab_transport::ContentItem::User {
+        envelope: None,
         source: None,
         parts: vec![microcrab_protocol::InputPart::Text {
             text: "fixture input".into(),
@@ -485,7 +487,9 @@ async fn semantic_response_errors_remain_manual_only_without_quarantining_local_
         ),
         (
             Protocol::OpenaiResponses,
-            "data: {\"type\":\"response.completed\",\"response\":{}}\n\n",
+            // A completed event with no optional metadata is valid; make the
+            // output structure explicitly malformed instead of testing emptiness.
+            "data: {\"type\":\"response.completed\",\"response\":{\"output\":\"invalid\"}}\n\n",
         ),
         (Protocol::Anthropic, "data: {\"type\":\"message_stop\"}\n\n"),
         (Protocol::Google, "data: {\"candidates\":[{},{}]}\n\n"),

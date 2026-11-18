@@ -3,6 +3,7 @@
 mod calls;
 mod consumption;
 mod diagnostics;
+mod files;
 mod payload;
 mod process;
 mod processes;
@@ -47,6 +48,7 @@ pub struct RemoteHost {
     diagnostics: Mutex<VecDeque<serde_json::Value>>,
     operation_history: Mutex<VecDeque<serde_json::Value>>,
     isolated_receipts: Mutex<BTreeMap<String, String>>,
+    files: files::Files,
 }
 struct Route {
     generation: u64,
@@ -92,6 +94,9 @@ impl RemoteHost {
                 operation.as_str(),
                 "file_mutation"
                     | "filesystem.stat"
+                    | "filesystem.open"
+                    | "filesystem.read"
+                    | "filesystem.close"
                     | "process.spawn"
                     | "process.status"
                     | "process.pid"
@@ -138,6 +143,7 @@ impl RemoteHost {
             diagnostics: Mutex::new(VecDeque::new()),
             operation_history: Mutex::new(VecDeque::new()),
             isolated_receipts: Mutex::new(BTreeMap::new()),
+            files: files::Files::default(),
         }))
     }
     pub fn set_scope(&self, scope: microcrab_host_protocol::BindingScope) -> Result<(), ToolError> {

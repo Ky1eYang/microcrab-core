@@ -193,7 +193,8 @@ impl Context {
                         context.pending_calls.insert(call.id.clone());
                     }
                 }
-                ContentItem::Tool { call_id, .. } => {
+                ContentItem::Tool { call_id, parts, .. } => {
+                    crate::admission::image::validate_tool_parts(parts)?;
                     if !context.pending_calls.remove(call_id) {
                         return Err(Error::protocol("orphan restored tool result"));
                     }

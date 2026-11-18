@@ -21,6 +21,8 @@ mod tool_diagnostics;
 mod wasm;
 #[path = "wasm_coding.rs"]
 mod wasm_coding;
+#[path = "wasm_coding_media.rs"]
+mod wasm_coding_media;
 #[path = "wasm_communication.rs"]
 mod wasm_communication;
 #[path = "wasm_epoch.rs"]

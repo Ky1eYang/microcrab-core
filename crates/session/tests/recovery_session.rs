@@ -145,7 +145,7 @@ struct RecoveryRouting {
     refresh: bool,
     client: Arc<Script>,
     acknowledged: Arc<AtomicUsize>,
-    expected_acknowledgements: usize,
+    expected_acknowledgements: AtomicUsize,
     installed: Mutex<Option<Recover>>,
 }
 #[async_trait]
@@ -171,7 +171,7 @@ impl microcrab_session::TurnRouting for RecoveryRouting {
     async fn restore(&self, recover: &Recover) -> Result<(), Error> {
         assert_eq!(
             self.acknowledged.load(Ordering::SeqCst),
-            self.expected_acknowledgements
+            self.expected_acknowledgements.load(Ordering::SeqCst)
         );
         *self.installed.lock().unwrap() = Some(recover.clone());
         Ok(())
@@ -226,13 +226,17 @@ async fn recovery_rebuilds_old_expand_catalog_without_changing_external_tool_aut
     expand.parameters["oneOf"] = json!([{"required":["ids"]},{"required":["reference"]}]);
     historical.validate().unwrap();
     let frozen = serde_json::to_vec(&historical).unwrap();
+    let session_id = source.process_control().session_id().to_owned();
     source.close().await.unwrap();
     for initial in [false, true] {
-        let builder = Session::builder(Script::new(vec![]), runtime_with_expand(effects.clone()));
+        let builder = Session::builder(Script::new(vec![]), runtime_with_expand(effects.clone()))
+            .session_id(session_id.clone());
         let session = if initial {
             Session::restore(builder, historical.clone()).await.unwrap()
         } else {
-            let session = builder.build().unwrap();
+            // Replacement must belong to the selected Session, not a freshly
+            // minted independent communication identity.
+            let session = Session::restore(builder, historical.clone()).await.unwrap();
             session.recover(historical.clone()).await.unwrap();
             session
         };
@@ -300,6 +304,7 @@ async fn route_recovery_refreshes_only_live_epoch_and_never_replays_effects() {
     assert!(source.submit("do it once").await.is_err());
     let original = source_journal.latest().unwrap();
     let frozen = serde_json::to_vec(&original).unwrap();
+    let session_id = source.process_control().session_id().to_owned();
     source.close().await.unwrap();
     for (refresh, initial) in [(false, false), (true, false), (false, true), (true, true)] {
         let client = Arc::new(Script::new(vec![Ok(answer("continued"))]));
@@ -308,7 +313,7 @@ async fn route_recovery_refreshes_only_live_epoch_and_never_replays_effects() {
             refresh,
             client: client.clone(),
             acknowledged: acknowledged.clone(),
-            expected_acknowledgements: usize::from(!initial),
+            expected_acknowledgements: AtomicUsize::new(0),
             installed: Mutex::new(None),
         });
         let journal = Arc::new(ExactRecoveryJournal {
@@ -316,18 +321,25 @@ async fn route_recovery_refreshes_only_live_epoch_and_never_replays_effects() {
             acknowledged,
         });
         let builder = Session::builder_arc(client.clone(), effect_runtime(effects.clone(), None))
+            .session_id(session_id.clone())
             .journal_arc(journal)
             .turn_routing(route.clone());
         let session = if initial {
             Session::restore(builder, original.clone()).await.unwrap()
         } else {
-            let session = builder.build().unwrap();
-            // This branch exercises replacement of an initialized live Session.
-            // Startup attachment is covered separately by Session::restore.
+            let session = Session::restore(builder, original.clone()).await.unwrap();
+            // This branch replaces an initialized instance of the same Session.
+            // Attachment acknowledges no head move; replacement must acknowledge
+            // the exact frozen Recover before installing the route again.
             session.start().await.unwrap();
+            route.expected_acknowledgements.store(1, Ordering::SeqCst);
             session.recover(original.clone()).await.unwrap();
             session
         };
+        assert_eq!(
+            route.acknowledged.load(Ordering::SeqCst),
+            usize::from(!initial)
+        );
         let installed = route.installed.lock().unwrap().clone().unwrap();
         assert_eq!(
             installed.context.epoch,
@@ -345,17 +357,18 @@ async fn route_recovery_refreshes_only_live_epoch_and_never_replays_effects() {
         assert_eq!(effects.load(Ordering::SeqCst), 1);
         assert_eq!(session.resume().await.unwrap().content, "continued");
         assert_eq!(effects.load(Ordering::SeqCst), 1);
-        let requests = client.seen.lock().unwrap();
-        assert_eq!(requests.len(), 1);
-        assert_eq!(
-            requests[0]
-                .items
-                .iter()
-                .filter(|item| matches!(item, ContentItem::Tool { .. }))
-                .count(),
-            1
-        );
-        drop(requests);
+        {
+            let requests = client.seen.lock().unwrap();
+            assert_eq!(requests.len(), 1);
+            assert_eq!(
+                requests[0]
+                    .items
+                    .iter()
+                    .filter(|item| matches!(item, ContentItem::Tool { .. }))
+                    .count(),
+                1
+            );
+        }
         assert_eq!(serde_json::to_vec(&original).unwrap(), frozen);
         session.close().await.unwrap();
     }

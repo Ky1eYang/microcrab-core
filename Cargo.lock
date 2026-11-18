@@ -1303,7 +1303,7 @@ dependencies = [
 
 [[package]]
 name = "microcrab-agent-coding"
-version = "0.1.16"
+version = "0.1.19"
 dependencies = [
  "microcrab-agent-types",
  "microcrab-permission",
@@ -1315,7 +1315,7 @@ dependencies = [
 
 [[package]]
 name = "microcrab-agent-types"
-version = "0.1.16"
+version = "0.1.19"
 dependencies = [
  "microcrab-permission",
  "microcrab-protocol",
@@ -1325,7 +1325,7 @@ dependencies = [
 
 [[package]]
 name = "microcrab-agent-universal"
-version = "0.1.16"
+version = "0.1.19"
 dependencies = [
  "microcrab-agent-types",
  "microcrab-protocol",
@@ -1335,11 +1335,11 @@ dependencies = [
 
 [[package]]
 name = "microcrab-agent-wit"
-version = "0.1.16"
+version = "0.1.19"
 
 [[package]]
 name = "microcrab-auditor"
-version = "0.1.16"
+version = "0.1.19"
 dependencies = [
  "microcrab-protocol",
  "serde",
@@ -1350,7 +1350,7 @@ dependencies = [
 
 [[package]]
 name = "microcrab-creator"
-version = "0.1.16"
+version = "0.1.19"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -1375,7 +1375,7 @@ dependencies = [
 
 [[package]]
 name = "microcrab-host-api"
-version = "0.1.16"
+version = "0.1.19"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1391,11 +1391,11 @@ dependencies = [
 
 [[package]]
 name = "microcrab-host-frontend"
-version = "0.1.16"
+version = "0.1.19"
 
 [[package]]
 name = "microcrab-host-local"
-version = "0.1.16"
+version = "0.1.19"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1414,7 +1414,7 @@ dependencies = [
 
 [[package]]
 name = "microcrab-host-protocol"
-version = "0.1.16"
+version = "0.1.19"
 dependencies = [
  "microcrab-host-api",
  "microcrab-protocol",
@@ -1431,7 +1431,7 @@ dependencies = [
 
 [[package]]
 name = "microcrab-host-remote"
-version = "0.1.16"
+version = "0.1.19"
 dependencies = [
  "async-trait",
  "microcrab-host-api",
@@ -1447,7 +1447,7 @@ dependencies = [
 
 [[package]]
 name = "microcrab-permission"
-version = "0.1.16"
+version = "0.1.19"
 dependencies = [
  "regex",
  "serde",
@@ -1457,7 +1457,7 @@ dependencies = [
 
 [[package]]
 name = "microcrab-protocol"
-version = "0.1.16"
+version = "0.1.19"
 dependencies = [
  "serde",
  "serde_json",
@@ -1465,8 +1465,9 @@ dependencies = [
 
 [[package]]
 name = "microcrab-session"
-version = "0.1.16"
+version = "0.1.19"
 dependencies = [
+ "aho-corasick",
  "async-trait",
  "base64 0.22.1",
  "futures-util",
@@ -1498,7 +1499,7 @@ dependencies = [
 
 [[package]]
 name = "microcrab-storage"
-version = "0.1.16"
+version = "0.1.19"
 dependencies = [
  "async-trait",
  "microcrab-permission",
@@ -1514,7 +1515,7 @@ dependencies = [
 
 [[package]]
 name = "microcrab-transport"
-version = "0.1.16"
+version = "0.1.19"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -1539,7 +1540,7 @@ dependencies = [
 
 [[package]]
 name = "microcrab-xtask"
-version = "0.1.16"
+version = "0.1.19"
 dependencies = [
  "serde_json",
  "sha2",

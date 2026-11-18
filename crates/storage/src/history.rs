@@ -1,6 +1,7 @@
 //! Creator history serializes publication and stages conversation head selection until recovery commits it.
 #[cfg(test)]
 mod commit_observer_tests;
+mod communication;
 #[cfg(feature = "storage-file")]
 mod disk;
 #[cfg(all(test, any(feature = "storage-file", feature = "storage-sqlite")))]
@@ -61,7 +62,7 @@ pub trait History: Send + Sync {
 }
 
 enum Backend {
-    Memory(MemoryJournal),
+    Memory(Box<MemoryJournal>),
     #[cfg(feature = "storage-file")]
     Disk(FileJournal),
     #[cfg(feature = "storage-sqlite")]
@@ -209,7 +210,7 @@ impl CreatorJournal {
                 return Err(Error::config("file storage is not compiled"));
             }
         } else {
-            Backend::Memory(MemoryJournal::default())
+            Backend::Memory(Box::default())
         };
         Self::from_backend(backend, session_id, restore).await
     }
@@ -837,6 +838,22 @@ impl CreatorJournal {
 }
 #[async_trait::async_trait]
 impl Journal for CreatorJournal {
+    fn supports_communication(&self) -> bool {
+        true
+    }
+    async fn commit_communication(
+        &self,
+        agent_id: &microcrab_session::state::communication::AgentId,
+        inbox: microcrab_session::state::communication::inbox::DurableInbox,
+    ) -> Result<(), Error> {
+        self.store_inbox(agent_id, inbox).await
+    }
+    async fn load_communication(
+        &self,
+        agent_id: &microcrab_session::state::communication::AgentId,
+    ) -> Result<Option<microcrab_session::state::communication::inbox::DurableInbox>, Error> {
+        self.read_inbox(agent_id).await
+    }
     async fn commit(&self, recover: Recover) -> Result<(), Error> {
         self.commit_navigation(
             recover,

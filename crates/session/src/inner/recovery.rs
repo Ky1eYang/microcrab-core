@@ -44,6 +44,7 @@ impl SessionInner {
                 return Err(Error::protocol("admission cannot certify navigation"));
             }
         }
+        self.remember_durable_carrier_consumption(&recover)?;
         if let Some(route) = &self.route {
             route.checkpoint_committed(&recover).await?;
         }
@@ -382,13 +383,12 @@ impl SessionInner {
                 "recovery Session kind differs from the configured lifecycle",
             ));
         }
-        if let Some(relation) = &recover.state.parent_relationship {
-            if self.kind != crate::SessionKind::Delegated
+        if let Some(relation) = &recover.state.parent_relationship
+            && (self.kind != crate::SessionKind::Delegated
                 || self.process_parent_session_id.as_deref()
-                    != Some(relation.parent_session_id.as_str())
-            {
-                return Err(Error::config("invalid recovered parent relationship"));
-            }
+                    != Some(relation.parent_session_id.as_str()))
+        {
+            return Err(Error::config("invalid recovered parent relationship"));
         }
         let configured = self
             .configured_limits
@@ -480,6 +480,24 @@ impl SessionInner {
         if recover.workspace.is_some() {
             tracing::warn!("legacy full-workspace snapshot is inert; restoring conversation only");
         }
+        if let Some(mode) = recover.state.selected_mode.as_deref() {
+            self.validate_mode(mode)?;
+        }
+        if self
+            .state()
+            .communication
+            .as_ref()
+            .map(|value| &value.identity)
+            != recover
+                .state
+                .communication
+                .as_ref()
+                .map(|value| &value.identity)
+        {
+            return Err(Error::config(
+                "recovery cannot replace or upgrade the Session communication identity",
+            ));
+        }
         Context::from_snapshot(recover.context.clone())
     }
 
@@ -516,7 +534,18 @@ impl SessionInner {
             .parent_relationship
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = recover.state.parent_relationship.clone();
+        let focus = recover
+            .state
+            .communication
+            .as_ref()
+            .filter(|value| value.identity.depth == 1)
+            .map(|value| value.focus.clone());
+        self.remember_durable_carrier_consumption(&recover)?;
         self.state.replace(recover.state);
+        if let Some(focus) = focus {
+            self.state.install_focused_references(focus)?;
+        }
+        self.reset_communication_endpoints()?;
         *self
             .context
             .lock()
@@ -538,6 +567,16 @@ impl SessionInner {
         installed: &microcrab_protocol::ToolDefinition,
     ) -> bool {
         let mut previous = installed.clone();
+        if let Some(properties) = previous.parameters["properties"].as_object_mut() {
+            properties.remove("interaction");
+            properties.remove("references");
+            if let Some(input) = properties.get_mut("input") {
+                input["description"]=Value::String("Task instructions including all context the child needs. Required, nonempty and not whitespace-only; null is invalid.".into());
+            }
+        }
+        if &previous == frozen {
+            return true;
+        }
         previous.parameters["required"] = serde_json::json!(["target", "input"]);
         if let Some(parameters) = previous.parameters.as_object_mut() {
             parameters.remove("allOf");
@@ -716,6 +755,7 @@ impl SessionInner {
                         Error::config_with_private(error.public_reason(), error.to_string())
                     })?;
             }
+            let _communication = inner.communication_transaction.lock().await;
             let _fence = inner.endpoint.fence().await?;
             inner.state.executions().release_for_restore().await?;
             // History selection restores conversation, never filesystem bytes.
@@ -737,7 +777,9 @@ impl SessionInner {
             } else {
                 (recover.clone(), context)
             };
+            inner.flush_durable_carrier_consumption_locked().await?;
             inner.journal.recovered(recover.clone()).await?;
+            inner.remember_durable_carrier_consumption(&recover)?;
             let selected_recover = recover;
             let recover = live_recover;
             if let Some(route) = &inner.route {
@@ -829,7 +871,17 @@ impl SessionInner {
                     .parent_relationship
                     .lock()
                     .unwrap_or_else(|e| e.into_inner()) = recover.state.parent_relationship.clone();
+                let focus = recover
+                    .state
+                    .communication
+                    .as_ref()
+                    .filter(|value| value.identity.depth == 1)
+                    .map(|value| value.focus.clone());
                 inner.state.replace(recover.state);
+                if let Some(focus) = focus {
+                    inner.state.install_focused_references(focus)?;
+                }
+                inner.reset_communication_endpoints()?;
                 if let Some(mode) = live_mode.as_ref() {
                     inner
                         .state
@@ -838,6 +890,7 @@ impl SessionInner {
                     configured_mode.1 = None;
                 }
             }
+            inner.restore_communication_inbox_locked().await?;
             inner.applied_tools.store(0, Ordering::Release);
             *inner
                 .context
@@ -853,6 +906,7 @@ impl SessionInner {
                 .unwrap_or_else(|error| error.into_inner()) = recover.cache_report;
             inner.restored.store(true, Ordering::SeqCst);
             drop(_fence);
+            drop(_communication);
             inner.load_references(&token).await?;
             inner
                 .boundary(Boundary::SessionRestored, None, &token)

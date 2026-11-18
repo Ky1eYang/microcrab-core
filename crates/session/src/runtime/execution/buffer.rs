@@ -171,6 +171,8 @@ impl OutputWriter {
 // Parallel byte/tag rings bound storage even for one-byte alternating channels.
 // Tags belong to UTF-8 scalars; public chunks are projected only for a bounded page.
 pub(super) struct Buffer {
+    redaction: super::InvocationRedaction,
+    stream: super::InvocationRedactionStream,
     pub channels: Vec<String>,
     pub declared: bool,
     pub end: u64,
@@ -187,6 +189,8 @@ struct PersistedRing {
     encoding: String,
     content_base64: String,
     tags_base64: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    withheld_redaction_tail: Option<bool>,
 }
 const MARKER_TAG: u8 = 17;
 const CHUNK_BYTES: usize = 64 * 1024;
@@ -204,6 +208,8 @@ impl Buffer {
         channels.sort();
         channels.dedup();
         Ok(Self {
+            redaction: super::InvocationRedaction::default(),
+            stream: super::InvocationRedaction::default().stream(),
             declared: !channels.is_empty(),
             channels,
             end: 0,
@@ -237,9 +243,12 @@ impl Buffer {
         self.end.checked_add(content.len() as u64).ok_or_else(|| {
             crate::budget::reject(crate::LimitKind::Arithmetic, "output cursor overflow")
         })?;
-        let tag = if let Some(channel) = channel {
+        let _tag = if let Some(channel) = channel {
             if channel.is_empty() || channel.len() > 64 {
                 return Err(Error::tool("invalid output channel"));
+            }
+            if self.redaction.redact_text(channel) != channel {
+                return Err(Error::tool("output channel contains a secret"));
             }
             let index = match self.channels.iter().position(|s| s == channel) {
                 Some(index) => index,
@@ -258,8 +267,40 @@ impl Buffer {
         if content.is_empty() {
             return Ok(());
         }
-        self.append_tag(tag, content)?;
-        self.loss_marked_at_tail = false;
+        let mut remaining = content;
+        while !remaining.is_empty() {
+            let mut width = remaining.len().min(16 * 1024);
+            while !remaining.is_char_boundary(width) {
+                width -= 1;
+            }
+            let safe = self.stream.push_ordered(channel, &remaining[..width])?;
+            self.append_projected(safe)?;
+            remaining = &remaining[width..];
+        }
+        Ok(())
+    }
+    pub(super) fn install_redaction(&mut self, redaction: super::InvocationRedaction) {
+        self.stream = redaction.stream();
+        self.redaction = redaction;
+    }
+    pub(super) fn flush_redaction(&mut self) -> Result<(), Error> {
+        let safe = self.stream.finish_all()?;
+        self.append_projected(safe)
+    }
+    fn append_projected(&mut self, chunks: Vec<(Option<String>, String)>) -> Result<(), Error> {
+        for (channel, text) in chunks {
+            let tag = match channel {
+                Some(channel) => self
+                    .channels
+                    .iter()
+                    .position(|known| known == &channel)
+                    .map(|index| (index + 1) as u8)
+                    .ok_or_else(|| Error::tool("redacted output references an unknown channel"))?,
+                None => 0,
+            };
+            self.append_tag(tag, &text)?;
+            self.loss_marked_at_tail = false;
+        }
         Ok(())
     }
     fn append_tag(&mut self, tag: u8, content: &str) -> Result<(), Error> {
@@ -318,6 +359,7 @@ impl Buffer {
             encoding: "ring-v1".into(),
             content_base64: STANDARD.encode(content),
             tags_base64: STANDARD.encode(tags),
+            withheld_redaction_tail: self.stream.has_withheld_tail().then_some(true),
         })
         .expect("ring persistence contains only serializable strings")
     }
@@ -399,6 +441,15 @@ impl Buffer {
         ring.loss_marked_at_tail = tags.last() == Some(&MARKER_TAG);
         ring.content = content.into();
         ring.tags = tags.into();
+        if let Some(withheld) = persisted.withheld_redaction_tail {
+            if !withheld {
+                return Err(Error::tool("invalid withheld redaction tail witness"));
+            }
+            ring.closed = false;
+            ring.append_tag(MARKER_TAG, "[upstream lost: withheld redaction tail]")?;
+            ring.loss_marked_at_tail = true;
+            ring.closed = output.closed;
+        }
         Ok(ring)
     }
     pub fn page(

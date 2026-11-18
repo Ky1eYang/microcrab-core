@@ -10,6 +10,7 @@ pub(super) struct Decoder {
     pending: Vec<u8>,
     data: Vec<String>,
     content: String,
+    refusal: String,
     parts: Vec<Value>,
     calls: BTreeMap<u32, PartialCall>,
     finish: Option<String>,
@@ -153,7 +154,7 @@ impl Decoder {
                 "role" | "content" | "reasoning_content" | "reasoning" | "tool_calls"
             )
         });
-        if let Some(role) = delta.get("role")
+        if let Some(role) = delta.get("role").filter(|v| !v.is_null())
             && role.as_str() != Some("assistant")
         {
             return Err(Error::protocol("invalid SSE role"));
@@ -169,7 +170,7 @@ impl Decoder {
             .transpose()?;
         // Validate both aliases even when the other supplies display text. A
         // malformed wrapper must not become harmless merely because we finished.
-        for key in ["content", "reasoning_content", "reasoning"] {
+        for key in ["content", "reasoning_content", "reasoning", "refusal"] {
             if delta
                 .get(key)
                 .is_some_and(|value| !value.is_null() && !value.is_string())
@@ -215,6 +216,9 @@ impl Decoder {
             // never replay text, reasoning, tool deltas, or a completion event.
             return Ok(());
         }
+        if let Some(refusal) = delta.get("refusal").and_then(Value::as_str) {
+            self.refusal.push_str(refusal);
+        }
         if let Some(reasoning) = delta
             .get("reasoning_content")
             .filter(|value| !value.is_null())
@@ -252,7 +256,7 @@ impl Decoder {
                     .and_then(Value::as_u64)
                     .and_then(|v| u32::try_from(v).ok())
                     .ok_or_else(|| Error::protocol("invalid SSE tool index"))?;
-                if let Some(kind) = call.get("type")
+                if let Some(kind) = call.get("type").filter(|v| !v.is_null())
                     && kind.as_str() != Some("function")
                 {
                     return Err(Error::protocol("unsupported SSE tool type"));
@@ -332,7 +336,7 @@ impl Decoder {
             .filter(|p| p["kind"] == "reasoning")
             .filter_map(|p| p["text"].as_str())
             .collect::<String>();
-        let value = json!({"choices":[{"finish_reason":self.finish,"message":{"role":"assistant","content":self.content,"reasoning_content":reasoning,"tool_calls":calls,"__microcrab_parts":parts}}],"usage":self.usage.last()});
+        let value = json!({"choices":[{"finish_reason":self.finish,"message":{"role":"assistant","content":self.content,"refusal":self.refusal,"reasoning_content":reasoning,"tool_calls":calls,"__microcrab_parts":parts}}],"usage":self.usage.last()});
         Ok((value, self.usage, gateway_text_complete))
     }
 }
@@ -958,5 +962,77 @@ mod tests {
         let mut decoder = Decoder::default();
         decoder.push(b"data: [DONE]", false).unwrap();
         assert!(decoder.push(&[], true).is_err());
+    }
+
+    #[test]
+    fn tool_chunks_with_null_type_and_incremental_fragments_are_accepted() {
+        use microcrab_protocol::{Request, ToolDefinition};
+        let wire = "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"tool_calls\":[{\"index\":0,\"id\":\"call_123\",\"type\":\"function\",\"function\":{\"name\":\"test_tool\",\"arguments\":\"\"}}]}}]}\n\n\
+                    data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"type\":null,\"function\":{\"arguments\":\"{\\\"k\\\":\"}}]}}]}\n\n\
+                    data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"type\":null,\"function\":{\"arguments\":\"123}\"}}]}}]}\n\n\
+                    data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}\n\n\
+                    data: [DONE]\n\n";
+        let mut decoder = Decoder::default();
+        let events = decoder.push(wire.as_bytes(), true).unwrap();
+        assert!(!events.is_empty());
+        let (value, usage, gateway_text_complete) = decoder.into_value().unwrap();
+        assert!(!gateway_text_complete);
+        let request = Request {
+            epoch: 1,
+            messages: vec![],
+            tools: vec![ToolDefinition {
+                name: "test_tool".into(),
+                description: "test".into(),
+                parameters: json!({"type":"object"}),
+            }],
+            max_output_tokens: 1000,
+        };
+        let response = super::super::decode_response(value, &request, Some(usage), false).unwrap();
+        assert_eq!(response.tool_calls.len(), 1);
+        assert_eq!(response.tool_calls[0].id, "call_123");
+        assert_eq!(response.tool_calls[0].name, "test_tool");
+        assert_eq!(response.tool_calls[0].arguments, json!({"k": 123}));
+    }
+
+    #[test]
+    fn null_argument_values_survive_fragmented_nullable_envelopes_exactly() {
+        use microcrab_protocol::{Request, ToolDefinition};
+        let wire = concat!(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":null,\"tool_calls\":[{\"index\":0,\"id\":\"call_null\",\"type\":\"function\",\"function\":{\"name\":\"plugin\",\"arguments\":\"{\\\"arguments\\\":{},\\\"artifact\\\":\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"type\":null,\"function\":{\"arguments\":\"null,\\\"pin\\\":null,\\\"plugin\\\":null}\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let mut decoder = Decoder::default();
+        for chunk in wire.as_bytes().chunks(7) {
+            decoder.push(chunk, false).unwrap();
+        }
+        decoder.push(&[], true).unwrap();
+        let (value, usage, gateway) = decoder.into_value().unwrap();
+        let request = Request {
+            epoch: 1,
+            messages: vec![],
+            tools: vec![ToolDefinition {
+                name: "plugin".into(),
+                description: String::new(),
+                parameters: json!({"type":"object"}),
+            }],
+            max_output_tokens: 100,
+        };
+        let response =
+            super::super::decode_response(value, &request, Some(usage), gateway).unwrap();
+        assert_eq!(
+            response.tool_calls[0].arguments,
+            json!({"arguments":{},"artifact":null,"pin":null,"plugin":null})
+        );
+        assert!(response.content.is_empty());
+    }
+
+    #[test]
+    fn invalid_sse_tool_type_is_rejected() {
+        let wire = "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_123\",\"type\":\"custom\",\"function\":{\"name\":\"test_tool\",\"arguments\":\"{}\"}}]}}]}\n\n";
+        let mut decoder = Decoder::default();
+        let err = decoder.push(wire.as_bytes(), false).unwrap_err();
+        assert!(err.to_string().contains("unsupported SSE tool type"));
     }
 }

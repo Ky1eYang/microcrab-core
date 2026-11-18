@@ -253,6 +253,7 @@ fn adaptation_wraps_scalar_results_and_rejects_orphan_tool_identity() {
         }],
     });
     request.messages.push(Message::Tool {
+        parts: vec![],
         call_id: "call".into(),
         content: "[1,2]".into(),
     });
@@ -262,6 +263,7 @@ fn adaptation_wraps_scalar_results_and_rejects_orphan_tool_identity() {
     assert_eq!(result["name"], "lookup");
     assert_eq!(result["response"], json!({"output":[1,2]}));
     request.messages.push(Message::Tool {
+        parts: vec![],
         call_id: "orphan".into(),
         content: "done".into(),
     });
@@ -468,10 +470,12 @@ fn ordered_parallel_calls_replay_original_optional_ids_and_arguments() {
     let mut history = request();
     append_native(&mut history, response);
     history.messages.push(Message::Tool {
+        parts: vec![],
         call_id: runtime_id.clone(),
         content: "one".into(),
     });
     history.messages.push(Message::Tool {
+        parts: vec![],
         call_id: "wire-second".into(),
         content: "two".into(),
     });

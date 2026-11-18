@@ -83,6 +83,7 @@ struct Factory {
 }
 fn agent() -> AgentInfo {
     AgentInfo {
+        tool_media_output_bytes: Default::default(),
         name: "review".into(),
         modes: vec![microcrab_agent_types::AgentMode {
             description: String::new(),

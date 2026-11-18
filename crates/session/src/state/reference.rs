@@ -8,6 +8,7 @@
 //! counters and variables. Each kind synchronizes its own catalog. `load` and
 //! `change` run without the state lock so a kind cannot deadlock on `State`.
 
+pub mod focus;
 pub mod markdown;
 pub use markdown::{MarkdownReferences, ReferenceLimits, ReferenceSource};
 

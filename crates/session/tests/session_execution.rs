@@ -5,6 +5,9 @@
 #[path = "support/execution_fixture.rs"]
 mod execution_fixture;
 
+#[path = "tool_media.rs"]
+mod tool_media;
+
 #[path = "context_budget.rs"]
 mod context_budget;
 
@@ -26,6 +29,8 @@ mod runtime;
 mod shell_initial_output;
 #[path = "tool_argument_rewrite.rs"]
 mod tool_argument_rewrite;
+#[path = "variable_injection.rs"]
+mod variable_injection;
 #[path = "tool_job_batches.rs"]
 mod tool_job_batches;
 #[path = "tool_jobs.rs"]

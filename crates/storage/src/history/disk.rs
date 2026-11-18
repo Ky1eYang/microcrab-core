@@ -54,6 +54,74 @@ fn missing() -> Error {
     Error::config("journal target does not exist")
 }
 impl FileJournal {
+    /// Read exact sidecar receipts without acquiring a writer or activating a Session.
+    pub async fn inspect_communication(
+        session_dir: impl AsRef<Path>,
+        session_id: String,
+        agent_id: microcrab_session::state::communication::AgentId,
+    ) -> Result<Option<microcrab_session::state::communication::inbox::DurableInbox>, Error> {
+        let directory = session_dir.as_ref().to_owned();
+        let read_directory = directory.clone();
+        let stored = tokio::task::spawn_blocking(move || {
+            let directory = read_directory.canonicalize()?;
+            let root = directory.join("journal");
+            if !root.try_exists()? {
+                return Ok(None);
+            }
+            let actual = root.canonicalize()?;
+            if actual.parent() != Some(directory.as_path()) {
+                return Err(invalid("communication journal escapes session directory"));
+            }
+            let path = actual.join("communication.json");
+            if !path.try_exists()? {
+                return Ok(None);
+            }
+            let metadata = fs::symlink_metadata(&path)?;
+            if !metadata.is_file() || metadata.file_type().is_symlink() {
+                return Err(invalid("communication sidecar is not an ordinary file"));
+            }
+            read_json::<super::communication::StoredInbox>(
+                &path,
+                super::communication::MAX_INBOX_STORAGE_BYTES,
+            )
+            .map(Some)
+        })
+        .await
+        .map_err(|_| invalid("communication inspection worker failed"))??;
+        let Some(stored) = stored else {
+            return Ok(None);
+        };
+        let head = Self::inspect_head(directory).await?;
+        super::communication::reconcile_inspected(
+            stored,
+            &session_id,
+            &agent_id,
+            head.as_ref().map(|point| &point.checkpoint.recover),
+        )
+        .map(Some)
+    }
+    pub(super) async fn read_inbox(
+        &self,
+    ) -> Result<Option<super::communication::StoredInbox>, Error> {
+        self.run(|disk| disk.read_inbox()).await
+    }
+    pub(super) async fn store_inbox(
+        &self,
+        inbox: super::communication::StoredInbox,
+    ) -> Result<(), Error> {
+        self.run(move |disk| {
+            disk.ensure_writable()?;
+            if inbox.check_next(disk.read_inbox()?.as_ref())? {
+                let bytes = encode_bounded(&inbox, super::communication::MAX_INBOX_STORAGE_BYTES)?;
+                if let Err(error) = atomic_bytes(&disk.root.join("communication.json"), &bytes) {
+                    disk.writable = false;
+                    return Err(error);
+                }
+            }
+            Ok(())
+        })
+        .await
+    }
     /// Read one atomically published immutable checkpoint without opening a writer,
     /// creating storage, taking its exclusive lock, or moving the selected head.
     pub async fn inspect_head(
@@ -322,6 +390,17 @@ impl History for FileJournal {
     }
 }
 impl Disk {
+    fn read_inbox(&self) -> Result<Option<super::communication::StoredInbox>, Error> {
+        let path = self.root.join("communication.json");
+        if !path.try_exists()? {
+            return Ok(None);
+        }
+        let metadata = fs::symlink_metadata(&path)?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Err(invalid("communication sidecar is not an ordinary file"));
+        }
+        read_json(&path, super::communication::MAX_INBOX_STORAGE_BYTES).map(Some)
+    }
     fn open(root: PathBuf, options: JournalOptions) -> Result<Self, Error> {
         if options.max_checkpoint_bytes == 0 || options.max_checkpoint_bytes > 1024 * 1024 * 1024 {
             return Err(Error::config(

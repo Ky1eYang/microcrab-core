@@ -54,6 +54,7 @@ fn test_catalog() -> Vec<AgentInfo> {
 
     vec![
         AgentInfo {
+            tool_media_output_bytes: Default::default(),
             name: "planner".into(),
             modes: vec![
                 AgentMode {
@@ -75,6 +76,7 @@ fn test_catalog() -> Vec<AgentInfo> {
             variables: Variable::default(),
         },
         AgentInfo {
+            tool_media_output_bytes: Default::default(),
             name: "reviewer".into(),
             modes: vec![AgentMode {
                 description: String::new(),
@@ -87,6 +89,7 @@ fn test_catalog() -> Vec<AgentInfo> {
             variables: rev_vars,
         },
         AgentInfo {
+            tool_media_output_bytes: Default::default(),
             name: "execute".into(),
             modes: vec![AgentMode {
                 description: String::new(),

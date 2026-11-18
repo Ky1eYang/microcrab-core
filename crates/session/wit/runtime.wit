@@ -2,7 +2,7 @@ package microcrab:session@0.1.0;
 
 /// Runtime's complete binding surface; guests select their own smaller worlds.
 world runtime {
-  include microcrab:agent/agent@0.7.0;
+  include microcrab:agent/agent@0.8.0;
   import microcrab:host/process@0.1.0;
   import microcrab:host/filesystem@0.1.0;
   import microcrab:host/net@0.1.0;

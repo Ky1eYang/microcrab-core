@@ -67,6 +67,7 @@ fn session(
 ) -> Arc<SessionInner> {
     SessionInner::new(SessionParts {
         kind: crate::SessionKind::Interactive,
+        communication: None,
         client,
         route: None,
         auto_compaction: None,
@@ -538,23 +539,24 @@ async fn admitted_state_conflict_persists_exact_retry_boundary_without_replaying
     session.resume().await.unwrap();
     assert!(!session.retry_ready());
     assert_eq!(effects.load(Ordering::SeqCst), 1);
-    let requests = model.requests.lock().unwrap();
-    assert_eq!(requests.len(), 2);
-    assert_eq!(requests[1].turn_id, requests[0].turn_id);
-    assert_eq!(requests[1].round, Some(2));
-    assert_eq!(
-        serde_json::to_value(&requests[1].items[..recover.context.items.len()]).unwrap(),
-        admitted_prefix
-    );
-    assert_eq!(
-        requests[1]
-            .items
-            .iter()
-            .filter(|item| matches!(item, crate::context::ContentItem::User { .. }))
-            .count(),
-        1
-    );
-    assert_eq!(requests[1].items.iter().filter(|item| matches!(item,crate::context::ContentItem::Tool{call_id,..} if call_id == "settled-once")).count(),1);
-    drop(requests);
+    {
+        let requests = model.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[1].turn_id, requests[0].turn_id);
+        assert_eq!(requests[1].round, Some(2));
+        assert_eq!(
+            serde_json::to_value(&requests[1].items[..recover.context.items.len()]).unwrap(),
+            admitted_prefix
+        );
+        assert_eq!(
+            requests[1]
+                .items
+                .iter()
+                .filter(|item| matches!(item, crate::context::ContentItem::User { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(requests[1].items.iter().filter(|item| matches!(item,crate::context::ContentItem::Tool{call_id,..} if call_id == "settled-once")).count(),1);
+    }
     session.close().await.unwrap();
 }

@@ -1,5 +1,6 @@
 //! Contract tests for nonprocess producers, explicit failures and output ownership.
 mod content;
+mod media;
 mod notices;
 mod ownership;
 mod target_wait;

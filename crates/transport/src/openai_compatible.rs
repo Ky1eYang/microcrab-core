@@ -161,27 +161,66 @@ impl OpenAiCompatible {
         self
     }
 
-    fn adapt(&self, request: &Request) -> Result<Value, Error> {
-        let messages = request
-            .messages
-            .iter()
-            .map(|message| {
-                Ok(match message {
-                    Message::System { content } => json!({"role":"system", "content":content}),
-                    Message::User { parts } => {
-                        json!({"role":"user", "content":user_content(parts)?})
+    pub(crate) fn adapt(&self, request: &Request) -> Result<Value, Error> {
+        let mut messages = Vec::new();
+        let mut carriers = Vec::new();
+        for message in &request.messages {
+            // A complete contiguous tool-result batch must precede every synthetic
+            // user image carrier, including when the last tool result has no media.
+            if !matches!(message, Message::Tool { .. }) {
+                messages.append(&mut carriers);
+            }
+            match message {
+                Message::System { content } => {
+                    messages.push(json!({"role":"system", "content":content}))
+                }
+                Message::User { parts } => {
+                    messages.push(json!({"role":"user", "content":user_content(parts)?}))
+                }
+                Message::Assistant {
+                    content,
+                    tool_calls,
+                    provider_metadata,
+                } => {
+                    messages.push(chat_replay(content, tool_calls, provider_metadata)?);
+                }
+                Message::Tool {
+                    call_id,
+                    content,
+                    parts,
+                } => {
+                    let mut text = content.clone();
+                    let mut images = Vec::new();
+                    for part in parts {
+                        match part {
+                            InputPart::Text { text: extra } => {
+                                text.push('\n');
+                                text.push_str(extra);
+                            }
+                            InputPart::Image {
+                                source: ImageSource::Data { .. } | ImageSource::Url { .. },
+                            } => images.push(part.clone()),
+                            InputPart::Image { .. } => {
+                                return Err(Error::protocol(
+                                    "tool images require resolved Data or route URL hints",
+                                ));
+                            }
+                        }
                     }
-                    Message::Assistant {
-                        content,
-                        tool_calls,
-                        provider_metadata,
-                    } => chat_replay(content, tool_calls, provider_metadata)?,
-                    Message::Tool { call_id, content } => {
-                        json!({"role":"tool", "tool_call_id":call_id,"content":content})
+                    messages.push(json!({"role":"tool", "tool_call_id":call_id,"content":text}));
+                    if !images.is_empty() {
+                        images.insert(
+                            0,
+                            InputPart::Text {
+                                text: format!("[Image output for tool call {call_id}]"),
+                            },
+                        );
+                        carriers.push(json!({"role":"user", "content":user_content(&images)?}));
                     }
-                })
-            })
-            .collect::<Result<Vec<_>, Error>>()?;
+                }
+            }
+        }
+        messages.append(&mut carriers);
         let mut body = json!({"model":self.config.model,"messages":messages,"stream":true,"stream_options":{"include_usage":true},"max_tokens":request.max_output_tokens});
         if !request.tools.is_empty() {
             body["tools"] = Value::Array(request.tools.iter().map(|tool| json!({"type":"function","function":{"name":tool.name,"description":tool.description,"parameters":tool.parameters}})).collect());
@@ -283,6 +322,10 @@ impl OpenAiCompatible {
         }
         audit.received_complete();
         if !status.is_success() {
+            if let Some(error) = crate::media::remote_image_fetch_rejection(status, &audit.received)
+            {
+                return Err(error);
+            }
             return Err(Error::ProviderStatus {
                 status: status.as_u16(),
             });
@@ -617,10 +660,9 @@ fn decode_response(
             .filter(|v| !v.is_null())
             .or_else(|| message.get("reasoning"))
             .and_then(Value::as_str)
+            && !text.is_empty()
         {
-            if !text.is_empty() {
-                parts.push(AssistantPart::Reasoning { text: text.into() });
-            }
+            parts.push(AssistantPart::Reasoning { text: text.into() });
         }
         if !content.is_empty() {
             parts.push(AssistantPart::Text {
@@ -651,7 +693,29 @@ fn decode_response(
         tool_calls: calls,
         usage,
     };
-    crate::validate_response(&response, &request.tools)?;
+    if let Some(refusal) = message.get("refusal").filter(|value| !value.is_null()) {
+        let refusal = refusal
+            .as_str()
+            .ok_or_else(|| Error::protocol("invalid assistant refusal field"))?;
+        if !refusal.is_empty()
+            && response.content.trim().is_empty()
+            && response.tool_calls.is_empty()
+        {
+            crate::validate_response_shape(&response, &request.tools)?;
+            return Err(Error::Provider(
+                "provider refused the assistant response".into(),
+            ));
+        }
+    }
+    crate::validate_response_with_finish(
+        &response,
+        &request.tools,
+        match finish {
+            Some("stop" | "end_turn" | "stop_sequence") => crate::EmptyCompletionFinish::Stop,
+            Some("length") => crate::EmptyCompletionFinish::Length,
+            _ => crate::EmptyCompletionFinish::Unknown,
+        },
+    )?;
     Ok(response)
 }
 

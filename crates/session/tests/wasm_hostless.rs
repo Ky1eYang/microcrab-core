@@ -167,7 +167,7 @@ fn zero_tools_does_not_remove_agent_mode_name_schema_or_count_validation() {
     bounded[0]["tools"].as_array_mut().unwrap().push(json!({
         "name":"too_many", "description":"", "parameters":{"type":"object"}
     }));
-    rejected(&bounded, "at most 128 tools");
+    rejected(&bounded, "agent tool/output declaration count exceeds128");
 }
 
 struct ClientTool(Arc<AtomicUsize>);
@@ -196,17 +196,48 @@ impl Client for Model {
         _: CancellationToken,
     ) -> Result<Response, microcrab_transport::Error> {
         assert_eq!(
-            content
-                .tools
-                .iter()
-                .map(|tool| tool.name.as_str())
-                .collect::<Vec<_>>(),
-            vec!["client_echo"]
+            content.tools,
+            vec![
+                ClientTool(Arc::new(AtomicUsize::new(0))).definition(),
+                microcrab_session::runtime::BuiltinTool::SendMessage.definition(),
+            ]
+        );
+        let mut state = json!({});
+        for item in &content.items {
+            if let ContentItem::State(frame) = item {
+                microcrab_transport::apply_state_patch(&mut state, frame).unwrap();
+            }
+        }
+        let groups = state["permission"].as_array().unwrap();
+        let communication = groups
+            .iter()
+            .filter(|group| {
+                group["tools"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|tool| tool == "send_message")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(communication.len(), 1);
+        assert_eq!(communication[0]["tools"], json!(["send_message"]));
+        let mut policy = communication[0].clone();
+        policy.as_object_mut().unwrap().remove("tools");
+        policy.as_object_mut().unwrap().remove("owners");
+        let policy: microcrab_permission::CompiledToolPolicy =
+            serde_json::from_value(policy).unwrap();
+        assert_eq!(
+            microcrab_permission::evaluate_compiled(&policy, &json!({"intent":"send"})).unwrap(),
+            microcrab_permission::Action::Ask
+        );
+        assert_eq!(
+            microcrab_permission::evaluate_compiled(&policy, &json!({"intent":"reply"})).unwrap(),
+            microcrab_permission::Action::Allow
         );
         let first = self.0.fetch_add(1, Ordering::SeqCst) == 0;
         if !first {
             assert!(content.items.iter().any(|item| matches!(item,
-                ContentItem::Tool { call_id, content } if call_id == "client-call" && content == "client-result")));
+                ContentItem::Tool { call_id, content, .. } if call_id == "client-call" && content == "client-result")));
         }
         Ok(Response {
             provider_metadata: None,
@@ -255,7 +286,7 @@ async fn zero_declared_host_tools_preserve_external_tool_registration_and_execut
             .iter()
             .map(|tool| tool.name.as_str())
             .collect::<Vec<_>>(),
-        vec!["client_echo"]
+        vec!["client_echo", "send_message"]
     );
     session.close().await.unwrap();
 }

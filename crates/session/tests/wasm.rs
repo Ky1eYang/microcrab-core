@@ -934,7 +934,7 @@ async fn session_permission_denial_never_reaches_wasm_host() {
                 .items
                 .iter()
                 .find_map(|item| match item {
-                    microcrab_session::context::ContentItem::Tool { call_id, content }
+                    microcrab_session::context::ContentItem::Tool { call_id, content, .. }
                         if call_id == "denied" =>
                     {
                         Some(serde_json::from_str::<serde_json::Value>(content).unwrap())

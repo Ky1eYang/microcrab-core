@@ -39,6 +39,25 @@ impl ModelRecording for Blocked {
     }
 }
 #[tokio::test]
+async fn empty_completion_keeps_specific_invalidation_even_if_finish_is_unpolled() {
+    let recording = Arc::new(Blocked::default());
+    let mut observation = call(recording.clone());
+    let result = Err(crate::Error::Provider(
+        crate::ProviderError::empty_completion(crate::EmptyCompletionFacts {
+            reasoning_present: true,
+            finish: crate::EmptyCompletionFinish::Stop,
+        }),
+    ));
+    drop(observation.finish(&result));
+    drop(observation);
+    let fallback = recording.fallback.lock().unwrap();
+    assert_eq!(fallback[0].call_id, "exact-call");
+    assert!(matches!(&fallback[0].state,
+        ObservationState::Invalidated { reason } if reason == "empty_assistant_response"));
+    assert!(recording.accepted.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn never_polled_finish_preserves_intended_cancelled_terminal() {
     let recording = Arc::new(Blocked::default());
     let mut observation = call(recording.clone());

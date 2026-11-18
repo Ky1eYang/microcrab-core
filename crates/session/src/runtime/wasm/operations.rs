@@ -63,9 +63,8 @@ fn finish<T>(
                 .get_or_insert_with(|| safe.clone());
         }
         state.operation_diagnostic = Some((safe, error.message.clone()));
-        match error.code {
-            abi::OperationErrorCode::Cancelled => state.operation_cancelled = true,
-            _ => {}
+        if error.code == abi::OperationErrorCode::Cancelled {
+            state.operation_cancelled = true;
         }
     } else {
         state.operation_diagnostic = None;

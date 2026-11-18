@@ -534,10 +534,9 @@ async fn recovered_custom_variable_cannot_collide_with_installed_kind_or_publish
         .unwrap();
     session.start().await.unwrap();
     let mut target = session.checkpoint().await.unwrap();
-    target
-        .state
-        .variables
-        .insert("skills".into(), json!("custom collision"));
+    let mut target_values = target.state.variables.as_value();
+    target_values["skills"] = json!("custom collision");
+    target.state.variables = microcrab_session::state::Variables::new(target_values).unwrap();
     std::fs::write(&path, b"retain current workspace").unwrap();
     let current = session.checkpoint().await.unwrap();
     let state = encoded(session.state());
@@ -556,10 +555,9 @@ async fn recovered_custom_variable_cannot_collide_with_installed_kind_or_publish
 
     // Initial restore must reject the same collision even when the workspace matches.
     let mut initial = current.clone();
-    initial
-        .state
-        .variables
-        .insert("skills".into(), json!("custom collision"));
+    let mut initial_values = initial.state.variables.as_value();
+    initial_values["skills"] = json!("custom collision");
+    initial.state.variables = microcrab_session::state::Variables::new(initial_values).unwrap();
     let initial_probe = Arc::new(Probe::default());
     assert!(matches!(
         Session::restore(

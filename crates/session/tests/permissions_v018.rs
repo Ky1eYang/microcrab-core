@@ -158,6 +158,7 @@ async fn native_builtins_override_guest_defaults_but_user_rules_win_and_expand_r
     let model = Arc::new(Model::default());
     let runtime = Runtime::new(builtin_tools().into(), Arc::new(DenyAll)).unwrap();
     let agent = AgentInfo {
+        tool_media_output_bytes: Default::default(),
         name: "custom".into(),
         modes: vec![AgentMode {
             description: String::new(),
@@ -191,7 +192,7 @@ async fn native_builtins_override_guest_defaults_but_user_rules_win_and_expand_r
     );
     model.call("expand-1", "expand", json!({"reference":"sample"}));
     session.submit("expand installed reference").await.unwrap();
-    assert!(session.messages().iter().any(|item| matches!(item, ContentItem::Tool { call_id, content } if call_id == "expand-1" && content == "actual reference body")));
+    assert!(session.messages().iter().any(|item| matches!(item, ContentItem::Tool { call_id, content, .. } if call_id == "expand-1" && content == "actual reference body")));
     edit(&session, vec![permission("sleep", Action::Deny)]);
     assert_eq!(
         row(&session.state_view().unwrap(), "sleep")["action"],
@@ -267,6 +268,7 @@ async fn opaque_guest_name_uses_declared_mode_grants_and_user_can_override_it() 
     )
     .unwrap();
     let agent = AgentInfo {
+        tool_media_output_bytes: Default::default(),
         name: "coding".into(),
         modes: vec![AgentMode {
             description: String::new(),
@@ -296,6 +298,7 @@ async fn opaque_guest_name_uses_declared_mode_grants_and_user_can_override_it() 
 #[tokio::test]
 async fn eligibility_requires_executor_and_live_authorization_and_uses_declared_mode_order() {
     let catalog = vec![AgentInfo {
+        tool_media_output_bytes: Default::default(),
         name: "worker".into(),
         modes: vec![
             AgentMode {
@@ -415,7 +418,7 @@ async fn eligibility_requires_executor_and_live_authorization_and_uses_declared_
         .messages()
         .iter()
         .find_map(|item| match item {
-            ContentItem::Tool { call_id, content } if call_id == "canonical-delegate" => {
+            ContentItem::Tool { call_id, content, .. } if call_id == "canonical-delegate" => {
                 serde_json::from_str(content).ok()
             }
             _ => None,
@@ -543,6 +546,7 @@ async fn native_job_keeps_all_six_actions_allowed_in_every_mode_and_args_overrid
         Runtime::new(builtin_tools().into(), Arc::new(DenyAll)).unwrap(),
     )
     .agent(AgentInfo {
+        tool_media_output_bytes: Default::default(),
         name: "coding".into(),
         modes: ["plan", "build"]
             .into_iter()

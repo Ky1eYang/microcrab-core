@@ -559,7 +559,7 @@ async fn actual_guest_yields_partial_output_without_process_lifetime_budget(envi
     .await;
     let messages = session.messages();
     let receipt = messages.iter().find_map(|item| match item {
-        ContentItem::Tool { call_id, content } if call_id == "real-guest-shell" => {
+        ContentItem::Tool { call_id, content, .. } if call_id == "real-guest-shell" => {
             Some(serde_json::from_str::<Value>(content).unwrap())
         }
         _ => None,
@@ -579,7 +579,7 @@ async fn actual_guest_yields_partial_output_without_process_lifetime_budget(envi
     let waited = messages
         .iter()
         .find_map(|item| match item {
-            ContentItem::Tool { call_id, content } if call_id == "past-legacy-budget" => {
+            ContentItem::Tool { call_id, content, .. } if call_id == "past-legacy-budget" => {
                 Some(serde_json::from_str::<Value>(content).unwrap())
             }
             _ => None,
@@ -590,7 +590,7 @@ async fn actual_guest_yields_partial_output_without_process_lifetime_budget(envi
     let zero: Value = messages
         .iter()
         .find_map(|item| match item {
-            ContentItem::Tool { call_id, content } if call_id == "real-guest-yield-zero" => {
+            ContentItem::Tool { call_id, content, .. } if call_id == "real-guest-yield-zero" => {
                 Some(serde_json::from_str(content).unwrap())
             }
             _ => None,
