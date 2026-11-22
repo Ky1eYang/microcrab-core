@@ -5,6 +5,10 @@ use microcrab_transport::UserSource;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+mod dialogue;
+use dialogue::DialogueAdmission;
+pub use dialogue::{ExternalCredentialIncarnation, ExternalDialogueReceipt};
+
 pub const MAX_CARRIERS: usize = 128;
 pub const MAX_CARRIER_BYTES: usize = 128 * 1024;
 pub const MAX_BODY_BYTES: usize = 8192;
@@ -27,6 +31,101 @@ pub struct QueuedReceipt {
 pub struct OperationReceipt {
     pub receipt: QueuedReceipt,
     pub digest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    dialogue: Option<DialogueAdmission>,
+}
+impl OperationReceipt {
+    pub(crate) fn new(
+        inbox: &DurableInbox,
+        carrier: &AcceptedCarrier,
+        digest: String,
+        incarnation: Option<&ExternalCredentialIncarnation>,
+    ) -> Result<Self, Error> {
+        let dialogue = incarnation
+            .map(|proof| DialogueAdmission::allocate(inbox, carrier, proof, uuid::Uuid::new_v4))
+            .transpose()?;
+        Ok(Self {
+            receipt: QueuedReceipt {
+                operation_id: carrier.operation_id.clone(),
+                ordinal: carrier.ordinal,
+                status: DeliveryStatus::Queued,
+            },
+            digest,
+            dialogue,
+        })
+    }
+
+    /// An exact consumption witness may advance status, but no admission facts.
+    pub fn same_admission(&self, other: &Self) -> bool {
+        self.receipt.operation_id == other.receipt.operation_id
+            && self.receipt.ordinal == other.receipt.ordinal
+            && self.digest == other.digest
+            && self.dialogue == other.dialogue
+    }
+
+    pub(crate) fn matches_enqueue(
+        &self,
+        digest: &str,
+        identity: Option<&str>,
+        incarnation: Option<&ExternalCredentialIncarnation>,
+    ) -> bool {
+        self.digest == digest
+            && match (&self.dialogue, identity, incarnation) {
+                (Some(dialogue), Some(identity), Some(proof)) => dialogue.matches(identity, proof),
+                (None, _, None) => true,
+                _ => false,
+            }
+    }
+
+    pub(super) fn dialogue_admission_key(
+        &self,
+    ) -> Result<Option<super::reply::DialogueAdmissionKey>, Error> {
+        self.dialogue
+            .as_ref()
+            .map(|admission| {
+                admission.validate(&self.receipt.operation_id)?;
+                // The exact commitment remains stable when a queued receipt is
+                // advanced to consumed or history is selected on another branch.
+                let fields = serde_json::to_vec(&(
+                    &self.receipt.operation_id,
+                    self.receipt.ordinal,
+                    &self.digest,
+                    admission,
+                ))?;
+                let mut digest = Sha256::new();
+                digest.update(b"microcrab/private-dialogue-admission/v1\0");
+                digest.update(fields);
+                Ok(super::reply::DialogueAdmissionKey::new(
+                    admission.canonical_id,
+                    format!("{:x}", digest.finalize()),
+                ))
+            })
+            .transpose()
+    }
+
+    pub(crate) fn dialogue_alias(&self) -> Option<&str> {
+        self.dialogue
+            .as_ref()
+            .map(|dialogue| dialogue.alias.as_str())
+    }
+
+    pub(crate) fn legacy_receipt(&self) -> Option<QueuedReceipt> {
+        self.dialogue.is_none().then(|| self.receipt.clone())
+    }
+
+    pub(crate) fn authenticated_external_receipt(
+        &self,
+        identity: &str,
+        incarnation: &ExternalCredentialIncarnation,
+    ) -> Option<ExternalDialogueReceipt> {
+        self.dialogue
+            .as_ref()
+            .filter(|row| row.matches(identity, incarnation))
+            .map(|row| ExternalDialogueReceipt {
+                receipt: self.receipt.clone(),
+                dialogue_id: row.alias.clone(),
+            })
+    }
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -63,8 +162,7 @@ impl DurableInbox {
                     .iter()
                     .find(|row| row.receipt.operation_id == receipt.receipt.operation_id)
                     .ok_or_else(|| Error::config("communication receipt cannot be forgotten"))?;
-                if receipt.digest != next.digest
-                    || receipt.receipt.ordinal != next.receipt.ordinal
+                if !receipt.same_admission(next)
                     || (receipt.receipt.status == DeliveryStatus::Consumed
                         && next.receipt.status != receipt.receipt.status)
                 {
@@ -97,12 +195,48 @@ impl DurableInbox {
         }
         Ok(true)
     }
-    pub fn receipt(&self, operation_id: &str) -> Option<QueuedReceipt> {
+    pub(crate) fn operation(&self, operation_id: &str) -> Option<&OperationReceipt> {
         self.receipts
             .iter()
             .find(|row| row.receipt.operation_id == operation_id)
-            .map(|row| row.receipt.clone())
     }
+    /// Compatibility observation for receipts without an exact credential binding.
+    pub fn receipt(&self, operation_id: &str) -> Option<QueuedReceipt> {
+        self.operation(operation_id)?.legacy_receipt()
+    }
+    /// Match exact operation and credential incarnation; never infer a legacy link.
+    pub fn authenticated_external_receipt(
+        &self,
+        operation_id: &str,
+        identity: &str,
+        incarnation: &ExternalCredentialIncarnation,
+    ) -> Result<Option<ExternalDialogueReceipt>, Error> {
+        validate_operation(operation_id)?;
+        Ok(self
+            .operation(operation_id)
+            .and_then(|row| row.authenticated_external_receipt(identity, incarnation)))
+    }
+    /// Resolve a presentation alias only with its exact authenticated credential
+    /// incarnation. Legacy receipts are deliberately never upgraded here.
+    pub fn authenticated_external_dialogue(
+        &self,
+        alias: &str,
+        identity: &str,
+        incarnation: &ExternalCredentialIncarnation,
+    ) -> Result<Option<(ExternalDialogueReceipt, super::reply::DialogueAdmissionKey)>, Error> {
+        let Some(row) = self.receipts.iter().find(|row| {
+            row.dialogue
+                .as_ref()
+                .is_some_and(|admission| admission.alias == alias)
+        }) else {
+            return Ok(None);
+        };
+        let Some(receipt) = row.authenticated_external_receipt(identity, incarnation) else {
+            return Ok(None);
+        };
+        Ok(row.dialogue_admission_key()?.map(|key| (receipt, key)))
+    }
+
     pub(crate) fn digest(carrier: &AcceptedCarrier) -> Result<String, Error> {
         Ok(format!(
             "{:x}",
@@ -129,8 +263,20 @@ impl DurableInbox {
         let mut ordinals = std::collections::BTreeSet::new();
         let mut operations = std::collections::BTreeSet::new();
         let mut receipt_ordinals = std::collections::BTreeSet::new();
+        let mut dialogue_ids = std::collections::BTreeSet::new();
+        let mut dialogue_aliases = std::collections::BTreeSet::new();
         for receipt in &self.receipts {
             validate_operation(&receipt.receipt.operation_id)?;
+            if let Some(dialogue) = &receipt.dialogue {
+                dialogue.validate(&receipt.receipt.operation_id)?;
+                if !dialogue_ids.insert(dialogue.canonical_id)
+                    || !dialogue_aliases.insert(&dialogue.alias)
+                {
+                    return Err(Error::config(
+                        "duplicate external dialogue identity or alias",
+                    ));
+                }
+            }
             if receipt.receipt.status == DeliveryStatus::Queued
                 && !self
                     .pending
@@ -162,6 +308,9 @@ impl DurableInbox {
             if receipt.receipt.ordinal != carrier.ordinal
                 || receipt.receipt.status != DeliveryStatus::Queued
                 || receipt.digest != Self::digest(carrier)?
+                || receipt.dialogue.as_ref().is_some_and(|dialogue| {
+                    !matches!(&carrier.source, UserSource::External { identity } if identity == &dialogue.identity)
+                })
             {
                 return Err(Error::config("carrier receipt witness mismatch"));
             }

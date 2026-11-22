@@ -1,11 +1,13 @@
 //! One bounded, in-memory insertion owner. Claim snapshots never remove bytes;
 //! only the Context append owner acknowledges them after a successful transaction.
 use crate::runtime::execution::{ExecutionId, ExecutionStatus, ToolFailure};
-use crate::{Error, SessionInput};
+use crate::{Error, InputAdmissionResolver, SessionInput};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::hash::BuildHasher;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+
+pub(crate) const MAX_IDLE_CARRIERS: usize = 32;
 
 /// Read-only user insertion facts from the shared inbox, excluding framework notices.
 #[derive(Clone, Debug, Serialize)]
@@ -113,6 +115,7 @@ pub(crate) struct UserEntry {
     pub lane: Lane,
     pub input: SessionInput,
     pub submission_operation_id: Option<String>,
+    pub admission_resolver: Option<Arc<dyn InputAdmissionResolver>>,
     bytes: usize,
 }
 #[derive(Clone)]
@@ -161,10 +164,10 @@ mod timing_tests {
     fn submission_identity_survives_edit_conversion_claim_and_removal() {
         let mut inbox = InboxState::default();
         inbox
-            .enqueue_submission("same".into(), false, Some("first".into()))
+            .enqueue_submission("same".into(), false, Some("first".into()), None)
             .unwrap();
         inbox
-            .enqueue_submission("same".into(), false, Some("second".into()))
+            .enqueue_submission("same".into(), false, Some("second".into()), None)
             .unwrap();
         let first = inbox.snapshot().items[0].clone();
         let changed = inbox
@@ -385,20 +388,21 @@ impl InboxState {
         })?;
         Ok(self.next_id)
     }
+    #[cfg(test)]
     pub fn enqueue(&mut self, input: SessionInput, steer: bool) -> Result<(), Error> {
-        self.enqueue_submission(input, steer, None)
+        self.enqueue_submission(input, steer, None, None)
     }
-    pub fn submission_operation_id(&self, id: u64) -> Option<String> {
+    pub fn claimed_user(&self, id: u64) -> Option<&UserEntry> {
         self.users
             .iter()
-            .find(|entry| entry.id == id)
-            .and_then(|entry| entry.submission_operation_id.clone())
+            .find(|entry| entry.id == id && entry.claimed)
     }
     pub fn enqueue_submission(
         &mut self,
         input: SessionInput,
         steer: bool,
         submission_operation_id: Option<String>,
+        admission_resolver: Option<Arc<dyn InputAdmissionResolver>>,
     ) -> Result<(), Error> {
         if self.retired || self.retiring {
             return Err(Error::config("Session conversation is retired or retiring"));
@@ -429,6 +433,7 @@ impl InboxState {
             },
             input,
             submission_operation_id,
+            admission_resolver,
             bytes,
         });
         self.user_bytes += bytes;
@@ -496,6 +501,7 @@ impl InboxState {
             lane,
             input: input.clone(),
             submission_operation_id: submission_operation_id.clone(),
+            admission_resolver: old.admission_resolver.clone(),
             bytes,
         };
         self.user_bytes = retained + bytes;
@@ -743,7 +749,7 @@ impl InboxState {
                 )
                 .collect::<Vec<_>>();
             run.sort_by_key(IdleCarrier::id);
-            run.truncate(32);
+            run.truncate(MAX_IDLE_CARRIERS);
             if !run.is_empty() {
                 return Some(TurnEntry::Carriers(run));
             }

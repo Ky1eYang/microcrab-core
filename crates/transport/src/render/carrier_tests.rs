@@ -54,6 +54,49 @@ fn empty_patch() -> ContentItem {
 }
 
 #[test]
+fn dialogue_envelope_preserves_legacy_wire_and_rejects_invalid_aliases_and_sources() {
+    let historical = r#"{"User":{"parts":[{"type":"text","text":"old"}],"source":{"external":{"identity":"speaker"}},"envelope":"v1"}}"#;
+    let old: ContentItem = serde_json::from_str(historical).unwrap();
+    assert_eq!(serde_json::to_string(&old).unwrap(), historical);
+    let make = |source, alias: &str| ContentItem::User {
+        parts: vec![InputPart::Text {
+            text: "<new>".into(),
+        }],
+        source,
+        envelope: Some(CarrierEnvelopeVersion::ExternalDialogue {
+            alias: alias.into(),
+        }),
+    };
+    let speaker = Some(UserSource::External {
+        identity: "speaker".into(),
+    });
+    let new = make(speaker.clone(), "0123abcd");
+    let encoded = serde_json::to_string(&new).unwrap();
+    let new: ContentItem = serde_json::from_str(&encoded).unwrap();
+    let rendered = render_ast(&content(vec![snapshot(state()), old, new])).unwrap();
+    assert!(text(&rendered.messages[1]).contains("<external_speaker>\nold\n</external_speaker>"));
+    assert!(
+        text(&rendered.messages[1])
+            .contains("<external_speaker id=\"0123abcd\">\n&lt;new&gt;\n</external_speaker>")
+    );
+    for (source, alias) in [
+        (speaker.clone(), "0123ABCD"),
+        (speaker.clone(), "0123\"xxx"),
+        (None, "0123abcd"),
+        (Some(UserSource::Framework), "0123abcd"),
+    ] {
+        assert!(render_ast(&content(vec![snapshot(state()), make(source, alias)])).is_err());
+    }
+    assert!(
+        render_ast(&content(vec![
+            snapshot(json!({})),
+            make(speaker, "0123abcd")
+        ]))
+        .is_err()
+    );
+}
+
+#[test]
 fn repeated_origins_preserve_order_behind_one_frame() {
     let request = render_ast(&content(vec![
         snapshot(state()),

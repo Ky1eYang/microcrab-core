@@ -68,6 +68,8 @@ pub struct AuditBody {
     pub context_target: Option<String>,
     /// Exact conversation tool call identity; independent of provider call IDs.
     pub tool_call_id: Option<String>,
+    /// Exact runtime reservation for this tool observation, not the provider call ID.
+    pub tool_execution_id: Option<u64>,
     pub payload: HookPayload,
     pub sent_request: Option<String>,
     pub response: Option<String>,

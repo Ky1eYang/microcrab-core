@@ -26,6 +26,21 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
 
+fn switch_mode_available(
+    kind: crate::SessionKind,
+    frozen_tools: &[microcrab_protocol::ToolDefinition],
+) -> bool {
+    use crate::runtime::BuiltinTool;
+    // The registry reserves this name for the native builtin; recovery validates
+    // the frozen definition against its installed implementation.
+    matches!(
+        kind,
+        crate::SessionKind::Interactive | crate::SessionKind::Delegated
+    ) && frozen_tools
+        .iter()
+        .any(|definition| BuiltinTool::from_name(&definition.name) == Some(BuiltinTool::SwitchMode))
+}
+
 // Close callers share one owned worker. Only execution/process cleanup may be
 // reconciled explicitly; terminal hooks, persistence and journal errors stay sticky.
 #[derive(Clone)]
@@ -44,6 +59,9 @@ pub(crate) struct SessionInner {
     directory: std::sync::RwLock<Arc<crate::runtime::messaging::LineageDirectory>>,
     communication_transaction: Arc<tokio::sync::Mutex<()>>,
     communication_loaded: AtomicBool,
+    // Also the reply mutation fence: terminal settlement joins a started write.
+    dialogue_reply_store:
+        tokio::sync::Mutex<Option<Arc<dyn crate::state::communication::reply::DialogueReplyStore>>>,
     durable_carrier_consumption: Mutex<
         std::collections::BTreeMap<String, crate::state::communication::inbox::OperationReceipt>,
     >,
@@ -150,6 +168,8 @@ pub(crate) struct SessionInner {
 pub(crate) struct SessionParts {
     pub kind: crate::SessionKind,
     pub communication: Option<crate::state::communication::CommunicationState>,
+    pub dialogue_reply_store:
+        Option<Arc<dyn crate::state::communication::reply::DialogueReplyStore>>,
     pub client: Arc<dyn Client>,
     pub route: Option<Arc<dyn crate::session::TurnRouting>>,
     pub auto_compaction: Option<(
@@ -206,11 +226,7 @@ impl SessionInner {
             .as_ref()
             .and_then(|agent| agent.modes.iter().find(|entry| entry.name == mode))
             .ok_or_else(|| Error::config("unknown agent mode"))?;
-        use microcrab_agent_types::AgentRole;
-        if matches!(
-            (self.is_main, selected.role),
-            (true, AgentRole::SubAgent) | (false, AgentRole::MainAgent)
-        ) {
+        if !crate::session::mode_role_eligible(self.is_main, selected.role) {
             return Err(Error::config(
                 "agent mode is not eligible for this session role",
             ));
@@ -227,21 +243,6 @@ impl SessionInner {
             .configured_mode
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        if let Some(selected) = self
-            .agent
-            .as_ref()
-            .and_then(|agent| agent.modes.iter().find(|entry| entry.name == mode))
-        {
-            use microcrab_agent_types::AgentRole;
-            if matches!(
-                (self.is_main, selected.role),
-                (true, AgentRole::SubAgent) | (false, AgentRole::MainAgent)
-            ) {
-                return Err(Error::config(
-                    "agent mode is not eligible for this session role",
-                ));
-            }
-        }
         if let Some(expected) = expected
             && (expected.generation != configured.0 || expected.epoch != self.state().epoch_id)
         {
@@ -326,6 +327,8 @@ impl SessionInner {
                     .iter()
                     .any(|definition| definition.name == "delegate"),
         );
+        self.state
+            .install_switch_mode_availability(switch_mode_available(self.kind, definitions));
     }
     pub(crate) fn state(&self) -> SessionState {
         self.state.snapshot()
@@ -418,6 +421,7 @@ impl SessionInner {
             self.state.update(|state| {
                 state.turn_id = None;
                 state.round_id = None;
+                state.dialogue_turn_live = false;
             });
         }
         *self.active.lock().unwrap_or_else(|e| e.into_inner()) = None;

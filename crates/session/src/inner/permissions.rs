@@ -178,6 +178,11 @@ impl SessionInner {
         self.runtime.publish_registry(registry);
         self.state
             .install_delegate_availability(self.runtime.delegate_available());
+        self.state
+            .install_switch_mode_availability(switch_mode_available(
+                self.kind,
+                context.frozen_tools(),
+            ));
         *self
             .context
             .lock()

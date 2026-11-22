@@ -205,14 +205,16 @@ impl SqliteAuditStore {
         }) {
             return Err(Error::audit("audit scope still has a live writer"));
         }
-        // Root deletion also owns display rows. Keep both admission locks through
-        // commit, in audit -> display order, so neither writer can open in the
-        // interval after its live-owner check and before deletion.
+        // Root deletion also owns display and private reply rows. Hold
+        // admission through commit, in audit -> display -> reply order.
         let _display_writers =
             crate::display::DisplaySource::fence_sqlite_root_purge(&key_path, owner, root)?;
+        let mut reply_writers =
+            crate::dialogue_reply::RootPurgeGuard::acquire(&key_path, owner, root)?;
         let tx = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(failure)?;
+        reply_writers.delete(&tx, owner, root)?;
         let has_history: bool = tx
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='journal_heads')",
@@ -262,7 +264,9 @@ impl SqliteAuditStore {
             params![owner, root],
         )
         .map_err(failure)?;
-        tx.commit().map_err(failure)
+        tx.commit().map_err(failure)?;
+        reply_writers.acknowledge_purge(&key_path, owner, root);
+        Ok(())
     }
 }
 impl AuditStore for SqliteAuditStore {

@@ -18,6 +18,7 @@ impl SessionInner {
         if parts.kind != crate::SessionKind::OneShot {
             parts.runtime.configure_conversation_tools(
                 parts.communication.as_ref().map(|value| &value.identity),
+                parts.dialogue_reply_store.is_some(),
             )?;
         }
         let context = Context::new(
@@ -73,6 +74,10 @@ impl SessionInner {
             snapshot.communication = parts.communication;
         });
         state.install_delegate_availability(parts.runtime.delegate_available());
+        state.install_switch_mode_availability(switch_mode_available(
+            parts.kind,
+            context.frozen_tools(),
+        ));
         state.install_references(crate::state::reference::References::new(parts.references)?)?;
         let auditor = Arc::new(crate::observation::hooks::BoundAuditor {
             inner: parts.auditor,
@@ -112,22 +117,15 @@ impl SessionInner {
                 .snapshot()
                 .map_err(|e| Error::config_with_private(e.public_reason(), e.to_string()))?;
             let selected = if snapshot.config.mode.is_empty() {
-                agent.modes.iter().find(|mode| {
-                    !matches!(
-                        (parts.is_main, mode.role),
-                        (true, microcrab_agent_types::AgentRole::SubAgent)
-                            | (false, microcrab_agent_types::AgentRole::MainAgent)
-                    )
-                })
+                agent
+                    .modes
+                    .iter()
+                    .find(|mode| crate::session::mode_role_eligible(parts.is_main, mode.role))
             } else {
                 agent.modes.iter().find(|m| m.name == snapshot.config.mode)
             };
             if let Some(mode) = selected {
-                if matches!(
-                    (parts.is_main, mode.role),
-                    (true, microcrab_agent_types::AgentRole::SubAgent)
-                        | (false, microcrab_agent_types::AgentRole::MainAgent)
-                ) {
+                if !crate::session::mode_role_eligible(parts.is_main, mode.role) {
                     return Err(Error::config(
                         "initial mode is ineligible for the Session Agent role",
                     ));
@@ -209,6 +207,7 @@ impl SessionInner {
                 )),
                 communication_transaction: Arc::new(tokio::sync::Mutex::new(())),
                 communication_loaded: AtomicBool::new(false),
+                dialogue_reply_store: tokio::sync::Mutex::new(parts.dialogue_reply_store),
                 durable_carrier_consumption: Mutex::new(Default::default()),
                 recovered_child_reservations: Mutex::new(Default::default()),
                 one_shot_claimed: AtomicBool::new(false),

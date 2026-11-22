@@ -370,8 +370,12 @@ impl Runtime {
     pub(crate) fn configure_conversation_tools(
         &self,
         identity: Option<&crate::state::communication::ConversationIdentity>,
+        external_dialogue_replies: bool,
     ) -> Result<(), Error> {
-        let registry = Arc::new(self.registry().for_conversation(identity)?);
+        let registry = Arc::new(
+            self.registry()
+                .for_conversation(identity, external_dialogue_replies)?,
+        );
         let provider = registry.provider_defaults()?;
         let snapshot = self
             .permission
@@ -980,13 +984,30 @@ impl Runtime {
     ) -> Result<(), Error> {
         let limits = state.snapshot().limits;
         let tool_registry = self.registry();
-        let mut ordered = response.tool_calls.to_vec();
-        ordered.sort_by_key(is_pending_work_wait);
+        // The assistant was appended before entering this batch; execution order
+        // can differ from the canonical order when pending-work waits are deferred.
+        let assistant_index = context.admitted_items().1.len().checked_sub(1);
+        let mut ordered = response
+            .tool_calls
+            .iter()
+            .cloned()
+            .enumerate()
+            .collect::<Vec<_>>();
+        ordered.sort_by_key(|(_, call)| is_pending_work_wait(call));
         let mut pending = ordered
             .into_iter()
-            .map(|call| (call, None, super::tool::injection::LiteralMask::default()))
+            .map(|(slot, call)| {
+                (
+                    slot,
+                    call,
+                    None,
+                    super::tool::injection::LiteralMask::default(),
+                )
+            })
             .collect::<std::collections::VecDeque<_>>();
-        while let Some((mut normalized, prepared, mut literal_mask)) = pending.pop_front() {
+        while let Some((call_index, mut normalized, prepared, mut literal_mask)) =
+            pending.pop_front()
+        {
             if cancellation.is_cancelled() {
                 return Err(Error::Cancelled);
             }
@@ -1049,7 +1070,7 @@ impl Runtime {
                             &limits,
                             tool_registry.media_output_bytes(&normalized.name),
                         )?;
-                        for (remaining, _, _) in &pending {
+                        for (_, remaining, _, _) in &pending {
                             reserve_tool_result(
                                 &mut reserved,
                                 remaining,
@@ -1063,9 +1084,9 @@ impl Runtime {
                     if is_pending_work_wait(&normalized)
                         && pending
                             .iter()
-                            .any(|(call, _, _)| !is_pending_work_wait(call))
+                            .any(|(_, call, _, _)| !is_pending_work_wait(call))
                     {
-                        pending.push_back((normalized, Some(clock), literal_mask));
+                        pending.push_back((call_index, normalized, Some(clock), literal_mask));
                         continue;
                     }
                 }
@@ -1121,7 +1142,7 @@ impl Runtime {
                 &limits,
                 tool_registry.media_output_bytes(&call.name),
             )?;
-            for (remaining, _, _) in &pending {
+            for (_, remaining, _, _) in &pending {
                 reserve_tool_result(
                     &mut result_probe,
                     remaining,
@@ -1157,13 +1178,15 @@ impl Runtime {
                 agent,
                 mode,
             );
-            let action_error = expansion_error.or_else(|| tool_registry.clone().validate(call).err()).or_else(|| {
-                if call.name == "job" {
-                    crate::runtime::execution::job::validate(&call.arguments).err()
-                } else {
-                    delegate_error
-                }
-            });
+            let action_error = expansion_error
+                .or_else(|| tool_registry.clone().validate(call).err())
+                .or_else(|| {
+                    if call.name == "job" {
+                        crate::runtime::execution::job::validate(&call.arguments).err()
+                    } else {
+                        delegate_error
+                    }
+                });
             use crate::policy::{PermissionError, PermissionRequest};
             let mut invocation = invocation;
             invocation.literal_mask = literal_mask;
@@ -1194,17 +1217,7 @@ impl Runtime {
             executions.mark(reserved, super::execution::ExecutionStatus::Waiting);
             recorder.record_task_admission(context).await?;
             let invocation_cancellation = invocation.cancellation.clone();
-            let issuer = crate::context::Content {
-                epoch: state.snapshot().epoch_id,
-                subagent: None,
-                system: "Permission review".into(),
-                items: vec![],
-                tools: vec![],
-                max_output_tokens: 1024,
-                max_bytes: limits.max_context_bytes,
-                turn_id: None,
-                round: None,
-            };
+            let issuer = context.review_issuer(1024);
             let mut admission_error = None;
             let mut invocation_cancelled = false;
             if action_error.is_none() {
@@ -1350,6 +1363,18 @@ impl Runtime {
                     })?;
                 Ok(output)
             });
+            // Some valid output receipts carry a failed terminal execution while
+            // the invocation still returns a body to Context. Read the exact
+            // reservation, never infer its outcome from that body.
+            use super::execution::ExecutionStatus;
+            let terminal_status = match executions.get(reserved).ok().map(|row| row.status) {
+                Some(ExecutionStatus::Failed) => Some("failed"),
+                Some(ExecutionStatus::Cancelled) => Some("cancelled"),
+                Some(ExecutionStatus::Interrupted) => Some("interrupted"),
+                _ if matches!(&result, Err(Error::Cancelled)) => Some("cancelled"),
+                _ if result.is_err() => Some("failed"),
+                _ => None,
+            };
             // Every returned outcome, including terminal errors, is observable.
             // ToolResult never enters the intervention lane.
             let snapshot = state.snapshot();
@@ -1378,6 +1403,7 @@ impl Runtime {
                     turn_id: snapshot.turn_id,
                     round: snapshot.round_id,
                     tool_call_id: Some(call.id.clone()),
+                    tool_execution_id: Some(reserved.0),
                     started_at_unix_ms: clock.0,
                     elapsed_ms: u64::try_from(clock.1.elapsed().as_millis()).ok(),
                     payload,
@@ -1426,7 +1452,20 @@ impl Runtime {
                 .collect();
             context.append_tool_result_with_parts(call.id.clone(), output.content, parts)?;
             let (epoch, items) = context.admitted_items();
-            client.observe_admitted(epoch, items, None).await;
+            if let Some(assistant_index) = assistant_index {
+                client
+                    .observe_tool_result_admitted(
+                        epoch,
+                        items,
+                        assistant_index,
+                        call_index,
+                        reserved.0,
+                        terminal_status,
+                    )
+                    .await;
+            } else {
+                client.observe_admitted(epoch, items, None).await;
+            }
             executions.acknowledge_result_delivered(reserved);
             recorder.observe_context(context)?;
         }

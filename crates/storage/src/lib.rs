@@ -3,6 +3,7 @@
 //! is published only after the Journal acknowledgement of successful recovery.
 pub mod audit;
 pub mod configuration;
+pub mod dialogue_reply;
 pub mod directory;
 pub mod display;
 pub mod execution;

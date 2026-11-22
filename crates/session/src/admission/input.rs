@@ -79,12 +79,12 @@ pub(crate) async fn prepare(
 pub(crate) fn stage_step(
     context: &crate::context::Context,
     preview: &crate::State,
-    prepared: &[SessionInput],
+    prepared: &[(SessionInput, Option<crate::ImportantInput>)],
     notices: Option<serde_json::Value>,
     max_output_tokens: u32,
 ) -> Result<(crate::context::Context, VariablesChange), Error> {
     let mut merged = VariablesChange::default();
-    for input in prepared {
+    for (input, _) in prepared {
         preview.apply_change(input.variables.clone())?;
         merged.overlay(&input.variables);
     }
@@ -95,8 +95,8 @@ pub(crate) fn stage_step(
     let mut candidate = context.clone();
     // One State suffix precedes all user parts admitted at this boundary.
     candidate.synchronize_state(&values)?;
-    for input in prepared.iter().cloned() {
-        candidate.admit_user(input, &values)?;
+    for (input, important) in prepared.iter().cloned() {
+        candidate.admit_user_with_important(input, &values, important)?;
     }
     candidate.content(max_output_tokens)?;
     Ok((candidate, merged))

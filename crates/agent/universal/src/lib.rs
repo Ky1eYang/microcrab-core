@@ -660,6 +660,34 @@ mod tests {
     }
 
     #[test]
+    fn session_variables_are_not_shell_parameters() {
+        let host = host(OsFamily::Unix);
+        let agent = describe(&host).unwrap().remove(0);
+        let parameters = &agent.tools[0].parameters;
+        let properties = parameters["properties"].as_object().unwrap();
+        assert_eq!(properties.len(), 3);
+        for key in ["command", "cwd", "yield_ms"] {
+            assert!(
+                properties.contains_key(key),
+                "missing shell parameter: {key}"
+            );
+        }
+        assert_eq!(parameters["additionalProperties"], false);
+        for arguments in [
+            r#"{"command":"ok","variables":["example"]}"#,
+            r#"{"command":"ok","env":{"example":"value"}}"#,
+        ] {
+            assert_eq!(
+                invoke_with_shell(&host, "bash", arguments, |_| {
+                    panic!("unexpected shell parameter reached Host")
+                })
+                .unwrap_err(),
+                "unknown shell argument"
+            );
+        }
+    }
+
+    #[test]
     fn wrong_host_name_and_exact_arguments_never_reach_capability() {
         for (family, name, args) in [
             (OsFamily::Windows, "bash", r#"{"command":"ok"}"#),

@@ -33,6 +33,7 @@ pub fn check(kind: LimitKind, required: usize, budget: usize) -> Result<(), Erro
             | LimitKind::ImagePixels
             | LimitKind::ImageSide
             | LimitKind::InboxEntries
+            | LimitKind::DialogueReplyEntries
             | LimitKind::ReferenceCount
             | LimitKind::HostOperations => limit.counts(required, budget),
             LimitKind::ToolCalls => limit.counts(required, budget).calls(required),

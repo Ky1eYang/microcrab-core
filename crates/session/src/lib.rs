@@ -14,6 +14,9 @@ mod session;
 pub mod state;
 pub mod utils;
 
+pub use admission::embedding::{
+    InputAdmissionBoundary, InputAdmissionResolver, PreparedInputAdmission,
+};
 pub use admission::inbox::{
     InboxSnapshot, NoticeFact, NoticeKey, NoticeKind, PendingInput, PendingInputError,
     PendingInputMode, StateDelivery, StateNotice,
@@ -27,7 +30,7 @@ pub use microcrab_auditor::{
 };
 pub use microcrab_protocol as protocol;
 pub use microcrab_protocol::{ImageSource, InputPart, SessionInput, VariablesChange};
-pub use microcrab_transport::{Client, ModelEvent};
+pub use microcrab_transport::{Client, ImportantInput, ModelEvent};
 pub use observation::activity::{
     CompletedTurn, InboxFailure, InboxFailureKind, RoundLimitStop, SessionActivity,
 };

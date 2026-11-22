@@ -74,24 +74,20 @@ async fn buffered(
     (registry, id, writer)
 }
 fn assert_owned(registry: &ExecutionRegistry, id: ExecutionId) {
-    assert!(
-        registry
-            .model_projection()
-            .iter()
-            .any(|row| row.execution_id == id)
-    );
+    let (rows, capacity) = registry.model_observation();
+    assert!(rows.iter().any(|row| row.execution_id == id));
+    assert_eq!(capacity.buffers.used, 1);
+    assert_eq!(capacity.buffers.remaining, capacity.buffers.limit - 1);
     let state = registry.state.lock().unwrap();
     let entry = &state.entries[&id];
     assert!(!entry.released);
     assert!(entry.controller.is_some());
 }
 fn assert_released(registry: &ExecutionRegistry, id: ExecutionId) {
-    assert!(
-        !registry
-            .model_projection()
-            .iter()
-            .any(|row| row.execution_id == id)
-    );
+    let (rows, capacity) = registry.model_observation();
+    assert!(!rows.iter().any(|row| row.execution_id == id));
+    assert_eq!(capacity.buffers.used, 0);
+    assert_eq!(capacity.buffers.remaining, capacity.buffers.limit);
     let state = registry.state.lock().unwrap();
     let entry = &state.entries[&id];
     assert!(entry.released);
@@ -199,6 +195,11 @@ async fn pending_and_terminal_empty_reads_never_release() {
     let gate = CleanupGate::new(false);
     let (registry, id, writer) = buffered(gate.clone(), "", false).await;
     assert!(!registry.read(id, 0, 4096).unwrap().closed);
+    let (rows, capacity) = registry.model_observation();
+    assert_eq!(rows[0].execution_id, id);
+    assert_eq!(capacity.buffers.used, 1);
+    // A running, adopted Buffered receipt charges the buffer quota only.
+    assert_eq!(capacity.pending.used, 0);
     assert!(
         registry
             .release(id, CancellationToken::new())
@@ -208,6 +209,7 @@ async fn pending_and_terminal_empty_reads_never_release() {
     writer.finish(Ok(())).unwrap();
     assert!(registry.read(id, 0, 4096).unwrap().closed);
     assert_owned(&registry, id);
+    assert_eq!(registry.model_observation().1.pending.used, 0);
     assert_eq!(gate.calls.load(Ordering::SeqCst), 0);
     gate.allowed.add_permits(1);
     registry
@@ -427,7 +429,11 @@ fn controller_free_empty_read_budgets_revision_without_releasing() {
 #[tokio::test]
 async fn final_source_and_producer_elapsed_are_visible_before_slow_cleanup_ack() {
     let gate = CleanupGate::new(false);
-    let registry = ExecutionRegistry::new(Limits::default());
+    let registry = ExecutionRegistry::new(Limits {
+        max_execution_buffers: 1,
+        max_pending_executions: 1,
+        ..Limits::default()
+    });
     let id = registry
         .admit_detached(row(), CancellationToken::new())
         .unwrap();
@@ -457,13 +463,23 @@ async fn final_source_and_producer_elapsed_are_visible_before_slow_cleanup_ack()
         .unwrap();
     assert_eq!(page.content, "final retained text");
     assert!(page.available);
-    // This prepared source has not been exposed as a Buffered receipt. It must
-    // stay out of model projection while its actual cleanup owner remains live.
+    // This hidden producer charges both admission quotas without exposing a handle.
+    let (rows, capacity) = registry.model_observation();
+    assert!(rows.is_empty());
+    assert_eq!(capacity.buffers.used, 1);
+    assert_eq!(capacity.pending.used, 1);
+    assert_eq!(capacity.pending.remaining, 0);
     assert!(
-        !registry
-            .model_projection()
-            .iter()
-            .any(|row| row.execution_id == id)
+        registry
+            .admit_detached(row(), CancellationToken::new())
+            .is_err()
+    );
+    assert!(
+        registry
+            .start(row(), CancellationToken::new(), |_| async {
+                Ok(ToolOutput::text("must not run"))
+            })
+            .is_err()
     );
     {
         let state = registry.state.lock().unwrap();
@@ -478,6 +494,7 @@ async fn final_source_and_producer_elapsed_are_visible_before_slow_cleanup_ack()
     assert_eq!(registry.get(id).unwrap().elapsed_ms, elapsed);
     assert_eq!(registry.get(id).unwrap().status, ExecutionStatus::Succeeded);
     assert_released(&registry, id);
+    assert_eq!(registry.model_observation().1.pending.remaining, 1);
     registry.close().await.unwrap();
 }
 

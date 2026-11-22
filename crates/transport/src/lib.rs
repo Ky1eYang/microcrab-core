@@ -29,8 +29,8 @@ pub use anthropic::{Anthropic, AnthropicConfig};
 pub use client::{Client, ModelEvent};
 pub use config::{AuthMode, TransportConfig};
 pub use content::{
-    AgentExchange, CarrierEnvelopeVersion, Content, ContentItem, ExchangeIntent, StateFrame,
-    UserSource,
+    AgentExchange, CarrierEnvelopeVersion, Content, ContentItem, ExchangeIntent, ImportantInput,
+    StateFrame, UserSource,
 };
 pub use dispatcher::{TransportClient, create_client};
 pub use error::{

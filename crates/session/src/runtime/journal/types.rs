@@ -193,6 +193,13 @@ impl Recover {
                 ));
             }
         }
+        if let Some(witness) = &self.state.dialogue_turn {
+            witness.validate(
+                self.state.communication.as_ref(),
+                self.state.epoch_id,
+                self.state.last_turn_id(),
+            )?;
+        }
         if self.state.agent_init.len() > 128 {
             return Err(Error::config("initialization evidence capacity exceeded"));
         }

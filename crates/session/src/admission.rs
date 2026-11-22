@@ -1,5 +1,6 @@
 //! Content admission owns bounded measurement and policy; callers retain locks,
 //! identities and commit authority. A decision never asserts absence of effects.
+pub(crate) mod embedding;
 pub mod image;
 pub(crate) mod inbox;
 pub(crate) mod input;

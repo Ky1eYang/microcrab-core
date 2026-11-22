@@ -56,10 +56,53 @@ pub enum ContentItem {
 }
 
 /// Explicit framing version; absence preserves historical rendering.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CarrierEnvelopeVersion {
     V1,
+    /// V1 direct-user framing with a literal, Session-authored notice.
+    Important {
+        notice: ImportantInput,
+    },
+    /// V1 framing with a frozen display alias, never an authorization witness.
+    ExternalDialogue {
+        alias: String,
+    },
+}
+
+/// Bounded literal text in a trusted, frozen envelope. This type is not an
+/// `InputPart` and is never accepted from the serialized `SessionInput`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String")]
+pub struct ImportantInput(String);
+
+impl ImportantInput {
+    pub const MAX_BYTES: usize = 8192;
+
+    pub fn new(text: impl Into<String>) -> Result<Self, Error> {
+        let text = text.into();
+        if text.len() > Self::MAX_BYTES {
+            return Err(Error::Limit("important input byte budget".into()));
+        }
+        if text.trim().is_empty() || text.contains('\0') {
+            return Err(Error::config(
+                "important input must be nonblank and contain no NUL",
+            ));
+        }
+        Ok(Self(text))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<String> for ImportantInput {
+    type Error = Error;
+
+    fn try_from(text: String) -> Result<Self, Error> {
+        Self::new(text)
+    }
 }
 
 /// Trusted, durable carrier origin. Missing source is ordinary user input.

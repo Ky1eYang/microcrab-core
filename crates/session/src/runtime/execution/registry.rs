@@ -49,6 +49,53 @@ struct RegistryState {
     closed: bool,
     entries: BTreeMap<ExecutionId, Entry>,
 }
+impl RegistryState {
+    fn buffers_used(&self) -> usize {
+        self.entries
+            .values()
+            .filter(|entry| {
+                (entry.buffer.is_some() || entry.controller.is_some()) && !entry.released
+            })
+            .count()
+    }
+
+    fn pending_used(&self) -> usize {
+        self.entries
+            .values()
+            .filter(|entry| entry.row.status_projection().is_pending() && !entry.adopted)
+            .count()
+    }
+}
+
+/// Advisory occupancy of the live registry, not a reservation or a history count.
+#[derive(serde::Serialize)]
+pub(crate) struct ExecutionCapacity {
+    buffers: CapacitySlots,
+    pending: CapacitySlots,
+}
+
+#[derive(serde::Serialize)]
+struct CapacitySlots {
+    limit: usize,
+    used: usize,
+    remaining: usize,
+}
+
+impl CapacitySlots {
+    fn new(limit: usize, used: usize) -> Self {
+        Self {
+            limit,
+            used,
+            remaining: limit.saturating_sub(used),
+        }
+    }
+}
+
+struct CapturedRow {
+    row: ExecutionSnapshot,
+    controller: Option<Arc<dyn ExecutionController>>,
+}
+
 pub struct ExecutionRegistry {
     state: Mutex<RegistryState>,
     limits: Limits,
@@ -542,49 +589,70 @@ impl ExecutionRegistry {
     pub fn model_projection(&self) -> Vec<ExecutionSnapshot> {
         self.rows(false, true)
     }
-    fn rows(&self, bodies: bool, model: bool) -> Vec<ExecutionSnapshot> {
-        let rows: Vec<_> = {
-            let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            state
-                .entries
-                .values()
-                .filter(|e| !model || (e.exposed && !e.released))
-                .map(|e| {
-                    let mut row = if bodies {
-                        e.row.clone()
-                    } else {
-                        e.row.metadata()
-                    };
-                    row.output = e.buffer.as_ref().map(Buffer::metadata);
-                    // Persist the same authoritative availability emitted by live
-                    // metadata, so full -> metadata and restore -> metadata agree.
-                    row.output_availability = Some(if e.buffer.is_none() {
-                        super::OutputAvailability::None
-                    } else if e.released {
-                        super::OutputAvailability::Released
-                    } else {
-                        super::OutputAvailability::Retained
-                    });
-                    if bodies {
-                        row.delivery = Some(super::ExecutionDelivery {
-                            exposed: e.exposed,
-                            released: e.released,
-                        });
-                        if let Some(buffer) = &e.buffer {
-                            row.result = Some(buffer.persisted());
-                        }
-                    }
-                    (row, e.controller.clone())
-                })
-                .collect()
+    /// Capture row visibility and occupancy at the same registry instant. As
+    /// with other row readers, capability callbacks run outside the owner lock.
+    pub(crate) fn model_observation(&self) -> (Vec<ExecutionSnapshot>, ExecutionCapacity) {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let rows = Self::capture_rows(&state, false, true);
+        let capacity = ExecutionCapacity {
+            buffers: CapacitySlots::new(self.limits.max_execution_buffers, state.buffers_used()),
+            pending: CapacitySlots::new(self.limits.max_pending_executions, state.pending_used()),
         };
+        drop(state);
+        (Self::finish_rows(rows), capacity)
+    }
+    fn rows(&self, bodies: bool, model: bool) -> Vec<ExecutionSnapshot> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let rows = Self::capture_rows(&state, bodies, model);
+        drop(state);
+        Self::finish_rows(rows)
+    }
+    fn capture_rows(state: &RegistryState, bodies: bool, model: bool) -> Vec<CapturedRow> {
+        state
+            .entries
+            .values()
+            .filter(|e| !model || (e.exposed && !e.released))
+            .map(|e| {
+                let mut row = if bodies {
+                    e.row.clone()
+                } else {
+                    e.row.metadata()
+                };
+                row.output = e.buffer.as_ref().map(Buffer::metadata);
+                // Persist the same authoritative availability emitted by live
+                // metadata, so full -> metadata and restore -> metadata agree.
+                row.output_availability = Some(if e.buffer.is_none() {
+                    super::OutputAvailability::None
+                } else if e.released {
+                    super::OutputAvailability::Released
+                } else {
+                    super::OutputAvailability::Retained
+                });
+                if bodies {
+                    row.delivery = Some(super::ExecutionDelivery {
+                        exposed: e.exposed,
+                        released: e.released,
+                    });
+                    if let Some(buffer) = &e.buffer {
+                        row.result = Some(buffer.persisted());
+                    }
+                }
+                CapturedRow {
+                    row,
+                    controller: e.controller.clone(),
+                }
+            })
+            .collect()
+    }
+    fn finish_rows(rows: Vec<CapturedRow>) -> Vec<ExecutionSnapshot> {
         rows.into_iter()
-            .map(|(mut row, controller)| {
-                row.capabilities = controller
+            .map(|mut captured| {
+                captured.row.capabilities = captured
+                    .controller
                     .as_ref()
-                    .map(|c| c.capabilities())
+                    .map(|controller| controller.capabilities())
                     .unwrap_or_default();
-                row
+                captured.row
             })
             .collect()
     }
@@ -1053,17 +1121,7 @@ impl ExecutionRegistry {
             return Err(Error::Closed);
         }
         if row.execution_id.0 == 0 {
-            let required = state
-                .entries
-                .values()
-                .filter(|entry| entry.row.status_projection().is_pending() && !entry.adopted)
-                .count()
-                .saturating_add(1);
-            crate::budget::check(
-                crate::LimitKind::PendingExecutions,
-                required,
-                self.limits.max_pending_executions,
-            )?;
+            self.check_pending_admission(&state)?;
         }
         let terminal: Vec<_> = state
             .entries
@@ -1228,6 +1286,14 @@ impl ExecutionRegistry {
             detached: false,
         })
     }
+    fn check_pending_admission(&self, state: &RegistryState) -> Result<(), Error> {
+        crate::budget::check(
+            crate::LimitKind::PendingExecutions,
+            state.pending_used().saturating_add(1),
+            self.limits.max_pending_executions,
+        )
+    }
+
     pub(crate) fn admit_detached(
         self: &Arc<Self>,
         mut row: ExecutionSnapshot,
@@ -1237,17 +1303,7 @@ impl ExecutionRegistry {
         if state.closed {
             return Err(Error::Closed);
         }
-        let required = state
-            .entries
-            .values()
-            .filter(|entry| entry.row.status_projection().is_pending() && !entry.adopted)
-            .count()
-            .saturating_add(1);
-        crate::budget::check(
-            crate::LimitKind::PendingExecutions,
-            required,
-            self.limits.max_pending_executions,
-        )?;
+        self.check_pending_admission(&state)?;
         let terminal: Vec<_> = state
             .entries
             .iter()
@@ -1350,15 +1406,7 @@ impl ExecutionRegistry {
         if state.closed {
             return Err(Error::Closed);
         }
-        if state
-            .entries
-            .values()
-            .filter(|entry| {
-                (entry.buffer.is_some() || entry.controller.is_some()) && !entry.released
-            })
-            .count()
-            >= self.limits.max_execution_buffers
-        {
+        if state.buffers_used() >= self.limits.max_execution_buffers {
             let mut diagnostic = crate::observation::diagnostics::ToolDiagnostic::new(
                 crate::observation::diagnostics::DiagnosticCode::OutputLimit,
                 crate::observation::diagnostics::DiagnosticLayer::Runtime,

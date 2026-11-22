@@ -47,6 +47,21 @@ pub trait Client: Send + Sync + 'static {
     ) {
     }
 
+    /// Exact runtime reservation for the last admitted item, a tool result.
+    /// The assistant item and call slot refer to this same admitted prefix.
+    /// This is display evidence only; it cannot reject or replay a tool result.
+    async fn observe_tool_result_admitted(
+        &self,
+        epoch: u64,
+        items: &[crate::ContentItem],
+        _assistant_index: usize,
+        _call_index: usize,
+        _execution_id: u64,
+        _terminal_status: Option<&str>,
+    ) {
+        self.observe_admitted(epoch, items, None).await;
+    }
+
     /// Exact committed input occurrences from Session admission. Item indices refer
     /// to this epoch's admitted items, never text or request timing. Observation
     /// cannot reject committed input or authorize its replay.

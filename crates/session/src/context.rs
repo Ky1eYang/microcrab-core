@@ -11,11 +11,18 @@ pub mod system;
 use crate::error::Error;
 
 use microcrab_protocol::{InputPart, Response, SessionInput, ToolDefinition};
-use microcrab_transport::StateFrame;
+use microcrab_transport::{CarrierEnvelopeVersion, ImportantInput, StateFrame, UserSource};
 use serde_json::{Map, Value};
 use std::collections::{BTreeSet, HashSet};
 
 pub use microcrab_transport::{Content, ContentItem};
+
+pub(crate) fn latest_direct_user(items: &[ContentItem]) -> Option<&ContentItem> {
+    items
+        .iter()
+        .rev()
+        .find(|item| matches!(item, ContentItem::User { source: None, .. }))
+}
 
 /// Validate and canonicalize Context's state snapshot; text rendering belongs to
 /// transport. Reject nonobjects before constructing an owned frame.
@@ -98,6 +105,39 @@ impl Context {
         (self.epoch, &self.items)
     }
 
+    /// Project only the latest genuine direct input for a clean permission review.
+    /// This also works while an admitted assistant still has pending tool calls.
+    pub(crate) fn review_issuer(&self, max_output_tokens: u32) -> Content {
+        // A retained compaction summary renders as a user message, but is not intent.
+        let items = if self.compaction.is_some() {
+            self.items
+                .iter()
+                .position(|item| matches!(item, ContentItem::User { .. }))
+                .map_or(&[][..], |index| &self.items[index + 1..])
+        } else {
+            &self.items[..]
+        };
+        Content {
+            epoch: self.epoch,
+            subagent: None,
+            system: "Permission review".into(),
+            items: latest_direct_user(items).cloned().into_iter().collect(),
+            tools: vec![],
+            max_output_tokens,
+            max_bytes: self.max_bytes,
+            turn_id: None,
+            round: None,
+        }
+    }
+
+    pub(crate) fn initialization_review_issuer(
+        &self,
+        max_output_tokens: u32,
+    ) -> Result<Content, Error> {
+        self.validate_content(max_output_tokens)?;
+        Ok(self.review_issuer(max_output_tokens))
+    }
+
     pub fn new(
         system: String,
         mut tools: Vec<ToolDefinition>,
@@ -150,6 +190,10 @@ impl Context {
         };
         context.check_budget(&context.items)?;
         Ok(context)
+    }
+
+    pub(crate) fn frozen_tools(&self) -> &[ToolDefinition] {
+        &self.tools
     }
 
     /// Current model-facing byte budget. Callers compare measurements against it
@@ -219,6 +263,22 @@ impl Context {
                 }
                 next.committed_state = Some(state.clone());
             } else {
+                if matches!(
+                    item,
+                    ContentItem::User {
+                        envelope: Some(CarrierEnvelopeVersion::Important { .. }),
+                        ..
+                    }
+                ) && !matches!(next.items.last(), Some(ContentItem::State(_)))
+                {
+                    // Recovery may have coalesced an unchanged admission frame.
+                    // This envelope still owns a frame before its notice.
+                    next.items.push(ContentItem::State(StateFrame::patch(
+                        Map::new(),
+                        Vec::new(),
+                        None,
+                    )));
+                }
                 next.items.push(item);
             }
         }
@@ -300,7 +360,19 @@ impl Context {
         input: impl Into<SessionInput>,
         state: &Value,
     ) -> Result<(), Error> {
-        self.admit_input_run(vec![(input.into(), None)], state)
+        self.admit_user_with_important(input.into(), state, None)
+    }
+
+    pub(crate) fn admit_user_with_important(
+        &mut self,
+        input: SessionInput,
+        state: &Value,
+        important: Option<ImportantInput>,
+    ) -> Result<(), Error> {
+        let envelope = important.map_or(CarrierEnvelopeVersion::V1, |notice| {
+            CarrierEnvelopeVersion::Important { notice }
+        });
+        self.admit_input_run([(input, None, envelope)], state)
     }
 
     pub(crate) fn admit_framework(
@@ -308,8 +380,12 @@ impl Context {
         input: SessionInput,
         state: &Value,
     ) -> Result<(), Error> {
-        self.admit_carriers(
-            vec![(input, microcrab_transport::UserSource::Framework)],
+        self.admit_input_run(
+            [(
+                input,
+                Some(UserSource::Framework),
+                CarrierEnvelopeVersion::V1,
+            )],
             state,
         )
     }
@@ -319,25 +395,25 @@ impl Context {
     /// Direct user input uses admit_user and cannot absorb this non-user run.
     pub(crate) fn admit_carriers(
         &mut self,
-        carriers: Vec<(SessionInput, microcrab_transport::UserSource)>,
+        carriers: Vec<(SessionInput, UserSource, CarrierEnvelopeVersion)>,
         state: &Value,
     ) -> Result<(), Error> {
         self.admit_input_run(
             carriers
                 .into_iter()
-                .map(|(input, source)| (input, Some(source)))
-                .collect(),
+                .map(|(input, source, envelope)| (input, Some(source), envelope)),
             state,
         )
     }
 
     fn admit_input_run(
         &mut self,
-        inputs: Vec<(SessionInput, Option<microcrab_transport::UserSource>)>,
+        inputs: impl IntoIterator<Item = (SessionInput, Option<UserSource>, CarrierEnvelopeVersion)>,
         state: &Value,
     ) -> Result<(), Error> {
         self.require_settled()?;
-        if inputs.is_empty() {
+        let mut inputs = inputs.into_iter().peekable();
+        if inputs.peek().is_none() {
             return Err(Error::config("carrier admission must not be empty"));
         }
         let mut items = self.items.clone();
@@ -347,12 +423,12 @@ impl Context {
             .state_frame(state)?
             .unwrap_or_else(|| StateFrame::patch(Map::new(), Vec::new(), None));
         items.push(ContentItem::State(frame));
-        for (input, source) in inputs {
+        for (input, source, envelope) in inputs {
             crate::admission::input::validate_resolved(&input, self.max_bytes)?;
             items.push(ContentItem::User {
                 parts: input.parts,
                 source,
-                envelope: Some(microcrab_transport::CarrierEnvelopeVersion::V1),
+                envelope: Some(envelope),
             });
         }
         let mut candidate = self.clone();
@@ -480,13 +556,17 @@ impl Context {
         Ok(())
     }
 
-    /// Assemble system, judged state, user text, and tools for the LLM client.
-    pub fn content(&self, max_output_tokens: u32) -> Result<Content, Error> {
+    fn validate_content(&self, max_output_tokens: u32) -> Result<(), Error> {
         self.require_settled()?;
         if max_output_tokens == 0 {
             return Err(Error::config("max output tokens must be positive"));
         }
-        self.check_budget(&self.items)?;
+        self.check_budget(&self.items)
+    }
+
+    /// Assemble system, judged state, user text, and tools for the LLM client.
+    pub fn content(&self, max_output_tokens: u32) -> Result<Content, Error> {
+        self.validate_content(max_output_tokens)?;
         Ok(Content {
             epoch: self.epoch,
             subagent: None,

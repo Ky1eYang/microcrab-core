@@ -1,5 +1,7 @@
 //! Durable conversational identity and disclosed correspondents, never credentials.
 pub mod inbox;
+pub mod reply;
+pub mod turn;
 use crate::Error;
 use serde::{Deserialize, Serialize};
 

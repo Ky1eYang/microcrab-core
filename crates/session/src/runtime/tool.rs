@@ -4,8 +4,9 @@ mod catalog;
 mod context;
 pub mod delegate;
 pub mod expand;
-mod messaging;
+pub(crate) mod external_dialogue;
 pub(crate) mod injection;
+mod messaging;
 pub(crate) mod secret;
 pub mod sleep;
 pub(crate) mod switch_mode;
@@ -107,6 +108,7 @@ pub enum BuiltinTool {
     SwitchMode,
     SendMessage,
     Escalate,
+    ReplyExternalSpeaker,
 }
 
 impl BuiltinTool {
@@ -119,6 +121,7 @@ impl BuiltinTool {
             "switch_mode" => Some(Self::SwitchMode),
             "send_message" => Some(Self::SendMessage),
             "escalate" => Some(Self::Escalate),
+            external_dialogue::NAME => Some(Self::ReplyExternalSpeaker),
             _ => None,
         }
     }
@@ -132,6 +135,7 @@ impl BuiltinTool {
             Self::SwitchMode => switch_mode::SwitchMode::definition(),
             Self::SendMessage => messaging::SendMessage.definition(),
             Self::Escalate => messaging::Escalate.definition(),
+            Self::ReplyExternalSpeaker => external_dialogue::ReplyExternalSpeaker.definition(),
         }
     }
 
@@ -144,6 +148,7 @@ impl BuiltinTool {
             Self::SwitchMode => Arc::new(switch_mode::SwitchMode),
             Self::SendMessage => Arc::new(messaging::SendMessage),
             Self::Escalate => Arc::new(messaging::Escalate),
+            Self::ReplyExternalSpeaker => Arc::new(external_dialogue::ReplyExternalSpeaker),
         }
     }
 }

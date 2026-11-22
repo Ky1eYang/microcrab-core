@@ -506,6 +506,8 @@ impl SessionInner {
         if let Some(route) = &self.route {
             route.validate_restore(&recover).await?;
         }
+        self.reconcile_recovered_dialogues(recover.state.dialogue_turn.as_ref())
+            .await?;
         let refresh = self.refresh_required(&recover);
         let selected_history = self.journal.has_selected_history().await;
         let (recover, context) = if refresh {
@@ -780,6 +782,9 @@ impl SessionInner {
             inner.flush_durable_carrier_consumption_locked().await?;
             inner.journal.recovered(recover.clone()).await?;
             inner.remember_durable_carrier_consumption(&recover)?;
+            inner
+                .reconcile_recovered_dialogues(recover.state.dialogue_turn.as_ref())
+                .await?;
             let selected_recover = recover;
             let recover = live_recover;
             if let Some(route) = &inner.route {

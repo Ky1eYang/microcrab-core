@@ -104,15 +104,12 @@ impl SessionInner {
         input: crate::SessionInput,
         steer: bool,
         submission_operation_id: Option<String>,
+        admission_resolver: Option<Arc<dyn crate::InputAdmissionResolver>>,
     ) -> Result<(), Error> {
         self.ensure_model_open()?;
         {
             let mut inbox = self.inbox.state.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(operation) = submission_operation_id {
-                inbox.enqueue_submission(input, steer, Some(operation))?;
-            } else {
-                inbox.enqueue(input, steer)?;
-            }
+            inbox.enqueue_submission(input, steer, submission_operation_id, admission_resolver)?;
         }
         self.start_inbox_dispatcher();
         self.inbox.steering_changed.notify_waiters();
@@ -126,6 +123,7 @@ impl SessionInner {
         self: &Arc<Self>,
         input: crate::SessionInput,
         submission_operation_id: Option<String>,
+        admission_resolver: Option<Arc<dyn crate::InputAdmissionResolver>>,
     ) -> Result<(), Error> {
         self.ensure_model_open()?;
         // Foreground is the execution/recovery owner, including pre-worker
@@ -141,7 +139,7 @@ impl SessionInner {
             }
             // Admission must succeed before clearing pause, under the same lock.
             // Existing older entries retain FIFO precedence over this new input.
-            inbox.enqueue_submission(input, false, submission_operation_id)?;
+            inbox.enqueue_submission(input, false, submission_operation_id, admission_resolver)?;
             if idle.is_some() {
                 self.explicit_activation.store(true, Ordering::Release);
                 inbox.paused = false;
@@ -288,7 +286,7 @@ impl SessionInner {
             .await?;
             input.variables.overlay(&injection.variables);
             hook_state.apply_change(input.variables.clone())?;
-            prepared.push(input);
+            prepared.push((input, None));
         }
         let facts = serde_json::to_value(
             snapshot
@@ -330,6 +328,23 @@ impl SessionInner {
         )
         .await?;
         let _fence = self.endpoint.fence().await?;
+        let mut embedding_admissions = Vec::new();
+        for (user, (input, important)) in snapshot.users.iter().zip(&mut prepared) {
+            let Some(resolver) = user.admission_resolver.as_deref() else {
+                continue;
+            };
+            let mut decision = crate::admission::embedding::resolve(
+                Some(resolver),
+                crate::InputAdmissionBoundary::Steer,
+                input,
+                cancellation,
+            )
+            .await
+            .map_err(|error| self.inbox_rejection(error))?;
+            input.variables.overlay(&decision.variables);
+            *important = decision.important.take();
+            embedding_admissions.push(decision);
+        }
         let original = self.state.preview();
         let preview = original.preview();
         let (candidate, _merged) = crate::admission::input::stage_step(
@@ -377,6 +392,9 @@ impl SessionInner {
                     .map(|entry| entry.id)
                     .collect::<Vec<_>>(),
             );
+        for decision in embedding_admissions {
+            decision.commit();
+        }
         // Claims are consumed before fallible external observation can run.
         if !submissions.is_empty() {
             self.client

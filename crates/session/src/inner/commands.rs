@@ -349,7 +349,8 @@ impl SessionInner {
                     arguments: serde_json::json!({"component":lifecycle.component(),"imports":lifecycle.import_scope(),"trust":"Approval trusts this component to use its linked Host imports during this initialization attempt."}),
                     revision: snapshot.revision,
                 };
-                let issuer = context.content(self.state().limits.max_output_tokens)?;
+                let issuer =
+                    context.initialization_review_issuer(self.state().limits.max_output_tokens)?;
                 let mut row = ExecutionSnapshot::new(
                     invocation.session_id.clone(),
                     call_id,
@@ -647,6 +648,13 @@ impl SessionInner {
                                     persistence_failed: previous.persistence_failed,
                                 };
                             }
+                            let reply_settlement = if discard_snapshot {
+                                Ok(())
+                            } else {
+                                inner.settle_live_external_dialogues(
+                                    crate::state::communication::reply::DialogueTerminalReason::Cancelled,
+                                ).await
+                            };
                             inner.state.close_wasm();
                             let boundary = inner
                                 .boundary(
@@ -681,7 +689,7 @@ impl SessionInner {
                             });
                             super::SessionCloseOutcome {
                                 cleanup_pending,
-                                terminal_failed: boundary.and(audit).is_err(),
+                                terminal_failed: boundary.and(audit).and(reply_settlement).is_err(),
                                 persistence_failed,
                             }
                         })
@@ -692,6 +700,7 @@ impl SessionInner {
                         } else {
                             AssertUnwindSafe(inner.journal.close()).catch_unwind().await
                         };
+                        inner.release_dialogue_reply_store().await;
                         inner.endpoint.shutdown();
                         let outcome = match result {
                             Ok(mut outcome) => {

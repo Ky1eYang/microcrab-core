@@ -176,6 +176,10 @@ impl Variables {
         let mut invisible = std::collections::BTreeSet::new();
         let mut secret = std::collections::BTreeSet::new();
         for (key, entry) in &self.entries {
+            // An inherited value shadowed by the framework is not injectable.
+            if key == crate::admission::variables::EXECUTION_CAPACITY_KEY {
+                continue;
+            }
             match entry.metadata.visibility {
                 VariableVisibility::Visible => {
                     visible.insert(key.clone(), entry.value.clone());
@@ -257,7 +261,11 @@ impl Variables {
         invisible: Map<String, Value>,
     ) -> Result<(), Error> {
         for (name, value) in invisible {
-            super::access::validate_custom_key(&name)?;
+            // Historical checkpoints could use this name before it became a
+            // framework key. Keep their bytes; the live projection owns the key.
+            if name != crate::admission::variables::EXECUTION_CAPACITY_KEY {
+                super::access::validate_custom_key(&name)?;
+            }
             if self.get_all(&name).is_some() {
                 return Err(Error::config("duplicate persisted variable name"));
             }

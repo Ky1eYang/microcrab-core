@@ -62,6 +62,9 @@ pub(crate) fn prepare_configured(
         "action_review" => &config.action_review_template,
         _ => return Err(Error::config("unknown configured helper")),
     };
+    if name == "action_review" {
+        return action_review::prepare_review(issuer, template, bindings);
+    }
     entry.definition().prepare_markdown(
         if template.is_empty() {
             entry.prompt
@@ -144,6 +147,9 @@ pub fn prepare(
         .iter()
         .find(|entry| entry.name == name && entry.source == source)
         .ok_or_else(|| Error::config("unknown functional subagent for this source"))?;
+    if name == "action_review" {
+        return action_review::prepare_review(issuer, entry.prompt, bindings);
+    }
     entry
         .definition()
         .prepare_markdown(entry.prompt, issuer, bindings)

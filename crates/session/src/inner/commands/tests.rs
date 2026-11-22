@@ -66,6 +66,7 @@ fn session(
     journal: Arc<dyn crate::runtime::journal::Journal>,
 ) -> Arc<SessionInner> {
     SessionInner::new(SessionParts {
+        dialogue_reply_store: None,
         kind: crate::SessionKind::Interactive,
         communication: None,
         client,

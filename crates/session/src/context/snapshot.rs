@@ -122,9 +122,11 @@ impl Context {
             .used_call_ids
             .extend(snapshot.retired_call_ids.iter().cloned());
         let mut projected: Option<Value> = None;
+        let mut leading_state = false;
         for item in &snapshot.items {
             match item {
                 ContentItem::State(frame) => {
+                    leading_state = true;
                     context.require_settled()?;
                     match frame {
                         StateFrame::StateSnapshot { state } => {
@@ -154,7 +156,19 @@ impl Context {
                         }
                     }
                 }
-                ContentItem::User { parts, .. } => {
+                ContentItem::User {
+                    parts,
+                    source,
+                    envelope,
+                } => {
+                    if matches!(envelope, Some(CarrierEnvelopeVersion::Important { .. }))
+                        && (!leading_state || source.is_some())
+                    {
+                        return Err(Error::protocol(
+                            "restored important input requires a fresh State frame and a direct user carrier",
+                        ));
+                    }
+                    leading_state = false;
                     context.require_settled()?;
                     crate::admission::input::validate_historical(
                         &SessionInput {
@@ -170,6 +184,7 @@ impl Context {
                     provider_metadata,
                 } => {
                     context.require_settled()?;
+                    leading_state = false;
                     let response = Response {
                         provider_metadata: provider_metadata.clone(),
                         content: content.clone(),
@@ -194,6 +209,7 @@ impl Context {
                     }
                 }
                 ContentItem::Tool { call_id, parts, .. } => {
+                    leading_state = false;
                     crate::admission::image::validate_tool_parts(parts)?;
                     if !context.pending_calls.remove(call_id) {
                         return Err(Error::protocol("orphan restored tool result"));

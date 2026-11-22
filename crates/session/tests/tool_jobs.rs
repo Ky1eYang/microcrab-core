@@ -859,7 +859,19 @@ async fn current_state_removes_each_released_buffer_then_final_key_and_replays_e
     use microcrab_session::context::ContentItem;
     use microcrab_transport::{StateFrame, apply_state_patch};
     let root = tempfile::tempdir().unwrap();
-    let f = fixture(&root, "state-removal", Limits::default());
+    let f = fixture(
+        &root,
+        "state-removal",
+        Limits {
+            max_execution_buffers: 2,
+            max_pending_executions: 1,
+            ..Limits::default()
+        },
+    );
+    let full = json!({
+        "buffers": {"limit": 2, "used": 2, "remaining": 0},
+        "pending": {"limit": 1, "used": 0, "remaining": 1}
+    });
     let first = f.start(waiting(), 0).await.unwrap();
     let second = f.start(waiting(), 0).await.unwrap();
     f.finish(id(&first), "retained first").await;
@@ -867,6 +879,21 @@ async fn current_state_removes_each_released_buffer_then_final_key_and_replays_e
     f.session.submit("observe terminal buffers").await.unwrap();
     let before = f.session.messages();
     let readable = f.session.state_view().unwrap();
+    assert_eq!(readable["execution_capacity"], full);
+    let state = f.session.state_handle();
+    let inspection = state.inspection().unwrap();
+    assert_eq!(inspection.values["execution_capacity"], full);
+    let descriptor = &inspection.descriptors["execution_capacity"];
+    assert_eq!(descriptor.kind, "framework");
+    assert!(!descriptor.editable && !descriptor.owner_editable && !descriptor.deletable);
+    assert!(
+        state
+            .patch(json!({"execution_capacity": "forged"}))
+            .await
+            .is_err()
+    );
+    assert!(state.remove("execution_capacity").await.is_err());
+    assert!(state.extract("execution_capacity").is_none());
     assert_eq!(readable["executions"].as_array().unwrap().len(), 2);
     assert_eq!(f.session.state().executions.len(), 2);
     assert!(
@@ -879,18 +906,24 @@ async fn current_state_removes_each_released_buffer_then_final_key_and_replays_e
     // Reading all terminal bytes never releases the owner's retained output.
     assert!(f.read(id(&first), 0, 65536).unwrap().closed);
     assert_eq!(f.session.state().executions.len(), 2);
+    assert_eq!(f.session.state_view().unwrap()["execution_capacity"], full);
     f.invoke("job", json!({"id":id(&first),"action":"release"}))
         .await
         .unwrap();
     let after_first = f.session.state_view().unwrap();
+    assert_eq!(
+        after_first["execution_capacity"]["buffers"],
+        json!({"limit": 2, "used": 1, "remaining": 1})
+    );
     assert_eq!(after_first["executions"].as_array().unwrap().len(), 1);
     assert_eq!(
         after_first["executions"][0]["execution_id"],
         second["execution_id"]
     );
     assert!(f.session.messages().iter().any(|item| matches!(item,
-        ContentItem::State(StateFrame::StatePatch { execution_delta: Some(delta), .. })
-        if delta["remove"].as_array().unwrap().iter().any(|row| row["execution_id"] == first["execution_id"])
+        ContentItem::State(StateFrame::StatePatch { set, execution_delta: Some(delta), .. })
+        if set.get("execution_capacity") == Some(&after_first["execution_capacity"])
+            && delta["remove"].as_array().unwrap().iter().any(|row| row["execution_id"] == first["execution_id"])
     )));
     f.invoke("job", json!({"id":id(&second),"action":"release"}))
         .await
@@ -916,6 +949,13 @@ async fn current_state_removes_each_released_buffer_then_final_key_and_replays_e
         }
     }
     assert!(replayed.get("executions").is_none());
+    assert_eq!(
+        replayed["execution_capacity"],
+        json!({
+            "buffers": {"limit": 2, "used": 0, "remaining": 2},
+            "pending": {"limit": 1, "used": 0, "remaining": 1}
+        })
+    );
     let frozen = serde_json::to_value(f.session.context_snapshot().unwrap()).unwrap();
     let restored =
         microcrab_session::context::Context::from_snapshot(f.session.context_snapshot().unwrap())

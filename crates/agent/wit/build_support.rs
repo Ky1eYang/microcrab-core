@@ -6,8 +6,8 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-/// Stage one guest-owned world and canonical dependencies, never source copies.
-/// Runtime additionally stages its own optional services in the root package.
+/// Stage an owned world and its canonical WIT dependencies into OUT_DIR.
+/// The Session runtime world shares the root package with the variables interface.
 pub fn stage(manifest: &Path, world: &str, runtime: bool) -> io::Result<PathBuf> {
     // Crates may have their own AGENTS.md; instruction scope is not a source
     // root marker. Locate the two canonical packages needed by every world.
@@ -22,7 +22,9 @@ pub fn stage(manifest: &Path, world: &str, runtime: bool) -> io::Result<PathBuf>
         std::env::var_os("OUT_DIR")
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "OUT_DIR"))?,
     )
-    .join("wit");
+    // Use a fresh staging layout so reused OUT_DIRs cannot carry forward
+    // removed dependency packages that WIT tooling would still discover.
+    .join("wit-session-abi");
     copy(&manifest.join("wit").join(world), &out.join("world.wit"))?;
     copy(
         &root.join("crates/agent/wit/wit/agent.wit"),
@@ -32,16 +34,15 @@ pub fn stage(manifest: &Path, world: &str, runtime: bool) -> io::Result<PathBuf>
         &root.join("crates/host/wit/host.wit"),
         &out.join("deps/host/host.wit"),
     )?;
+    let variables = if runtime {
+        out.join("scoped-variables.wit")
+    } else {
+        out.join("deps/session/scoped-variables.wit")
+    };
     copy(
         &root.join("crates/session/wit/scoped-variables.wit"),
-        &out.join("deps/session-scoped/scoped-variables.wit"),
+        &variables,
     )?;
-    if runtime {
-        copy(
-            &manifest.join("wit/services.wit"),
-            &out.join("services.wit"),
-        )?;
-    }
     Ok(out)
 }
 

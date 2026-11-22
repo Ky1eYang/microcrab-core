@@ -98,6 +98,96 @@ async fn restore_is_unstarted_and_announces_restoration_when_started() {
     restored.close().await.unwrap();
 }
 
+#[tokio::test]
+async fn execution_capacity_arrives_as_next_model_patch_after_legacy_restore() {
+    use microcrab_transport::{StateFrame, apply_state_patch};
+
+    let limits = microcrab_session::Limits {
+        max_execution_buffers: 1,
+        max_pending_executions: 1,
+        ..Default::default()
+    };
+    let original = Session::builder(Script::new(vec![Ok(answer("saved"))]), empty_runtime())
+        .limits(limits.clone())
+        .build()
+        .unwrap();
+    original.submit("legacy input").await.unwrap();
+    let mut saved = original.checkpoint().await.unwrap();
+    original.close().await.unwrap();
+
+    // Reproduce a checkpoint written before the new framework key existed.
+    for item in &mut saved.context.items {
+        match item {
+            ContentItem::State(StateFrame::StateSnapshot { state }) => {
+                state.as_object_mut().unwrap().remove("execution_capacity");
+            }
+            ContentItem::State(StateFrame::StatePatch { set, .. }) => {
+                set.remove("execution_capacity");
+            }
+            _ => {}
+        }
+    }
+    saved
+        .context
+        .committed_state
+        .as_mut()
+        .unwrap()
+        .as_object_mut()
+        .unwrap()
+        .remove("execution_capacity");
+    let legacy_items = serde_json::to_vec(&saved.context.items).unwrap();
+    let legacy_len = saved.context.items.len();
+    let legacy_epoch = saved.context.epoch;
+    assert!(
+        serde_json::to_value(&saved.state)
+            .unwrap()
+            .get("execution_capacity")
+            .is_none()
+    );
+
+    let client = Arc::new(Script::new(vec![Ok(answer("resumed"))]));
+    let restored = Session::restore(
+        Session::builder_arc(client.clone(), empty_runtime()).limits(limits),
+        saved,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        serde_json::to_vec(&restored.messages()).unwrap(),
+        legacy_items
+    );
+    let expected = json!({
+        "buffers": {"limit": 1, "used": 0, "remaining": 1},
+        "pending": {"limit": 1, "used": 0, "remaining": 1}
+    });
+    assert_eq!(
+        restored.state_view().unwrap()["execution_capacity"],
+        expected
+    );
+    restored.submit("next input").await.unwrap();
+    {
+        let requests = client.seen.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        let request = &requests[0];
+        assert_eq!(request.epoch, legacy_epoch);
+        assert_eq!(
+            serde_json::to_vec(&request.items[..legacy_len]).unwrap(),
+            legacy_items
+        );
+        assert!(matches!(&request.items[legacy_len],
+            ContentItem::State(StateFrame::StatePatch { set, .. })
+            if set.get("execution_capacity") == Some(&expected)));
+        let mut projected = json!({});
+        for item in &request.items {
+            if let ContentItem::State(frame) = item {
+                apply_state_patch(&mut projected, frame).unwrap();
+            }
+        }
+        assert_eq!(projected["execution_capacity"], expected);
+    }
+    restored.close().await.unwrap();
+}
+
 struct Effect {
     calls: Arc<AtomicUsize>,
     path: Option<PathBuf>,

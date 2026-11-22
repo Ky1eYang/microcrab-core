@@ -331,7 +331,100 @@ async fn failing_context_ack_fences_concurrent_append_and_retains_accepted_carri
 }
 
 #[tokio::test]
-async fn acknowledged_context_sidecar_failure_reports_consumed_and_never_replays_on_travel() {
+async fn dialogue_mixed_admission_renders_exact_alias_and_live_retry_keeps_same_turn() {
+    struct OnceFailed(Capture, std::sync::atomic::AtomicBool);
+    #[async_trait::async_trait]
+    impl crate::Client for OnceFailed {
+        async fn complete(
+            &self,
+            content: &crate::context::Content,
+            auditor: &dyn microcrab_auditor::Auditor,
+            variables: &dyn microcrab_auditor::VariableView,
+            cancel: CancellationToken,
+        ) -> Result<microcrab_protocol::Response, microcrab_transport::Error> {
+            let result = self.0.complete(content, auditor, variables, cancel).await;
+            if self.1.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                Err(microcrab_transport::Error::ProviderTimeout)
+            } else {
+                result
+            }
+        }
+    }
+    let model = Arc::new(OnceFailed(Capture(Default::default()), true.into()));
+    let journal = MemoryJournal::new();
+    let session = crate::Session::builder_arc(
+        model.clone(),
+        Runtime::new(vec![], Arc::new(crate::runtime::tool::DenyAll)).unwrap(),
+    )
+    .system("fixed")
+    .journal(journal.clone())
+    .build()
+    .unwrap();
+    session.inner.inbox.state.lock().unwrap().paused = true;
+    session
+        .replace_external_speakers(vec![ExternalSpeaker {
+            identity: "speaker".into(),
+        }])
+        .await
+        .unwrap();
+    session
+        .enqueue_external("old".into(), "speaker".into(), "legacy".into())
+        .await
+        .unwrap();
+    let proof = crate::state::communication::inbox::ExternalCredentialIncarnation::new([7; 32]);
+    let bound = session
+        .enqueue_authenticated_external("new".into(), "speaker".into(), "<auth>".into(), proof)
+        .await
+        .unwrap();
+    assert!(matches!(
+        session.resume().await,
+        Err(Error::ProviderTimeout)
+    ));
+    assert!(session.retry_ready());
+    let live = session.inner.state.live_dialogue_turn().unwrap();
+    let (owner, _, turn, receipts) = live.exact_parts();
+    assert_eq!(owner, &session.communication_identity().unwrap().agent_id);
+    assert_eq!(turn.number(), 1);
+    assert_eq!(receipts.len(), 1);
+    assert_eq!(
+        receipts[0].receipt,
+        crate::state::communication::inbox::QueuedReceipt {
+            status: DeliveryStatus::Consumed,
+            ..bound.receipt
+        }
+    );
+    let failed = journal.latest().unwrap();
+    assert!(failed.continuation.as_ref().unwrap().request_prepared);
+    assert_eq!(failed.state.dialogue_turn, Some(live.clone()));
+    let restored = crate::Session::restore(builder().journal(journal.clone()), failed)
+        .await
+        .unwrap();
+    assert!(restored.retry_ready());
+    assert!(restored.inner.state.live_dialogue_turn().is_none());
+    session.resume().await.unwrap();
+    assert!(session.inner.state.live_dialogue_turn().is_none());
+    assert_eq!(journal.latest().unwrap().state.dialogue_turn, Some(live));
+    {
+        let calls = model.0.0.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        let request = microcrab_transport::render_ast(&calls[0]).unwrap();
+        assert_eq!(request, microcrab_transport::render_ast(&calls[1]).unwrap());
+        let microcrab_protocol::Message::User { parts } = &request.messages[1] else {
+            panic!("expected carrier run")
+        };
+        let rendered = serde_json::to_string(parts).unwrap();
+        assert!(rendered.contains("<external_speaker>\\nlegacy"));
+        assert!(rendered.contains(&format!(
+            "<external_speaker id=\\\"{}\\\">\\n&lt;auth&gt;",
+            bound.dialogue_id
+        )));
+    }
+    session.submit("next Turn").await.unwrap();
+    assert!(journal.latest().unwrap().state.dialogue_turn.is_none());
+}
+
+#[tokio::test]
+async fn dialogue_checkpoint_before_sidecar_ack_retains_exact_consume_certificate() {
     use crate::runtime::journal::{Journal, Recover};
     struct FailConsumption {
         memory: MemoryJournal,
@@ -393,11 +486,13 @@ async fn acknowledged_context_sidecar_failure_reports_consumed_and_never_replays
         }])
         .await
         .unwrap();
-    session
-        .enqueue_external(
+    let proof = crate::state::communication::inbox::ExternalCredentialIncarnation::new([7; 32]);
+    let queued = session
+        .enqueue_authenticated_external(
             "consumed-before-provider".into(),
             "speaker".into(),
             "accepted".into(),
+            proof.clone(),
         )
         .await
         .unwrap();
@@ -416,15 +511,47 @@ async fn acknowledged_context_sidecar_failure_reports_consumed_and_never_replays
     );
     assert_eq!(
         session
-            .delivery_receipt("consumed-before-provider")
+            .authenticated_external_receipt("consumed-before-provider", "speaker", &proof)
             .await
             .unwrap()
             .unwrap()
+            .receipt
             .status,
         DeliveryStatus::Consumed
     );
     let consumed = journal.memory.latest().unwrap();
     let id = session.communication_identity().unwrap().agent_id;
+    assert!(consumed.continuation.is_none());
+    assert!(consumed.state.turn_id.is_none());
+    let witness = consumed.state.dialogue_turn.as_ref().unwrap();
+    let (owner, epoch, turn, receipts) = witness.exact_parts();
+    assert_eq!(owner, &id);
+    assert_eq!(epoch, consumed.context.epoch);
+    assert_eq!(turn.number(), consumed.state.last_turn_id());
+    assert_eq!(receipts.len(), 1);
+    assert_eq!(receipts[0].receipt.ordinal, queued.receipt.ordinal);
+    assert_eq!(
+        receipts[0].dialogue_alias(),
+        Some(queued.dialogue_id.as_str())
+    );
+    assert!(
+        session.state().dialogue_turn.is_none(),
+        "public State does not expose private witness"
+    );
+    let json = serde_json::to_vec(&consumed).unwrap();
+    let consumed: Recover = serde_json::from_slice(&json).unwrap();
+    consumed.validate().unwrap();
+    assert_eq!(serde_json::to_vec(&consumed).unwrap(), json);
+    let mut mismatched = consumed.clone();
+    mismatched
+        .state
+        .communication
+        .as_mut()
+        .unwrap()
+        .inbox
+        .receipts[0]
+        .digest = "0".repeat(64);
+    assert!(mismatched.validate().is_err());
     assert_eq!(
         journal
             .memory
@@ -444,6 +571,7 @@ async fn acknowledged_context_sidecar_failure_reports_consumed_and_never_replays
     let restored = crate::Session::restore(builder().journal(journal.memory.clone()), consumed)
         .await
         .unwrap();
+    assert!(restored.inner.state.live_dialogue_turn().is_none());
     restored.inner.restore_communication_inbox().await.unwrap();
     assert_eq!(
         journal
@@ -470,10 +598,11 @@ async fn acknowledged_context_sidecar_failure_reports_consumed_and_never_replays
     );
     assert_eq!(
         restored
-            .delivery_receipt("consumed-before-provider")
+            .authenticated_external_receipt("consumed-before-provider", "speaker", &proof)
             .await
             .unwrap()
             .unwrap()
+            .receipt
             .status,
         DeliveryStatus::Consumed
     );

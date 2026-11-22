@@ -595,7 +595,15 @@ fn invisible_writes_reject_reserved_reference_duplicate_invalid_scope_and_budget
         )
         .unwrap();
     for persistence in [Persisted, Ephemeral] {
-        for name in ["session", "time", "host", "agent", "executions", "skills"] {
+        for name in [
+            "session",
+            "time",
+            "host",
+            "agent",
+            "executions",
+            "skills",
+            "execution_capacity",
+        ] {
             let mut change = scoped(name, json!("forged"), persistence);
             change.remove.push("retained".into());
             assert!(state.apply_change(change).is_err());
@@ -613,6 +621,60 @@ fn invisible_writes_reject_reserved_reference_duplicate_invalid_scope_and_budget
     assert!(state.apply_change(oversized).is_err());
     assert_eq!(state.view_all().unwrap()["retained"], 1);
     assert_eq!(state.view().unwrap()["session"]["variables_revision"], 1);
+}
+
+#[test]
+fn historical_execution_capacity_variable_decodes_without_overriding_live_capacity() {
+    let state = State::new(Limits::default());
+    assert!(DynReference::new(projection("execution_capacity", json!({}))).is_err());
+    for (visibility, field) in [
+        ("visible", "variables"),
+        ("invisible", "invisible_variables"),
+    ] {
+        let mut historical = serde_json::to_value(state.recovery_snapshot()).unwrap();
+        historical["variables"] = json!({});
+        historical
+            .as_object_mut()
+            .unwrap()
+            .remove("invisible_variables");
+        historical[field] = json!({"execution_capacity": "old user value"});
+        historical["variable_metadata"] = json!({"execution_capacity": {
+            "visibility": visibility, "persistence": "persisted", "owner": "client", "editors": ["client"]
+        }});
+        let historical: SessionState = serde_json::from_value(historical).unwrap();
+        let encoded = serde_json::to_vec(&historical).unwrap();
+        let decoded: SessionState = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(serde_json::to_vec(&decoded).unwrap(), encoded);
+        state.replace(decoded);
+        let inspection = state.inspection().unwrap();
+        assert_eq!(
+            inspection.values["execution_capacity"]["buffers"]["used"],
+            0
+        );
+        assert_eq!(
+            inspection.descriptors["execution_capacity"].kind,
+            "framework"
+        );
+        assert!(!inspection.descriptors["execution_capacity"].editable);
+        assert!(inspection.metadata.get("execution_capacity").is_none());
+        assert!(
+            state
+                .variable_metadata()
+                .unwrap()
+                .get("execution_capacity")
+                .is_none()
+        );
+        assert!(state.variables().get("execution_capacity").is_none());
+        assert!(state.extract("execution_capacity").is_none());
+        assert!(matches!(
+            state.injection_view().lookup("execution_capacity"),
+            crate::state::variables::InjectionKey::Missing
+        ));
+        assert_eq!(
+            serde_json::to_value(state.recovery_snapshot()).unwrap()[field]["execution_capacity"],
+            "old user value"
+        );
+    }
 }
 
 #[test]

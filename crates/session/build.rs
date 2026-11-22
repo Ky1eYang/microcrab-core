@@ -2,6 +2,7 @@
 mod wit_support;
 
 fn main() -> std::io::Result<()> {
+    println!("cargo:rerun-if-changed=../agent/wit/build_support.rs");
     let manifest =
         std::path::PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::NotFound, "CARGO_MANIFEST_DIR")

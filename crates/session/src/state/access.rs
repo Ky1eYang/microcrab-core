@@ -78,6 +78,7 @@ struct LiveState {
     agent: Option<microcrab_agent_types::AgentInfo>,
     is_main: bool,
     delegate_available: bool,
+    switch_mode_available: bool,
     active_correspondents: std::collections::BTreeSet<crate::state::communication::AgentId>,
     cache_points: Arc<crate::runtime::cache::Collector>,
     /// Live epoch resources: shared by handles of this Session, never serialized.
@@ -88,6 +89,8 @@ struct LiveState {
 }
 fn inspection_metadata(live: &LiveState) -> Result<Value, Error> {
     let mut metadata = live.snapshot.variables.metadata();
+    // Historical custom metadata must not describe the live framework object.
+    metadata.remove(crate::admission::variables::EXECUTION_CAPACITY_KEY);
     for name in ["agent_init", "agent_initialization_pending"] {
         metadata.insert(
             name.into(),
@@ -153,6 +156,7 @@ impl State {
                 agent: None,
                 is_main: true,
                 delegate_available: false,
+                switch_mode_available: false,
                 active_correspondents: Default::default(),
                 cache_points: Arc::new(crate::runtime::cache::Collector::default()),
                 #[cfg(feature = "wasm")]
@@ -371,6 +375,9 @@ impl State {
         // Frozen Recover values retain their encoding for hash validation; newly
         // active state and future checkpoints use the current limit vocabulary.
         snapshot.clear_historical_limits();
+        // Recover can retain a historical certificate, but selecting history or
+        // restarting alone does not certify a currently owned dialogue Turn.
+        snapshot.dialogue_turn_live = false;
         snapshot.variables.clear_ephemeral();
         snapshot.variables.activate();
         state.runtime_instance_id = uuid::Uuid::new_v4().to_string();
@@ -404,14 +411,51 @@ impl State {
             round: None,
         }
     }
+    pub(crate) fn selected_mode(&self) -> Option<String> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .snapshot
+            .selected_mode
+            .clone()
+    }
+    /// Issuer mode and its literal instructions, observed under one State lock.
+    pub(crate) fn selected_mode_instructions(&self) -> (String, String) {
+        let live = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        let Some(mode) = &live.snapshot.selected_mode else {
+            return (String::new(), String::new());
+        };
+        let prompt = live
+            .agent
+            .as_ref()
+            .and_then(|agent| agent.modes.iter().find(|metadata| metadata.name == *mode));
+        (
+            mode.clone(),
+            prompt.map_or_else(String::new, |metadata| metadata.prompt.clone()),
+        )
+    }
     pub fn snapshot(&self) -> SessionState {
         let (mut snapshot, executions) = {
             let live = self.inner.lock().unwrap_or_else(|error| error.into_inner());
             (live.snapshot.clone(), live.executions.clone())
         };
         snapshot.executions = executions.model_projection();
+        snapshot.dialogue_turn = None;
+        snapshot.dialogue_turn_live = false;
         snapshot
     }
+    /// The live Turn claim is deliberately independent of serializable Recover.
+    pub(crate) fn live_dialogue_turn(
+        &self,
+    ) -> Option<super::communication::turn::DialogueTurnWitness> {
+        let live = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        let witness = live.snapshot.dialogue_turn.as_ref()?;
+        (live.snapshot.dialogue_turn_live
+            && live.snapshot.epoch_id == witness.exact_parts().1
+            && live.snapshot.turn_id == Some(witness.exact_parts().2.number()))
+        .then(|| witness.clone())
+    }
+
     /// Checkpoint-only payload projection. Public/model State never exposes the
     /// owner-specific restoration payloads retained by this separate port.
     pub(crate) fn recovery_snapshot(&self) -> SessionState {
@@ -420,6 +464,7 @@ impl State {
             (live.snapshot.clone(), live.executions.clone())
         };
         snapshot.variables.clear_ephemeral();
+        snapshot.dialogue_turn_live = false;
         snapshot.executions = executions.recovery_snapshot();
         snapshot
     }
@@ -537,6 +582,12 @@ impl State {
             .unwrap_or_else(|error| error.into_inner())
             .delegate_available = available;
     }
+    pub(crate) fn install_switch_mode_availability(&self, available: bool) {
+        self.inner
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .switch_mode_available = available;
+    }
     /// Public read-only facts use the same derivation as model State. Handles and
     /// custom-variable mutation remain separate from this ephemeral view.
     pub fn view(&self) -> Result<Value, Error> {
@@ -649,14 +700,22 @@ impl State {
             .clone()
     }
     pub fn variables(&self) -> Value {
-        self.inner
+        let mut values = self
+            .inner
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .snapshot
             .variables
-            .as_value()
+            .as_value();
+        if let Value::Object(values) = &mut values {
+            values.remove(crate::admission::variables::EXECUTION_CAPACITY_KEY);
+        }
+        values
     }
     pub fn extract(&self, key: &str) -> Option<Value> {
+        if key == crate::admission::variables::EXECUTION_CAPACITY_KEY {
+            return None;
+        }
         self.inner
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -831,6 +890,8 @@ impl State {
             || live.references_revision != original.references_revision
             || live.active_correspondents != original.active_correspondents
             || live.snapshot.communication != original.snapshot.communication
+            || live.snapshot.dialogue_turn != original.snapshot.dialogue_turn
+            || live.snapshot.dialogue_turn_live != original.snapshot.dialogue_turn_live
             || live.snapshot.selected_mode != original.snapshot.selected_mode
             || live.snapshot.epoch_id != original.snapshot.epoch_id
             || live.snapshot.last_turn_id != original.snapshot.last_turn_id
@@ -840,6 +901,8 @@ impl State {
             return false;
         }
         live.snapshot.communication = candidate.snapshot.communication;
+        live.snapshot.dialogue_turn = candidate.snapshot.dialogue_turn;
+        live.snapshot.dialogue_turn_live = candidate.snapshot.dialogue_turn_live;
         live.snapshot.variables = candidate.snapshot.variables;
         live.variables_revision = candidate.variables_revision;
         live.snapshot.turn_id = candidate.snapshot.turn_id;
@@ -1089,20 +1152,43 @@ fn current_projection(live: &LiveState) -> Result<Value, crate::policy::Permissi
     for key in ["tool_tasks", "jobs", "subagents"] {
         values.remove(key);
     }
-    let executions = live.executions.model_projection();
+    let (executions, capacity) = live.executions.model_observation();
     if executions.is_empty() {
         values.remove("executions");
     } else {
         values.insert("executions".into(), json!(executions));
     }
+    values.insert(
+        crate::admission::variables::EXECUTION_CAPACITY_KEY.into(),
+        json!(capacity),
+    );
+    // Do not let a legacy custom variable with this name stand in for a live hint.
+    values.remove("switchable_modes");
     if let Some(mode) = &live.snapshot.selected_mode {
         values.insert("mode".into(), json!(mode));
-        if let Some(metadata) = live
-            .agent
-            .as_ref()
-            .and_then(|agent| agent.modes.iter().find(|candidate| candidate.name == *mode))
-        {
+        if let Some((agent, metadata)) = live.agent.as_ref().and_then(|agent| {
+            agent
+                .modes
+                .iter()
+                .find(|candidate| candidate.name == *mode)
+                .map(|metadata| (agent, metadata))
+        }) {
             values.insert("mode_prompt".into(), json!(metadata.prompt));
+            if live.switch_mode_available {
+                // Discovery is role/catalog eligibility, not permission to switch.
+                let targets = agent
+                    .modes
+                    .iter()
+                    .filter(|target| {
+                        target.name != *mode
+                            && crate::session::mode_role_eligible(live.is_main, target.role)
+                    })
+                    .map(|target| target.name.as_str())
+                    .collect::<Vec<_>>();
+                if !targets.is_empty() {
+                    values.insert("switchable_modes".into(), json!(targets));
+                }
+            }
         } else {
             values.remove("mode_prompt");
         }

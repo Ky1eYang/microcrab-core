@@ -177,6 +177,7 @@ async fn pending_recovery_receipt_gets_terminal_model_transition_without_output(
 #[tokio::test]
 async fn restored_unread_buffer_remains_visible_and_survives_history_pruning() {
     let limits = Limits {
+        max_execution_buffers: 1,
         max_retained_executions: 1,
         ..Default::default()
     };
@@ -206,7 +207,12 @@ async fn restored_unread_buffer_remains_visible_and_survives_history_pruning() {
     owner.close().await.unwrap();
     let restored = ExecutionRegistry::new(limits);
     restored.restore(&checkpoint).unwrap();
-    assert_eq!(restored.model_projection()[0].execution_id, id);
+    let (rows, capacity) = restored.model_observation();
+    assert_eq!(rows[0].execution_id, id);
+    assert_eq!(
+        serde_json::to_value(capacity).unwrap()["buffers"],
+        serde_json::json!({"limit": 1, "used": 1, "remaining": 0})
+    );
     for _ in 0..4 {
         let mut task = restored
             .start(descriptor(), CancellationToken::new(), |_| async {

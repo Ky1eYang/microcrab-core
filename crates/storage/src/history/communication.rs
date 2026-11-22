@@ -54,9 +54,7 @@ pub(super) fn reconcile_inspected(
                     .iter_mut()
                     .find(|row| row.receipt.operation_id == selected.receipt.operation_id)
             {
-                if receipt.digest != selected.digest
-                    || receipt.receipt.ordinal != selected.receipt.ordinal
-                {
+                if !receipt.same_admission(selected) {
                     return Err(Error::config(
                         "durable carrier consumption witness mismatch",
                     ));

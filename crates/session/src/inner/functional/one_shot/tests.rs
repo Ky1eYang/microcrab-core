@@ -116,6 +116,9 @@ async fn functional_request_owns_context_and_hook_state_without_mutating_the_par
                 ("tool", "echo"),
                 ("tool_name", "echo"),
                 ("tool_args", "{}"),
+                ("operation_kind", "tool"),
+                ("mode", ""),
+                ("mode_prompt", ""),
             ],
         )
         .unwrap();

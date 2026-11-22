@@ -60,6 +60,14 @@ pub enum SessionKind {
     OneShot,
 }
 
+pub(crate) fn mode_role_eligible(is_main: bool, role: microcrab_agent_types::AgentRole) -> bool {
+    use microcrab_agent_types::AgentRole;
+    !matches!(
+        (is_main, role),
+        (true, AgentRole::SubAgent) | (false, AgentRole::MainAgent)
+    )
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DelegateRequest {
     pub target: String,
@@ -107,10 +115,19 @@ pub trait TurnRouting: Send + Sync {
     async fn restore(&self, recover: &Recover) -> Result<(), Error>;
 }
 
+use crate::state::communication::{
+    AgentId,
+    reply::{DialogueAdmissionKey, DialogueReplyStore, DurableDialogueReply},
+};
+
+type DialogueReplyStoreFactory =
+    Box<dyn FnOnce(&AgentId) -> Result<Arc<dyn DialogueReplyStore>, Error> + Send>;
+
 pub struct SessionBuilder {
     kind: Option<SessionKind>,
     communication: Option<Option<crate::state::communication::CommunicationState>>,
     interaction: crate::state::communication::SessionInteraction,
+    dialogue_reply_store: Option<DialogueReplyStoreFactory>,
     route: Option<Arc<dyn TurnRouting>>,
     client: Arc<dyn Client>,
     auto_compaction: Option<(
@@ -185,6 +202,7 @@ impl Session {
         SessionBuilder {
             kind: None,
             communication: None,
+            dialogue_reply_store: None,
             interaction: crate::state::communication::SessionInteraction::Persistent,
             route: None,
             client,
@@ -293,6 +311,14 @@ impl Session {
             .communication
             .map(|communication| communication.identity)
     }
+    /// Observe the configured reply store without activating the model. The
+    /// embedding owner must authenticate and resolve the exact admission first.
+    pub async fn observe_external_dialogue_reply(
+        &self,
+        key: &DialogueAdmissionKey,
+    ) -> Result<Option<DurableDialogueReply>, Error> {
+        self.inner.observe_external_dialogue_reply(key).await
+    }
     /// The caller must authenticate access to this exact parent. Inspection grants
     /// no persistent unlock; every targeted submission checks the child's current mode.
     pub async fn submit_child_user(
@@ -391,6 +417,44 @@ impl Session {
             .enqueue_external(operation_id, identity, body)
             .await
     }
+    /// Observe an exact historical external admission without enqueueing or
+    /// installing the inbox. The embedder authenticates the external identity;
+    /// the historical receipt contains no credential-incarnation binding.
+    pub async fn replay_legacy_external(
+        &self,
+        operation_id: String,
+        identity: String,
+        body: String,
+    ) -> Result<crate::state::communication::inbox::QueuedReceipt, Error> {
+        self.inner
+            .replay_legacy_external(operation_id, identity, body)
+            .await
+    }
+    /// Admit a request after the embedder authenticates the exact credential.
+    /// Success means the operation and its dialogue alias are durably committed.
+    pub async fn enqueue_authenticated_external(
+        &self,
+        operation_id: String,
+        identity: String,
+        body: String,
+        incarnation: crate::state::communication::inbox::ExternalCredentialIncarnation,
+    ) -> Result<crate::state::communication::inbox::ExternalDialogueReceipt, Error> {
+        self.inner
+            .enqueue_authenticated_external(operation_id, identity, body, incarnation)
+            .await
+    }
+    /// Observe an authenticated operation without replaying an uncertain enqueue.
+    pub async fn authenticated_external_receipt(
+        &self,
+        operation_id: &str,
+        identity: &str,
+        incarnation: &crate::state::communication::inbox::ExternalCredentialIncarnation,
+    ) -> Result<Option<crate::state::communication::inbox::ExternalDialogueReceipt>, Error> {
+        self.inner
+            .authenticated_external_receipt(operation_id, identity, incarnation)
+            .await
+    }
+    /// Legacy/unbound receipt metadata. Authenticated rows require exact observation.
     pub async fn delivery_receipt(
         &self,
         operation_id: &str,
@@ -506,6 +570,10 @@ impl Session {
     pub fn state(&self) -> SessionState {
         self.inner.state()
     }
+    /// Applied runtime mode, without projecting Execution rows or invoking controllers.
+    pub fn selected_mode(&self) -> Option<String> {
+        self.inner.state_handle().selected_mode()
+    }
     pub fn state_handle(&self) -> State {
         self.inner.state_handle()
     }
@@ -591,21 +659,21 @@ impl Session {
     /// Cancellation/errors pause automatic draining until submit or resume.
     pub fn queue(&self, input: impl Into<crate::SessionInput>) -> Result<(), Error> {
         self.require_interactive()?;
-        self.inner.enqueue(input.into(), false, None)
+        self.inner.enqueue(input.into(), false, None, None)
     }
     /// Enqueue an explicit send, activating the existing dispatcher only if idle.
     /// Retained continuations reject before admission and require explicit retry;
     /// busy sends remain queued without changing the running worker or pause.
     pub fn queue_and_activate(&self, input: impl Into<crate::SessionInput>) -> Result<(), Error> {
         self.require_interactive()?;
-        self.inner.enqueue_and_activate(input.into(), None)
+        self.inner.enqueue_and_activate(input.into(), None, None)
     }
     /// Insert at the next settled model boundary. A builtin `job` wait yields
     /// its observation so this boundary can be reached without stopping targets.
     /// Idle steer becomes queued NextTurn input and does not wake a silent Session.
     pub fn steer(&self, input: impl Into<crate::SessionInput>) -> Result<(), Error> {
         self.require_interactive()?;
-        self.inner.enqueue(input.into(), true, None)
+        self.inner.enqueue(input.into(), true, None, None)
     }
     /// Trusted embedding admission identity; not part of model-facing or frozen input bytes.
     pub fn queue_submission(
@@ -615,11 +683,41 @@ impl Session {
         steer: bool,
         activate_if_idle: bool,
     ) -> Result<(), Error> {
+        self.queue_submission_with_resolver(input, operation_id, steer, activate_if_idle, None)
+    }
+    /// Queue a trusted embedding decision with this exact input. It is resolved
+    /// on consumption, not enqueue, and is not exposed in pending-input DTOs.
+    pub fn queue_submission_with_important(
+        &self,
+        input: crate::SessionInput,
+        operation_id: String,
+        steer: bool,
+        activate_if_idle: bool,
+        resolver: Arc<dyn crate::InputAdmissionResolver>,
+    ) -> Result<(), Error> {
+        self.queue_submission_with_resolver(
+            input,
+            operation_id,
+            steer,
+            activate_if_idle,
+            Some(resolver),
+        )
+    }
+    fn queue_submission_with_resolver(
+        &self,
+        input: crate::SessionInput,
+        operation_id: String,
+        steer: bool,
+        activate_if_idle: bool,
+        resolver: Option<Arc<dyn crate::InputAdmissionResolver>>,
+    ) -> Result<(), Error> {
         self.require_interactive()?;
         if activate_if_idle {
-            self.inner.enqueue_and_activate(input, Some(operation_id))
+            self.inner
+                .enqueue_and_activate(input, Some(operation_id), resolver)
         } else {
-            self.inner.enqueue(input, steer, Some(operation_id))
+            self.inner
+                .enqueue(input, steer, Some(operation_id), resolver)
         }
     }
     pub async fn stream(
@@ -636,7 +734,7 @@ impl Session {
         input: impl Into<crate::SessionInput>,
         cancellation: CancellationToken,
     ) -> Result<SessionStream, Error> {
-        self.stream_turn(Some(input.into()), cancellation, None)
+        self.stream_turn(Some(input.into()), cancellation, None, None)
             .await
             .map(|(stream, _)| stream)
     }
@@ -648,7 +746,7 @@ impl Session {
         input: impl Into<crate::SessionInput>,
         cancellation: CancellationToken,
     ) -> Result<(SessionStream, SettlementGuard), Error> {
-        self.stream_turn(Some(input.into()), cancellation, None)
+        self.stream_turn(Some(input.into()), cancellation, None, None)
             .await
     }
     /// Retry the current failed model request without appending user input.
@@ -661,7 +759,7 @@ impl Session {
         &self,
         cancellation: CancellationToken,
     ) -> Result<SessionStream, Error> {
-        self.stream_turn(None, cancellation, None)
+        self.stream_turn(None, cancellation, None, None)
             .await
             .map(|(stream, _)| stream)
     }
@@ -671,7 +769,7 @@ impl Session {
         &self,
         cancellation: CancellationToken,
     ) -> Result<(SessionStream, SettlementGuard), Error> {
-        self.stream_turn(None, cancellation, None).await
+        self.stream_turn(None, cancellation, None, None).await
     }
     /// Explicitly resume the exact oldest pending user input. Retained round
     /// continuations require their own retry/resume action; failed CAS never unpauses.
@@ -696,14 +794,32 @@ impl Session {
         operation_id: String,
         cancellation: CancellationToken,
     ) -> Result<(SessionStream, SettlementGuard), Error> {
-        self.stream_turn(Some(input), cancellation, Some(operation_id))
+        self.stream_turn(Some(input), cancellation, Some(operation_id), None)
             .await
+    }
+    /// Stream with a trusted embedding decision for this exact input. A retry
+    /// cannot set a new decision: it uses the already-frozen admitted envelope.
+    pub async fn stream_submission_with_settlement_and_important(
+        &self,
+        input: crate::SessionInput,
+        operation_id: String,
+        cancellation: CancellationToken,
+        resolver: Arc<dyn crate::InputAdmissionResolver>,
+    ) -> Result<(SessionStream, SettlementGuard), Error> {
+        self.stream_turn(
+            Some(input),
+            cancellation,
+            Some(operation_id),
+            Some(resolver),
+        )
+        .await
     }
     async fn stream_turn(
         &self,
         input: Option<crate::SessionInput>,
         cancellation: CancellationToken,
         submission_operation_id: Option<String>,
+        admission_resolver: Option<Arc<dyn crate::InputAdmissionResolver>>,
     ) -> Result<(SessionStream, SettlementGuard), Error> {
         self.require_interactive()?;
         // Prefer immediate admission even for an already-cancelled token, so the
@@ -715,6 +831,7 @@ impl Session {
             _ = cancellation.cancelled() => return Err(Error::Cancelled),
         };
         reservation.submission_operation_id = submission_operation_id;
+        reservation.admission_resolver = admission_resolver;
         reservation.user_target = input.as_ref().map(|_| false);
         let reservation = Arc::new(reservation);
         if input.is_none() && !self.inner.retry_ready() {
@@ -1025,6 +1142,21 @@ impl SessionBuilder {
         self.auditor = Arc::new(auditor);
         self
     }
+    /// Install the reply adapter for this exact Interactive Session. An adapter
+    /// must not be shared across independent Session/Agent identities.
+    pub fn dialogue_reply_store(self, store: Arc<dyn DialogueReplyStore>) -> Self {
+        self.dialogue_reply_store_with(|_| Ok(store))
+    }
+    /// Bind a scoped adapter after Core has created or restored the canonical
+    /// communication AgentId. Legacy/other Session kinds do not get a reply owner.
+    /// The factory is synchronous: adapters needing I/O may open lazily.
+    pub fn dialogue_reply_store_with(
+        mut self,
+        factory: impl FnOnce(&AgentId) -> Result<Arc<dyn DialogueReplyStore>, Error> + Send + 'static,
+    ) -> Self {
+        self.dialogue_reply_store = Some(Box::new(factory));
+        self
+    }
     pub fn journal<J: Journal>(self, journal: J) -> Self {
         self.journal_arc(Arc::new(journal))
     }
@@ -1141,9 +1273,20 @@ impl SessionBuilder {
         if let Some(communication) = &communication {
             communication.validate()?;
         }
+        let dialogue_reply_store = self
+            .dialogue_reply_store
+            .zip(communication.as_ref().filter(|owner| {
+                kind == SessionKind::Interactive
+                    && owner.identity.depth == 0
+                    && owner.identity.interaction
+                        == crate::state::communication::SessionInteraction::Persistent
+            }))
+            .map(|(factory, owner)| factory(&owner.identity.agent_id))
+            .transpose()?;
         Ok(Session {
             inner: SessionInner::new(SessionParts {
                 communication,
+                dialogue_reply_store,
                 kind: self.kind.unwrap_or(if is_main {
                     SessionKind::Interactive
                 } else {

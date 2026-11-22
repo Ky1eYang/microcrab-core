@@ -2,6 +2,8 @@
 use crate::{Error, VariablesChange};
 use std::collections::HashSet;
 
+pub(crate) const EXECUTION_CAPACITY_KEY: &str = "execution_capacity";
+
 /// Protected model namespaces. `host` and `agent` remain compatibility guards:
 /// HostInfo and SYSTEM's agent namespace carry those facts, not derived State.
 pub(crate) fn is_reserved_key(key: &str) -> bool {
@@ -22,7 +24,9 @@ pub(crate) fn is_reserved_key(key: &str) -> bool {
             | "correspondents"
             | "external_speakers"
             | "mode_prompt"
+            | "switchable_modes"
             | "executions"
+            | EXECUTION_CAPACITY_KEY
             | "tool_tasks"
     )
 }

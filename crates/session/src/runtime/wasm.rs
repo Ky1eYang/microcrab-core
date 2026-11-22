@@ -24,10 +24,7 @@ use crate::Error;
 use crate::state::wasm::SessionBinding;
 use crate::utils::cancel::CancelOnDrop;
 use async_trait::async_trait;
-use communication::{
-    host_info_import, scoped_variable_change_import, variable_change_import,
-    variable_get_all_import, variable_get_import, variable_metadata_import,
-};
+use communication::{TYPED_VARIABLES_INTERFACE, host_info_import};
 use microcrab_agent_types::AgentInfo;
 use microcrab_host_api::Host;
 use microcrab_protocol::ToolDefinition;
@@ -272,8 +269,7 @@ fn load_agent(bytes: &[u8], limits: WasmLimits, host: Arc<dyn Host>) -> Result<W
             }
             "buffer" if matches!(&import.ty, ComponentItem::Resource(_)) => None,
             HOST_INTERFACE
-            | "microcrab:session/variables@0.1.0"
-            | "microcrab:session/variables@0.1.1"
+            | TYPED_VARIABLES_INTERFACE
             | "microcrab:host/types@0.1.0"
             | "microcrab:host/tool-types@0.1.0"
             | "microcrab:host/cache-points@0.1.0"
@@ -818,48 +814,9 @@ impl Compiled {
                 .map_err(|error| {
                     boundary.failure(error, crate::observation::wasm::Phase::Instantiate)
                 })?;
-            let mut variables = linker
-                .instance("microcrab:session/variables@0.1.0")
-                .map_err(|error| {
-                    boundary.failure(error, crate::observation::wasm::Phase::Instantiate)
-                })?;
-            variables
-                .func_wrap("variable-get", variable_get_import)
-                .map_err(|error| {
-                    boundary.failure(error, crate::observation::wasm::Phase::Instantiate)
-                })?;
-            variables
-                .func_wrap("variable-change", variable_change_import)
-                .map_err(|error| {
-                    boundary.failure(error, crate::observation::wasm::Phase::Instantiate)
-                })?;
-            {
-                let mut scoped = linker
-                    .instance("microcrab:session/variables@0.1.1")
-                    .map_err(|error| {
-                        boundary.failure(error, crate::observation::wasm::Phase::Instantiate)
-                    })?;
-                scoped
-                    .func_wrap("variable-get", variable_get_import)
-                    .map_err(|error| {
-                        boundary.failure(error, crate::observation::wasm::Phase::Instantiate)
-                    })?;
-                scoped
-                    .func_wrap("variable-get-all", variable_get_all_import)
-                    .map_err(|error| {
-                        boundary.failure(error, crate::observation::wasm::Phase::Instantiate)
-                    })?;
-                scoped
-                    .func_wrap("variable-metadata", variable_metadata_import)
-                    .map_err(|error| {
-                        boundary.failure(error, crate::observation::wasm::Phase::Instantiate)
-                    })?;
-                scoped
-                    .func_wrap("variable-change", scoped_variable_change_import)
-                    .map_err(|error| {
-                        boundary.failure(error, crate::observation::wasm::Phase::Instantiate)
-                    })?;
-            }
+            communication::add_typed_to_linker(&mut linker).map_err(|error| {
+                boundary.failure(error, crate::observation::wasm::Phase::Instantiate)
+            })?;
             linker
                 .instance("microcrab:host/text-read@0.1.0")
                 .map_err(|error| {

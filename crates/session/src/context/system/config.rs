@@ -91,7 +91,7 @@ impl PromptConfig {
             (config.rename_template.as_str(), &["user_input"][..]),
             (
                 config.action_review_template.as_str(),
-                &["user_input", "tool", "tool_name", "tool_args"][..],
+                crate::runtime::subagents::action_review::BINDINGS,
             ),
         ] {
             crate::runtime::subagents::validate_template(

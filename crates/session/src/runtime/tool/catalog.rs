@@ -84,12 +84,16 @@ impl ToolRegistry {
     pub(crate) fn for_conversation(
         &self,
         identity: Option<&crate::state::communication::ConversationIdentity>,
+        external_dialogue_replies: bool,
     ) -> Result<Self, Error> {
         let mut registrations = self
             .entries
             .iter()
             .filter_map(|(name, entry)| {
-                if matches!(name.as_str(), "send_message" | "escalate") {
+                if matches!(
+                    name.as_str(),
+                    "send_message" | "escalate" | super::external_dialogue::NAME
+                ) {
                     return None;
                 }
                 if name == "delegate" && identity.is_some_and(|identity| identity.depth != 0) {
@@ -106,6 +110,9 @@ impl ToolRegistry {
             identity.interaction == crate::state::communication::SessionInteraction::Persistent
         }) {
             registrations.push(ToolRegistration::Builtin(BuiltinTool::SendMessage));
+            if identity.depth == 0 && external_dialogue_replies {
+                registrations.push(ToolRegistration::Builtin(BuiltinTool::ReplyExternalSpeaker));
+            }
             if identity.depth == 1 {
                 registrations.push(ToolRegistration::Builtin(BuiltinTool::Escalate));
             }
@@ -245,7 +252,10 @@ impl ToolRegistry {
             .ensure_admitted(entry.tool.component_identity())
             .and_then(|()| invocation.ensure_admitted_arguments(&call.arguments))
             .map_err(|error| error.into_runtime_error())?;
-        if entry.origin != ToolOrigin::Wasm && call.name != "job" {
+        // Reply owns its one-shot dispatch at the Session mutation boundary.
+        if entry.origin != ToolOrigin::Wasm
+            && !matches!(call.name.as_str(), "job" | super::external_dialogue::NAME)
+        {
             invocation
                 .begin_dispatch(entry.tool.component_identity())
                 .map_err(|error| error.into_runtime_error())?;

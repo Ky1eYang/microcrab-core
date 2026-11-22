@@ -244,11 +244,33 @@ struct ModeScript {
     first: Mutex<bool>,
     prompts: Arc<Mutex<Vec<Option<serde_json::Value>>>>,
 }
+
+fn projected_switchable_modes(items: &[crate::context::ContentItem]) -> Option<&serde_json::Value> {
+    use crate::context::ContentItem;
+    use microcrab_transport::StateFrame;
+    for item in items.iter().rev() {
+        match item {
+            ContentItem::State(StateFrame::StateSnapshot { state }) => {
+                return state.get("switchable_modes");
+            }
+            ContentItem::State(StateFrame::StatePatch { set, remove, .. }) => {
+                if let Some(value) = set.get("switchable_modes") {
+                    return Some(value);
+                }
+                if remove.iter().any(|key| key == "switchable_modes") {
+                    return None;
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
 #[async_trait]
 impl Client for ModeScript {
     async fn complete(
         &self,
-        _: &crate::context::Content,
+        request: &crate::context::Content,
         _: &dyn Auditor,
         variables: &dyn VariableView,
         _: CancellationToken,
@@ -258,6 +280,12 @@ impl Client for ModeScript {
             .unwrap()
             .push(variables.get("mode_prompt"));
         let first = std::mem::take(&mut *self.first.lock().unwrap());
+        assert!(request.tools.iter().any(|tool| tool.name == "switch_mode"));
+        let alternate = if first { "second" } else { "first" };
+        assert_eq!(
+            projected_switchable_modes(&request.items),
+            Some(&json!([alternate]))
+        );
         Ok(Response {
             provider_metadata: None,
             content: "done".into(),
@@ -338,6 +366,145 @@ async fn requested_mode_applies_after_the_original_batch_and_before_the_next_req
     assert_eq!(session.context_snapshot().unwrap().system, frozen.system);
     assert_eq!(session.context_snapshot().unwrap().tools, frozen.tools);
     session.close().await.unwrap();
+}
+
+fn mode_discovery_agent() -> AgentInfo {
+    let mut agent = agent();
+    agent.modes.extend(
+        [
+            ("plan", AgentRole::MainAgent),
+            ("review", AgentRole::Both),
+            ("build", AgentRole::MainAgent),
+        ]
+        .into_iter()
+        .map(|(name, role)| AgentMode {
+            name: name.into(),
+            role,
+            description: String::new(),
+            prompt: String::new(),
+            permissions: vec![],
+        }),
+    );
+    agent
+}
+
+fn mode_discovery_runtime(register_switch: bool) -> crate::runtime::Runtime {
+    let tools = if register_switch {
+        vec![ToolRegistration::Builtin(BuiltinTool::SwitchMode)]
+    } else {
+        vec![]
+    };
+    crate::runtime::Runtime::new(tools, Arc::new(AllowTools::new(Vec::<String>::new()))).unwrap()
+}
+
+#[tokio::test]
+async fn switchable_modes_respect_agent_roles_and_omit_empty_alternatives() {
+    let root = Session::builder(Answer, mode_discovery_runtime(true))
+        .agent(mode_discovery_agent())
+        .build()
+        .unwrap();
+    let state = root.state_handle();
+    let inspection = state.inspection().unwrap();
+    assert_eq!(inspection.values["mode"], json!("plan"));
+    assert_eq!(
+        inspection.values["switchable_modes"],
+        json!(["review", "build"])
+    );
+    let key = &inspection.descriptors["switchable_modes"];
+    assert_eq!(key.kind, "framework");
+    assert!(!key.editable && !key.deletable);
+    assert!(
+        state
+            .inject("switchable_modes", json!(["spoof"]))
+            .await
+            .is_err()
+    );
+    assert!(root.validate_mode("work").is_err());
+    root.close().await.unwrap();
+
+    let child = Session::builder(Answer, mode_discovery_runtime(true))
+        .kind(crate::SessionKind::Delegated)
+        .agent(mode_discovery_agent())
+        .build()
+        .unwrap();
+    let state = child.state_handle().view().unwrap();
+    assert_eq!(state["mode"], json!("work"));
+    assert_eq!(state["switchable_modes"], json!(["review"]));
+    assert!(child.validate_mode("plan").is_err());
+    child.close().await.unwrap();
+
+    let one_mode = Session::builder(Answer, mode_discovery_runtime(true))
+        .kind(crate::SessionKind::Delegated)
+        .agent(agent())
+        .build()
+        .unwrap();
+    assert!(
+        one_mode
+            .state_handle()
+            .view()
+            .unwrap()
+            .get("switchable_modes")
+            .is_none()
+    );
+    one_mode.close().await.unwrap();
+
+    assert!(!crate::inner::switch_mode_available(
+        crate::SessionKind::OneShot,
+        &[BuiltinTool::SwitchMode.definition()],
+    ));
+}
+
+#[tokio::test]
+async fn switchable_modes_use_frozen_catalog_on_restore_until_explicit_update() {
+    let old = Session::builder(Answer, mode_discovery_runtime(false))
+        .agent(mode_discovery_agent())
+        .build()
+        .unwrap();
+    old.submit("pre-feature turn").await.unwrap();
+    let mut recover = old.checkpoint().await.unwrap();
+    // Formerly legal custom values may be present in old serialized snapshots.
+    recover.state.variables =
+        serde_json::from_value(json!({"switchable_modes": ["spoof"]})).unwrap();
+    let frozen = recover.context.clone();
+    assert!(!frozen.tools.iter().any(|tool| tool.name == "switch_mode"));
+    old.close().await.unwrap();
+
+    let restored = Session::restore(
+        Session::builder(Answer, mode_discovery_runtime(true)).agent(mode_discovery_agent()),
+        recover.clone(),
+    )
+    .await
+    .unwrap();
+    let installed = restored.context_snapshot().unwrap();
+    assert_eq!(installed.tools, frozen.tools);
+    assert_eq!(installed.items, frozen.items);
+    assert_eq!(installed.system, frozen.system);
+    assert_eq!(installed.epoch, frozen.epoch);
+    let state = restored.state_handle();
+    assert!(state.view().unwrap().get("switchable_modes").is_none());
+    restored.submit("still using frozen catalog").await.unwrap();
+    assert!(state.view().unwrap().get("switchable_modes").is_none());
+    let still_frozen = restored.context_snapshot().unwrap();
+    assert_eq!(still_frozen.tools, frozen.tools);
+    assert!(projected_switchable_modes(&still_frozen.items).is_none());
+
+    restored.replace_external_tools(vec![]).await.unwrap();
+    assert!(state.view().unwrap().get("switchable_modes").is_none());
+    restored
+        .submit("apply the explicit catalog update")
+        .await
+        .unwrap();
+    let updated = restored.context_snapshot().unwrap();
+    assert!(updated.tools.iter().any(|tool| tool.name == "switch_mode"));
+    assert!(updated.epoch > frozen.epoch);
+    let expected = json!(["review", "build"]);
+    assert_eq!(projected_switchable_modes(&updated.items), Some(&expected));
+    assert_eq!(state.view().unwrap()["switchable_modes"], expected);
+
+    restored.recover(recover).await.unwrap();
+    assert_eq!(restored.context_snapshot().unwrap().tools, frozen.tools);
+    assert!(state.view().unwrap().get("switchable_modes").is_none());
+    restored.close().await.unwrap();
 }
 
 #[tokio::test]

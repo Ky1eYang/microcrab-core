@@ -258,10 +258,13 @@ async fn review_allow_is_once_per_tool_invocation_and_never_enters_conversation(
     assert_eq!((review.turn_id, review.round), (None, None));
     assert_eq!(review.items.len(), 1);
     assert!(
-        !serde_json::to_string(review)
-            .unwrap()
-            .contains("private issuer history")
+        review
+            .system
+            .contains("<untrusted_user_input>\nprivate issuer history\n</untrusted_user_input>")
     );
+    assert!(matches!(&review.items[0], ContentItem::User { parts, .. }
+        if matches!(parts.as_slice(), [microcrab_protocol::InputPart::Text { text }]
+            if text == "begin")));
     assert!(
         !serde_json::to_string(&session.messages())
             .unwrap()
@@ -312,18 +315,26 @@ async fn conditional_review_runs_only_after_failed_predicates_with_ask_fallback(
                 panic!("review request must be text");
             };
             assert_eq!(text, "begin");
-            let request_text = review
+            assert!(review.system.contains(
+                "<untrusted_user_input>\nrun conditional operation\n</untrusted_user_input>"
+            ));
+            let rendered = microcrab_transport::render_ast(review).unwrap();
+            assert_eq!(rendered.messages.len(), 2);
+            assert!(
+                matches!(&rendered.messages[1], microcrab_protocol::Message::User { parts } if parts.as_slice() == [microcrab_protocol::InputPart::Text { text: text.clone() }])
+            );
+            assert!(review.system.contains("Operation kind: tool"));
+            assert!(review.system.contains("<untrusted_tool_name>\nwrite\n"));
+            let (_, args) = review
                 .system
-                .split_once("<untrusted_permission_request>\n")
-                .unwrap()
-                .1
-                .strip_suffix("\n</untrusted_permission_request>\n")
+                .split_once("<untrusted_tool_arguments>\n")
                 .unwrap();
-            let request: PermissionRequest = serde_json::from_str(request_text).unwrap();
-            assert_eq!(request.tool, "write");
-            assert_eq!(request.call_id, "operation-1");
-            assert_eq!(request.subject, InvocationSubject::Tool);
-            assert_eq!(request.arguments, json!({"path":"/root/a","content":"new"}));
+            let (args, _) = args.split_once("\n</untrusted_tool_arguments>").unwrap();
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(args).unwrap(),
+                json!({"path":"/root/a","content":"new"})
+            );
+            assert!(!review.system.contains("operation-1"));
             assert!(review.tools.is_empty());
         }
     }

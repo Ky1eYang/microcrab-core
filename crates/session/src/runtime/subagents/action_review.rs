@@ -1,9 +1,10 @@
 //! Internal clean-context review; never allocates a Session command or mutates Context.
 use super::{Builtin, ContextMode, Source};
-use crate::context::Content;
+use crate::context::{Content, ContentItem};
 use crate::policy::{PermissionError, PermissionRequest, ReviewResult};
 use crate::{Client, Error, State};
 use microcrab_auditor::Auditor;
+use microcrab_protocol::InputPart;
 use tokio_util::sync::CancellationToken;
 
 pub(super) const BUILTIN: Builtin = Builtin {
@@ -12,6 +13,88 @@ pub(super) const BUILTIN: Builtin = Builtin {
     context_mode: ContextMode::Clean,
     prompt: include_str!("../../../templates/subagents/ACTION_REVIEW.tmpl"),
 };
+
+pub(crate) const BINDINGS: &[&str] = &[
+    "user_input",
+    "tool",
+    "tool_name",
+    "tool_args",
+    "operation_kind",
+    "mode",
+    "mode_prompt",
+];
+
+// Exact previously shipped default bytes only. Keep compatibility without carrying
+// the retired prompt assets or rewriting any saved custom configuration.
+const LEGACY_DEFAULT_SHA256: [&str; 2] = [
+    "29d89e6b445812fdbbc43ce6a5fecc53238c1d6ff26987108cfab7f5b05a0abc",
+    "8d11b97ef87ff2db01f622ba5504b72903be0af97cc909514067c72c5df11cd3",
+];
+
+fn is_legacy_default(markdown: &str) -> bool {
+    use sha2::{Digest, Sha256};
+    LEGACY_DEFAULT_SHA256.contains(&format!("{:x}", Sha256::digest(markdown)).as_str())
+}
+
+fn latest_user_text(issuer: &Content) -> String {
+    let Some(ContentItem::User { parts, .. }) = crate::context::latest_direct_user(&issuer.items)
+    else {
+        return String::new();
+    };
+    parts
+        .iter()
+        .filter_map(|part| match part {
+            InputPart::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+pub(super) fn prepare_review(
+    issuer: &Content,
+    markdown: &str,
+    bindings: &[(&str, &str)],
+) -> Result<Content, Error> {
+    // Saved defaults use the current authored asset; custom templates stay literal.
+    if !markdown.is_empty() && markdown != BUILTIN.prompt && !is_legacy_default(markdown) {
+        return BUILTIN
+            .definition()
+            .prepare_markdown(markdown, issuer, bindings);
+    }
+    let escaped = bindings
+        .iter()
+        .map(|(name, value)| {
+            if matches!(*name, "user_input" | "mode_prompt") {
+                escape_review_data(value, issuer.max_bytes).map(Some)
+            } else {
+                Ok(None)
+            }
+        })
+        .collect::<Result<Vec<_>, Error>>()?;
+    let bindings = bindings
+        .iter()
+        .zip(&escaped)
+        .map(|(&(name, value), escaped)| (name, escaped.as_deref().unwrap_or(value)))
+        .collect::<Vec<_>>();
+    BUILTIN
+        .definition()
+        .prepare_markdown(BUILTIN.prompt, issuer, &bindings)
+}
+
+fn escape_review_data(value: &str, maximum: usize) -> Result<String, Error> {
+    let mut escaped = String::new();
+    for ch in value.chars() {
+        match ch {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            _ => escaped.push(ch),
+        }
+        crate::budget::check(crate::LimitKind::ContextBytes, escaped.len(), maximum)?;
+    }
+    Ok(escaped)
+}
 
 pub(crate) async fn run(
     executor: &dyn super::OneShotExecutor,
@@ -26,19 +109,29 @@ pub(crate) async fn run(
     if input.len() > 65536 {
         return Err(PermissionError::Review);
     }
-    let tool_args =
-        serde_json::to_string(&permission.arguments).map_err(|_| PermissionError::Review)?;
-    let request = super::prepare_configured(
-        BUILTIN.name,
-        Source::System,
+    let tool_args = serde_json::to_string(&permission.arguments)
+        .map_err(|_| PermissionError::Review)?
+        .replace('<', "\\u003c")
+        .replace('>', "\\u003e");
+    let user_input = latest_user_text(issuer);
+    let (mode, mode_prompt) = state.selected_mode_instructions();
+    let operation_kind = if permission.subject.is_tool() {
+        "tool"
+    } else {
+        "agent_init"
+    };
+    let request = prepare_review(
         issuer,
+        &executor.prompt_config().action_review_template,
         &[
-            ("user_input", input.as_str()),
-            ("tool", permission.tool.as_str()),
-            ("tool_name", permission.tool.as_str()),
-            ("tool_args", tool_args.as_str()),
+            ("user_input", &user_input),
+            ("tool", &permission.tool),
+            ("tool_name", &permission.tool),
+            ("tool_args", &tool_args),
+            ("operation_kind", operation_kind),
+            ("mode", &mode),
+            ("mode_prompt", &mode_prompt),
         ],
-        &executor.prompt_config(),
     )
     .map_err(|_| PermissionError::Review)?;
     let response = executor
@@ -70,4 +163,102 @@ pub(crate) async fn run(
         PermissionError::InvalidConfiguration(format!("invalid action review result: {error}"))
     })?;
     Ok(reply)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn real_user_selection_ignores_framework_carriers_and_does_not_skip_an_empty_latest_input() {
+        let mut issuer = crate::context::Context::new("parent".into(), vec![], 65_536)
+            .unwrap()
+            .content(128)
+            .unwrap();
+        let input = |source, text: &str| ContentItem::User {
+            envelope: None,
+            source,
+            parts: vec![InputPart::Text { text: text.into() }],
+        };
+        assert_eq!(latest_user_text(&issuer), "");
+        issuer.items = vec![
+            input(None, "old"),
+            input(None, "latest"),
+            input(
+                Some(microcrab_transport::UserSource::Framework),
+                "framework",
+            ),
+            ContentItem::Tool {
+                call_id: "fixture".into(),
+                content: "not intent".into(),
+                parts: vec![],
+            },
+        ];
+        assert_eq!(latest_user_text(&issuer), "latest");
+        issuer.items.push(input(None, ""));
+        assert_eq!(latest_user_text(&issuer), "");
+    }
+
+    #[test]
+    fn tool_and_initialization_review_exclude_compaction_summary_and_framework_carriers() {
+        let mut context = crate::context::Context::new("parent".into(), vec![], 65_536).unwrap();
+        let state = serde_json::json!({});
+        context.compact("summary".into(), &state).unwrap();
+        assert_eq!(latest_user_text(&context.review_issuer(128)), "");
+        assert_eq!(
+            latest_user_text(&context.initialization_review_issuer(128).unwrap()),
+            ""
+        );
+        context.admit_user("direct intent", &state).unwrap();
+        context
+            .admit_framework("framework notice".into(), &state)
+            .unwrap();
+        assert_eq!(
+            latest_user_text(&context.review_issuer(128)),
+            "direct intent"
+        );
+        assert_eq!(
+            latest_user_text(&context.initialization_review_issuer(128).unwrap()),
+            "direct intent"
+        );
+        assert!(context.initialization_review_issuer(0).is_err());
+    }
+
+    #[test]
+    fn default_embeds_intent_but_custom_bindings_remain_literal() {
+        let issuer = crate::context::Context::new("parent".into(), vec![], 65_536)
+            .unwrap()
+            .content(128)
+            .unwrap();
+        let bindings = [
+            ("user_input", "intent {{ mode }}"),
+            ("tool_name", "write"),
+            ("tool_args", "{}"),
+            ("operation_kind", "tool"),
+            ("mode", "plan"),
+            ("mode_prompt", "Read {{ literally }}"),
+        ];
+        let current = prepare_review(&issuer, BUILTIN.prompt, &bindings).unwrap();
+        assert!(current.system.contains("Read {{ literally }}"));
+        assert!(
+            current
+                .system
+                .contains("<untrusted_user_input>\nintent {{ mode }}\n</untrusted_user_input>")
+        );
+        assert!(
+            matches!(&current.items[..], [ContentItem::User { parts, .. }]
+            if matches!(&parts[..], [InputPart::Text { text }] if text == "begin"))
+        );
+        let custom = prepare_review(
+            &issuer,
+            "{{ user_input }} | {{ mode }} | {{ mode_prompt }}",
+            &bindings,
+        )
+        .unwrap();
+        assert_eq!(
+            custom.system,
+            "intent {{ mode }} | plan | Read {{ literally }}"
+        );
+        assert!(prepare_review(&issuer, "{{ permission_request }}", &bindings).is_err());
+    }
 }

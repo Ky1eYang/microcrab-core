@@ -1,4 +1,4 @@
-package microcrab:session@0.1.0;
+package microcrab:session@0.2.0;
 
 /// Runtime's complete binding surface; guests select their own smaller worlds.
 world runtime {
@@ -14,5 +14,4 @@ world runtime {
   import microcrab:host/grep@0.1.0;
   import microcrab:host/shell@0.1.0;
   import variables;
-  import scoped-variables: microcrab:session/variables@0.1.1;
 }

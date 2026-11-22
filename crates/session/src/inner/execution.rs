@@ -1,6 +1,6 @@
 //! Own admitted work through caller cancellation, including Host-backed input preparation.
 use super::*;
-use crate::SessionInput;
+use crate::{SessionInput, state::communication::reply::DialogueTerminalReason};
 
 struct LiveMeasurementGuard<'a>(&'a SessionInner);
 impl Drop for LiveMeasurementGuard<'_> {
@@ -20,6 +20,7 @@ pub(crate) struct OperationReservation {
     pub(crate) interrupt_reason: Arc<Mutex<Option<crate::InterruptReason>>>,
     pending: Mutex<Option<PendingResume>>,
     pub(crate) submission_operation_id: Option<String>,
+    pub(crate) admission_resolver: Option<Arc<dyn crate::InputAdmissionResolver>>,
     resume_pending: bool,
     pub(crate) user_target: Option<bool>,
     pub(crate) carrier_run: Vec<crate::admission::inbox::IdleCarrier>,
@@ -54,6 +55,7 @@ impl OperationReservation {
             interrupt_reason: Arc::new(Mutex::new(None)),
             pending: Mutex::new(None),
             submission_operation_id: None,
+            admission_resolver: None,
             resume_pending: false,
             user_target: None,
             carrier_run: Vec::new(),
@@ -67,6 +69,9 @@ impl SessionInner {
         targeted_child: bool,
     ) -> Result<TurnOutcome, Error> {
         self.require_user_input(targeted_child)?;
+        // A retiring conversation must reject new input concretely even when
+        // an earlier foreground reservation has not yet been released.
+        self.ensure_model_open()?;
         let mut reservation = self.reserve().await?;
         reservation.user_target = Some(targeted_child);
         self.submit_reserved(
@@ -112,6 +117,7 @@ impl SessionInner {
             interrupt_reason: Arc::new(Mutex::new(None)),
             pending: Mutex::new(None),
             submission_operation_id: None,
+            admission_resolver: None,
             resume_pending: false,
             user_target: None,
             carrier_run: Vec::new(),
@@ -143,11 +149,33 @@ impl SessionInner {
         let operation = self.operation.clone().lock_owned().await;
         self.ensure_open()?;
         reset.0 = None;
-        Ok(ReplacementReservation {
+        let reservation = ReplacementReservation {
             inner: self.clone(),
             _operation: OperationReservation::from_guards(operation, foreground),
             _replacement: replacement,
+        };
+        if self.state.live_dialogue_turn().is_none() {
+            return Ok(reservation);
+        }
+        // A dropped replacement caller must not abandon the terminal write or
+        // release the foreground fence while the reply adapter still owns it.
+        tokio::spawn(async move {
+            let mut guard = FaultOnDrop {
+                faulted: &reservation.inner.faulted,
+                armed: true,
+            };
+            reservation
+                .inner
+                .settle_live_external_dialogues(DialogueTerminalReason::Interrupted)
+                .await?;
+            guard.armed = false;
+            drop(guard);
+            Ok(reservation)
         })
+        .await
+        .map_err(|_| {
+            Error::lifecycle("external dialogue replacement settlement stopped unexpectedly")
+        })?
     }
     pub(crate) async fn reserve_pending_input(
         self: &Arc<Self>,
@@ -318,15 +346,21 @@ impl SessionInner {
             return Err(error);
         }
         self.inbox_validation_failed.store(false, Ordering::SeqCst);
-        let submission_operation_id = queued
-            .and_then(|id| {
-                self.inbox
-                    .state
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .submission_operation_id(id)
-            })
-            .or_else(|| operation.submission_operation_id.clone());
+        let (submission_operation_id, admission_resolver) =
+            if let Some(id) = queued.filter(|_| !framework) {
+                let inbox = self.inbox.state.lock().unwrap_or_else(|e| e.into_inner());
+                inbox.claimed_user(id).map_or((None, None), |entry| {
+                    (
+                        entry.submission_operation_id.clone(),
+                        entry.admission_resolver.clone(),
+                    )
+                })
+            } else {
+                (
+                    operation.submission_operation_id.clone(),
+                    operation.admission_resolver.clone(),
+                )
+            };
         let inner = self.clone();
         let worker_token = token.clone();
         let worker = tokio::spawn(async move {
@@ -349,6 +383,7 @@ impl SessionInner {
                 queued,
                 framework,
                 submission_operation_id,
+                admission_resolver.as_deref(),
                 user_target,
                 carrier_run.clone(),
             ))
@@ -459,6 +494,24 @@ impl SessionInner {
                     outcome = Err(error);
                 }
             }
+            if admitted {
+                let can_resume = !inner.faulted.load(Ordering::Acquire)
+                    && !inner.closed.load(Ordering::Acquire)
+                    && !inner.replacing.load(Ordering::Acquire)
+                    && !matches!(outcome, Err(Error::Cancelled))
+                    && inner.has_continuation();
+                if !can_resume {
+                    let reason = match outcome {
+                        Ok(_) => DialogueTerminalReason::Completed,
+                        Err(Error::Cancelled) => DialogueTerminalReason::Cancelled,
+                        Err(_) => DialogueTerminalReason::Interrupted,
+                    };
+                    if let Err(error) = inner.settle_live_external_dialogues(reason).await {
+                        inner.faulted.store(true, Ordering::Release);
+                        outcome = Err(error);
+                    }
+                }
+            }
             if let Ok(result) = &outcome
                 && let Err(error) = inner.publish_completed(result, autonomous)
             {
@@ -502,6 +555,7 @@ impl SessionInner {
         queued: Option<u64>,
         framework: bool,
         submission_operation_id: Option<String>,
+        admission_resolver: Option<&dyn crate::InputAdmissionResolver>,
         user_target: Option<bool>,
         carrier_run: Vec<crate::admission::inbox::IdleCarrier>,
     ) -> Result<TurnOutcome, Error> {
@@ -591,6 +645,10 @@ impl SessionInner {
                 preview_context.replace_tools_for_environment(registry.definitions())?;
             }
             let preview = self.state.preview();
+            preview.install_switch_mode_availability(switch_mode_available(
+                self.kind,
+                preview_context.frozen_tools(),
+            ));
             if preview_context.pending_epoch() {
                 preview.refresh_preview(Boundary::EpochEnded)?;
                 preview_context.materialize_epoch()?;
@@ -649,6 +707,8 @@ impl SessionInner {
             armed: false,
         };
         let mut communication_admission = None;
+        let reply_store =
+            !carrier_run.is_empty() && self.dialogue_reply_store.lock().await.is_some();
         if let Some(input) = input {
             if continuation.is_some() {
                 return Err(Error::config(
@@ -657,6 +717,16 @@ impl SessionInner {
             }
             if cancellation.is_cancelled() {
                 return Err(Error::Cancelled);
+            }
+            // Epoch/catalog updates can discard the live Turn coordinates.
+            // Secure an old dialogue before changing that baseline.
+            if (catalog.is_some() || route_changed || context.pending_epoch())
+                && let Err(error) = self
+                    .settle_live_external_dialogues(DialogueTerminalReason::Interrupted)
+                    .await
+            {
+                self.faulted.store(true, Ordering::Release);
+                return Err(error);
             }
             if catalog.is_some() || route_changed || context.pending_epoch() {
                 admission_transition.armed = true;
@@ -733,6 +803,14 @@ impl SessionInner {
             if cancellation.is_cancelled() {
                 return Err(Error::Cancelled);
             }
+            let prepared = crate::admission::embedding::resolve(
+                admission_resolver,
+                crate::InputAdmissionBoundary::Turn,
+                &input,
+                &cancellation,
+            )
+            .await?;
+            changes.overlay(&prepared.variables);
             let mut staged = None;
             for _ in 0..3 {
                 let original = self.state.preview();
@@ -752,6 +830,8 @@ impl SessionInner {
                     state.turn_id = Some(turn_id);
                     state.round_id = None;
                     state.last_turn_id = turn_id;
+                    state.dialogue_turn = None;
+                    state.dialogue_turn_live = false;
                 });
                 // TurnStarted owns reference refresh, but has no intervening hook.
                 // Run its pure projection on the candidate; no State lock is held
@@ -764,25 +844,45 @@ impl SessionInner {
                 };
                 let mut candidate = context.clone();
                 if !carrier_run.is_empty() {
-                    let carriers = carrier_run
-                        .iter()
-                        .map(|entry| entry.input())
-                        .collect::<Result<Vec<_>, _>>()?;
+                    let carriers =
+                        Self::stage_carrier_run(&preview, &carrier_run, turn_id, reply_store)?;
                     candidate.admit_carriers(carriers, &values)?;
-                    preview.update(|snapshot|{
-                        if let Some(communication)=&mut snapshot.communication{
-                            let consumed=carrier_run.iter().filter_map(|entry|match entry{crate::admission::inbox::IdleCarrier::Accepted(entry)=>Some(entry.operation_id.as_str()),_=>None}).collect::<Vec<_>>();
-                            for receipt in &mut communication.inbox.receipts{if consumed.contains(&receipt.receipt.operation_id.as_str()){receipt.receipt.status=crate::state::communication::inbox::DeliveryStatus::Consumed;}}
-                            communication.inbox.pending.retain(|entry|!consumed.contains(&entry.operation_id.as_str()));
-                        }
-                    });
                 } else if framework {
                     candidate.admit_framework(input.clone(), &values)?;
                 } else {
-                    candidate.admit_user(input.clone(), &values)?;
+                    candidate.admit_user_with_important(
+                        input.clone(),
+                        &values,
+                        prepared.important.clone(),
+                    )?;
+                }
+                if prepared.important.is_some() || prepared.variables != Default::default() {
+                    // The settled request includes the real round-start frame;
+                    // count it together with the trusted overlay and escaped notice.
+                    let mut request_preview = candidate.clone();
+                    let round_preview = preview.preview();
+                    round_preview.update(|state| state.round_id = Some(1));
+                    round_preview.refresh_preview(Boundary::RoundStarted)?;
+                    request_preview.synchronize_state(&round_preview.model_variables()?)?;
+                    microcrab_transport::render_ast(
+                        &request_preview
+                            .content(round_preview.snapshot().limits.max_output_tokens)?,
+                    )?;
                 }
                 if cancellation.is_cancelled() {
                     return Err(Error::Cancelled);
+                }
+                // Only displace a resumable Turn after this input has a valid
+                // candidate. Rebuild under the new authority after settlement.
+                if self.state.live_dialogue_turn().is_some() {
+                    if let Err(error) = self
+                        .settle_live_external_dialogues(DialogueTerminalReason::Interrupted)
+                        .await
+                    {
+                        self.faulted.store(true, Ordering::Release);
+                        return Err(error);
+                    }
+                    continue;
                 }
                 if self.state.commit_input(&original, &preview) {
                     staged = Some(candidate);
@@ -799,6 +899,7 @@ impl SessionInner {
                 .unwrap_or_else(|e| e.into_inner())
                 .take();
             context = candidate;
+            prepared.commit();
             drop(fence);
             if let Some(id) = queued {
                 let mut inbox = self.inbox.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -855,7 +956,22 @@ impl SessionInner {
                 .collect::<Vec<_>>();
             self.acknowledge_carrier_run_locked(&accepted).await?;
         }
+        if continuation.is_none() && !carrier_run.is_empty() {
+            // Only the successfully acknowledged owning admission can mint live
+            // reply authority; checkpoint recovery retains the evidence alone.
+            self.state
+                .update(|state| state.dialogue_turn_live = state.dialogue_turn.is_some());
+        }
         drop(communication_admission);
+        if continuation.is_none()
+            && !carrier_run.is_empty()
+            && let Err(error) = self.open_external_dialogues().await
+        {
+            // No acknowledged live reply authority after a failed Open. An
+            // exact recovered admission can reconcile storage later.
+            self.state.update(|state| state.dialogue_turn_live = false);
+            return Err(error);
+        }
         admission_transition.armed = false;
         if continuation
             .as_ref()

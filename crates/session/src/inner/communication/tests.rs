@@ -143,3 +143,4 @@ mod exchange_tests;
 mod consumption_tests;
 
 mod reattach_tests;
+mod reply_tests;

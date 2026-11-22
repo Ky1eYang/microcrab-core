@@ -2,6 +2,7 @@
 mod exchange;
 mod inbox;
 mod reattach;
+pub(super) mod reply;
 use super::*;
 use crate::runtime::messaging::AgentPeer;
 use crate::state::communication::{
@@ -23,6 +24,14 @@ impl AgentPeer for SessionInner {
         invocation: crate::runtime::tool::ToolContext,
     ) -> Result<crate::state::communication::inbox::QueuedReceipt, Error> {
         self.escalate_owned(arguments, invocation).await
+    }
+    async fn reply_external_speaker(
+        &self,
+        arguments: Value,
+        invocation: crate::runtime::tool::ToolContext,
+    ) -> Result<crate::runtime::tool::ToolOutput, Error> {
+        self.reply_external_speaker_owned(arguments, invocation)
+            .await
     }
     async fn enqueue_authenticated(
         &self,
@@ -68,7 +77,7 @@ impl SessionInner {
         if self.started.load(Ordering::Acquire) || !old.items.is_empty() {
             return Err(Error::config("prepared child already started its Context"));
         }
-        self.runtime.configure_conversation_tools(identity)?;
+        self.runtime.configure_conversation_tools(identity, false)?;
         *self
             .context
             .lock()
