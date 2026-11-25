@@ -63,6 +63,61 @@ fn no_staging(root: &Path) {
 }
 
 #[tokio::test]
+async fn resolved_glob_is_additive_and_never_reloads_rules_on_dispatch() {
+    let (root, host) = host();
+    let ctx = microcrab_host_api::OpContext::default();
+    fs::write(root.path().join(".ignore"), "old.txt\n").unwrap();
+    for name in ["old.txt", "new.txt"] {
+        fs::write(root.path().join(name), "needle").unwrap();
+    }
+    let old_snapshot = host.glob_ignore_snapshot(&ctx).await.unwrap();
+    assert_eq!(old_snapshot.rules[0].content, "old.txt\n");
+    let resolved = host.glob_ignored_paths(&ctx).await.unwrap();
+    assert_eq!(resolved, ["old.txt"]);
+    fs::write(root.path().join(".ignore"), "new.txt\n").unwrap();
+    let req = glob("*.txt", 8);
+    let resolved = host
+        .glob_with_ignored_paths(&ctx, req.clone(), resolved)
+        .await
+        .unwrap();
+    let legacy = host
+        .glob(req.clone(), CancellationToken::new())
+        .await
+        .unwrap();
+    let legacy_state = host
+        .glob_with_ignore_rules(&ctx, req.clone(), old_snapshot.rules)
+        .await
+        .unwrap();
+    let grep = host
+        .grep(grep("needle"), CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(resolved.entries[0].path, Path::new("new.txt"));
+    assert_eq!(legacy.entries[0].path, Path::new("old.txt"));
+    assert_eq!(legacy_state.entries[0].path, Path::new("new.txt"));
+    assert_eq!(grep.matches[0].path, Path::new("old.txt"));
+    let explicit = host
+        .glob_with_ignored_paths(&ctx, req.clone(), vec!["new.txt".into()])
+        .await
+        .unwrap();
+    assert_eq!(explicit.entries[0].path, Path::new("old.txt"));
+    assert_eq!(
+        host.glob_with_ignored_paths(&ctx, req.clone(), vec![])
+            .await
+            .unwrap()
+            .entries
+            .len(),
+        2
+    );
+    let mut invalid = req;
+    invalid.include_ignored = true;
+    assert!(matches!(
+        host.glob_with_ignored_paths(&ctx, invalid, vec![]).await,
+        Err(ToolError::InvalidRequest(_))
+    ));
+}
+
+#[tokio::test]
 async fn page_cursor_preserves_complete_lines_and_full_file_version() {
     let (root, host) = host();
     fs::write(root.path().join("page.txt"), "alpha\nβeta\nlast").unwrap();

@@ -16,8 +16,30 @@ struct State {
     records: HashMap<String, HistoryNode>,
     redo: Vec<String>,
     inbox: Option<super::communication::StoredInbox>,
+    file_versions: Option<super::file_versions::FileVersions>,
 }
 impl MemoryJournal {
+    pub(super) async fn file_versions(
+        &self,
+    ) -> Result<Option<super::file_versions::FileVersions>, Error> {
+        Ok(self
+            .state
+            .lock()
+            .map_err(|_| conflict())?
+            .file_versions
+            .clone())
+    }
+    pub(super) async fn store_file_versions(
+        &self,
+        session: &str,
+        next: super::file_versions::FileVersions,
+    ) -> Result<(), Error> {
+        let mut state = self.state.lock().map_err(|_| conflict())?;
+        if next.check_successor(session, state.file_versions.as_ref())? {
+            state.file_versions = Some(next);
+        }
+        Ok(())
+    }
     pub(super) async fn read_inbox(
         &self,
     ) -> Result<Option<super::communication::StoredInbox>, Error> {

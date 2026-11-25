@@ -21,13 +21,21 @@ pub(super) struct Entry {
     pub output: Option<BufferedOutput>,
     pub controller: Arc<Controller>,
     pub channels: Vec<String>,
+    pub private_mime: Option<String>,
     pub cleanup: Option<(
         tokio::runtime::Handle,
         Arc<dyn crate::runtime::execution::process::ProcessControl>,
     )>,
     pub retained: std::collections::HashMap<u64, (Vec<String>, serde_json::Value)>,
     pub driver: Option<Vec<u8>>,
+    pub web: Option<super::web_transport::Continuation>,
     pub attached: bool,
+}
+impl Entry {
+    pub(super) fn retain_web(&mut self, continuation: super::web_transport::Continuation) {
+        *self.controller.delegate.lock().unwrap_or_else(|error| error.into_inner()) = Some(continuation.controller());
+        self.web = Some(continuation);
+    }
 }
 impl Drop for Entry {
     fn drop(&mut self) {
@@ -189,7 +197,7 @@ pub(super) fn insert(
     Ok(Resource::new_own(id))
 }
 pub(super) fn add_to_linker(linker: &mut Linker<RuntimeState>) -> wasmtime::Result<()> {
-    let mut interface = linker.instance("microcrab:agent/execution@0.8.0")?;
+    let mut interface = linker.instance(microcrab_agent_wit::EXECUTION_INTERFACE)?;
     interface.resource(
         "buffer",
         ResourceType::host::<BufferResource>(),
@@ -205,32 +213,58 @@ pub(super) fn add_to_linker(linker: &mut Linker<RuntimeState>) -> wasmtime::Resu
     interface.func_wrap("finish", finish)?;
     interface.func_wrap("attach-process", attach_process)?;
     interface.func_wrap("retain-process", retain_process)?;
+    interface.func_wrap("launch-private-shell", launch_private_shell)?;
     interface.func_wrap("attach-guest", attach_guest)?;
     Ok(())
 }
 fn create(
     mut caller: StoreContextMut<'_, RuntimeState>,
-    (channels,): (Vec<String>,),
+    (descriptors,): (Vec<abi::OutputChannel>,),
 ) -> wasmtime::Result<(Result<Resource<BufferResource>, abi::ToolFailure>,)> {
     let state = caller.data_mut();
     let result = (|| {
         let context = context(state)?;
-        spend(state, channels.iter().map(String::len).sum())?;
+        let mut cost = 0usize;
+        let mut channels = Vec::new();
+        let mut private_mime = None;
+        let count = descriptors.len();
+        for descriptor in descriptors {
+            cost = cost.saturating_add(descriptor.name.len());
+            match descriptor.kind {
+                abi::ContentKind::Text => channels.push(descriptor.name),
+                abi::ContentKind::Bytes(mime) if count == 1 && descriptor.name == "stdout" => {
+                    cost = cost.saturating_add(mime.len());
+                    private_mime = Some(mime);
+                }
+                abi::ContentKind::Bytes(_) => {
+                    return Err(failure(
+                        "output",
+                        "Private capture requires exactly one Bytes stdout channel",
+                    ));
+                }
+            }
+        }
+        spend(state, cost)?;
         let controller = Arc::new(Controller::new());
-        let (writer, output) = context
-            .open_output(
+        let opened = if let Some(mime) = &private_mime {
+            context.open_private_output(mime.clone(), controller.clone())
+        } else {
+            context.open_output(
                 OutputOptions {
                     channels: channels.clone(),
                 },
                 controller.clone(),
             )
-            .map_err(|e| failure("output", e.to_string()))?;
+        };
+        let (writer, output) = opened.map_err(|e| failure("output", e.to_string()))?;
         let source = Entry {
             writer,
             output: Some(output),
             controller,
             channels,
+            private_mime,
             driver: None,
+            web: None,
             cleanup: state
                 .runtime
                 .clone()
@@ -266,7 +300,11 @@ fn mark_truncated(
     let state = caller.data_mut();
     let result = (|| {
         spend(state, 0)?;
-        entry(state, &resource)?
+        let source = entry(state, &resource)?;
+        if source.private_mime.is_some() {
+            return Err(failure("denied", "Runtime owns private capture"));
+        }
+        source
             .writer
             .mark_truncated()
             .map_err(|e| failure("output", e.to_string()))
@@ -289,19 +327,80 @@ fn finish(
             .map(native_failure)
             .transpose()
             .map_err(|e| failure("invalid_failure", e.to_string()))?;
-        entry(state, &resource)?
+        let source = entry(state, &resource)?;
+        if source.private_mime.is_some() {
+            return Err(failure("denied", "Runtime owns private capture"));
+        }
+        source
             .writer
             .finish(outcome.map_or(Ok(()), Err))
             .map_err(|e| failure("output", e.to_string()))
     })();
     Ok((result,))
 }
+fn launch_private_shell(
+    mut caller: StoreContextMut<'_, RuntimeState>,
+    (resource, request): (
+        Resource<BufferResource>,
+        super::microcrab::host0_1_0::shell::ShellRequest,
+    ),
+) -> wasmtime::Result<(Result<(), abi::ToolFailure>,)> {
+    let state = caller.data_mut();
+    let (writer, mime, controller) = match entry(state, &resource).and_then(|source| {
+        let mime = source
+            .private_mime
+            .clone()
+            .filter(|_| !source.attached)
+            .ok_or_else(|| {
+                failure(
+                    "output",
+                    "Private launch requires a fresh Bytes stdout buffer",
+                )
+            })?;
+        Ok((source.writer.clone(), mime, source.controller.clone()))
+    }) {
+        Ok(arguments) => arguments,
+        Err(error) => return Ok((Err(error),)),
+    };
+    let (result,) = super::resources::launch_private_shell(state, request, &mime, writer)?;
+    Ok((match result {
+        Ok(delegate) => {
+            *controller
+                .delegate
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) = Some(delegate);
+            state
+                .outputs
+                .get_mut(&resource.rep())
+                .expect("output cannot change during its synchronous import")
+                .attached = true;
+            Ok(())
+        }
+        Err(error) => {
+            use super::microcrab::host0_1_0::types::ErrorCategory;
+            let (kind, code) = match error.category {
+                ErrorCategory::Timeout => (abi::FailureKind::Timeout, "startup_timeout"),
+                ErrorCategory::Cancelled => (abi::FailureKind::Cancelled, "host_cancelled"),
+                ErrorCategory::Unsupported => (abi::FailureKind::Failed, "host_unsupported"),
+                ErrorCategory::Permission => (abi::FailureKind::Failed, "host_permission"),
+                _ => (abi::FailureKind::Failed, "host_source"),
+            };
+            Err(abi::ToolFailure {
+                kind,
+                code: code.into(),
+                message: "Private shell launch was not acknowledged".into(),
+                retryable: false,
+            })
+        }
+    },))
+}
+
 fn attach_process(
     mut caller: StoreContextMut<'_, RuntimeState>,
-    (resource, process, captured): (
+    (resource, process, mode): (
         Resource<BufferResource>,
-        super::microcrab::host::process::ProcessHandle,
-        bool,
+        super::microcrab::host0_1_0::process::ProcessHandle,
+        abi::ProcessSource,
     ),
 ) -> wasmtime::Result<(Result<(), abi::ToolFailure>,)> {
     let state = caller.data_mut();
@@ -317,7 +416,7 @@ fn attach_process(
             ));
         }
         let source = entry(state, &resource)?;
-        if source.attached || !source.retained.is_empty() {
+        if source.private_mime.is_some() || source.attached || !source.retained.is_empty() {
             return Err(failure("conflict", "Output already has a producer"));
         }
         let handle =
@@ -334,7 +433,7 @@ fn attach_process(
                 source.writer.clone(),
                 handle,
                 source.channels.clone(),
-                captured,
+                matches!(mode, abi::ProcessSource::ShellText),
             ))
             .map_err(|e| failure("host_source", e.to_string()))?;
         *source
@@ -354,10 +453,10 @@ fn attach_process(
 }
 fn retain_process(
     mut caller: StoreContextMut<'_, RuntimeState>,
-    (resource, process, captured): (
+    (resource, process, mode): (
         Resource<BufferResource>,
-        super::microcrab::host::process::ProcessHandle,
-        bool,
+        super::microcrab::host0_1_0::process::ProcessHandle,
+        abi::ProcessSource,
     ),
 ) -> wasmtime::Result<(Result<(), abi::ToolFailure>,)> {
     let state = caller.data_mut();
@@ -368,6 +467,7 @@ fn retain_process(
         if state.borrowed_processes.contains(&process.id)
             || !state.process_grants.contains_key(&process.id)
             || !source.retained.is_empty()
+            || source.private_mime.is_some()
             || (source.attached && source.driver.is_none())
         {
             return Err(failure(
@@ -383,7 +483,11 @@ fn retain_process(
         let controller = context
             .processes
             .registry()
-            .output_controller(&context.session_id, handle, captured)
+            .output_controller(
+                &context.session_id,
+                handle,
+                matches!(mode, abi::ProcessSource::ShellText),
+            )
             .map_err(|e| failure("host_source", e.to_string()))?;
         *source
             .controller
@@ -416,8 +520,11 @@ fn attach_guest(
             .outputs
             .get_mut(&resource.rep())
             .ok_or_else(|| failure("invalid_resource", "Output removed"))?;
-        if source.attached {
-            return Err(failure("conflict", "Output already has a producer"));
+        if source.private_mime.is_some() || source.attached {
+            return Err(failure(
+                "conflict",
+                "Output already has a producer or is private",
+            ));
         }
         source.driver = Some(bytes);
         source.attached = true;
@@ -498,6 +605,9 @@ pub(super) fn lift(
             let mut source = state.outputs.remove(&value.output.rep()).ok_or_else(|| {
                 Error::denied("Buffered resource is foreign, expired or transferred")
             })?;
+            if source.private_mime.is_some() && !source.attached {
+                return Err(Error::denied("private output has no admitted process"));
+            }
             let output = source
                 .output
                 .take()

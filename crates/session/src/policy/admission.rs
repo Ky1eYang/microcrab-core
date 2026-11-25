@@ -19,6 +19,7 @@ pub struct AdmittedInvocation {
     tool: String,
     component: Option<String>,
     arguments: serde_json::Value,
+    file_version_policy_arguments: Option<Arc<serde_json::Value>>,
     cancellation: CancellationToken,
     grants: std::sync::Mutex<Vec<super::grants::StagedGrant>>,
     interactions: Vec<Arc<dyn PermissionInteraction>>,
@@ -152,6 +153,15 @@ impl AdmittedInvocation {
             Some("invocation subject differs")
         } else if self.tool != context.tool {
             Some("tool identity differs")
+        } else if !match (
+            &self.file_version_policy_arguments,
+            &context.file_version_policy_arguments,
+        ) {
+            (None, None) => true,
+            (Some(expected), Some(actual)) => Arc::ptr_eq(expected, actual),
+            _ => false,
+        } {
+            Some("file version admission witness differs")
         } else if component.is_some_and(|actual| self.component.as_deref() != Some(actual)) {
             Some("component identity differs")
         } else {
@@ -173,20 +183,52 @@ impl PermissionController {
         tool: &str,
     ) -> Result<(CompiledToolPolicy, Vec<serde_json::Value>), PermissionError> {
         let lineage = self.lineage()?;
-        let mut policies = vec![compile(local, tool).map_err(configuration)?];
-        let mut owners = vec![self.provenance(local)];
-        for (owner, snapshot) in &lineage {
-            policies.push(compile(snapshot, tool).map_err(configuration)?);
-            owners.push(owner.provenance(snapshot));
-        }
-        let compiled = combine(policies).map_err(configuration)?;
+        let compiled = Self::compile_witness(local, &lineage, tool)?;
+        let owners = std::iter::once(self.provenance(local))
+            .chain(
+                lineage
+                    .iter()
+                    .map(|(owner, snapshot)| owner.provenance(snapshot)),
+            )
+            .map(|owner| serde_json::to_value(owner).map_err(configuration))
+            .collect::<Result<_, _>>()?;
         self.ensure_witness(local.revision, &lineage)?;
         Ok((compiled, owners))
     }
 
-    fn provenance(&self, snapshot: &PolicySnapshot) -> serde_json::Value {
-        serde_json::json!({"controller":self.identity,"revision":snapshot.revision,
-            "agent":snapshot.config.agent,"mode":snapshot.config.mode})
+    /// Pure compilation from one captured chain; the reader validates the chain
+    /// before and after projecting its entire observation, rather than per row.
+    pub(crate) fn compile_witness(
+        local: &PolicySnapshot,
+        lineage: &[(Arc<PermissionController>, PolicySnapshot)],
+        tool: &str,
+    ) -> Result<CompiledToolPolicy, PermissionError> {
+        let policies = std::iter::once(local)
+            .chain(lineage.iter().map(|(_, snapshot)| snapshot))
+            .map(|snapshot| compile(snapshot, tool).map_err(configuration))
+            .collect::<Result<Vec<_>, _>>()?;
+        combine(policies).map_err(configuration)
+    }
+
+    pub(crate) fn provenance(&self, snapshot: &PolicySnapshot) -> super::PermissionOwner {
+        super::PermissionOwner {
+            controller: self.identity,
+            revision: snapshot.revision,
+            agent: snapshot.config.agent.clone(),
+            mode: snapshot.config.mode.clone(),
+        }
+    }
+
+    pub(crate) fn ancestor_witness(
+        lineage: &[(Arc<PermissionController>, PolicySnapshot)],
+    ) -> String {
+        use sha2::{Digest, Sha256};
+        let mut digest = Sha256::new();
+        for (owner, snapshot) in lineage {
+            digest.update(owner.identity.to_be_bytes());
+            digest.update(snapshot.revision.to_be_bytes());
+        }
+        format!("{:x}", digest.finalize())
     }
 
     pub(crate) fn ensure_witness(
@@ -303,6 +345,9 @@ impl PermissionController {
                         tool: invocation.tool.clone(),
                         component,
                         arguments: request.arguments.clone(),
+                        file_version_policy_arguments: invocation
+                            .file_version_policy_arguments
+                            .clone(),
                         cancellation: invocation.cancellation.clone(),
                         grants: std::sync::Mutex::new(grants),
                         interactions,
@@ -348,7 +393,10 @@ impl PermissionController {
                 .collect::<Result<Vec<_>, _>>()?;
             microcrab_permission::evaluate_compiled_members(
                 &CompiledToolPolicy::AllOf { policies },
-                &request.arguments,
+                invocation
+                    .file_version_policy_arguments
+                    .as_deref()
+                    .unwrap_or(&request.arguments),
             )
             .map_err(configuration)?
         } else {
@@ -399,8 +447,14 @@ impl PermissionController {
                 owned.revision = snapshot.revision;
                 owned.agent = snapshot.config.agent.clone();
                 owned.mode = snapshot.config.mode.clone();
-                let resolution =
-                    owner.resolve_ask(snapshot, &owned, &invocation.state, issuer, cancellation);
+                let resolution = owner.resolve_ask(
+                    snapshot,
+                    &owned,
+                    invocation.image_approval_preview.as_ref(),
+                    &invocation.state,
+                    issuer,
+                    cancellation,
+                );
                 tokio::pin!(resolution);
                 let result = loop {
                     tokio::select! { biased;
@@ -412,21 +466,24 @@ impl PermissionController {
                 // A stale Deny or unavailable result also belongs to the old
                 // witness. Discard it before interpreting that result.
                 self.ensure_witness(local.revision, &lineage)?;
-                let (action, grant, interaction) = result?;
+                let (action, grant, interaction, denial) = result?;
                 if let Some(interaction) = interaction {
                     interactions.push(interaction);
                 }
                 if action != Action::Allow {
-                    return Err(PermissionError::PolicyDenied {
+                    let denial = denial.unwrap_or_else(super::interaction::Denial::invalid_reply);
+                    return Err(PermissionError::SettledDenied {
                         controller: owner.identity,
                         revision: snapshot.revision,
-                        reason: format!(
-                            "approval for agent {:?}, mode {:?}, tool {:?} did not resolve Allow",
-                            snapshot.config.agent, snapshot.config.mode, request.tool
-                        ),
+                        source_kind: denial.source,
+                        reason: denial.reason,
                     });
                 }
-                if let Some(grant) = grant {
+                // Exact predicates saw the canonical version, but this Ask/review
+                // presented authored references. Never promote that view to a reusable grant.
+                if let Some(grant) = grant
+                    && invocation.file_version_policy_arguments.is_none()
+                {
                     grants.push(super::grants::StagedGrant {
                         owner: owner.clone(),
                         expected: snapshot.clone(),

@@ -35,6 +35,8 @@ mod provider_recovery;
 mod reference_cancellation;
 #[path = "reference_lifecycle.rs"]
 mod reference_lifecycle;
+#[path = "response_completion.rs"]
+mod response_completion;
 #[path = "system_template.rs"]
 mod system_template;
 #[path = "variable_protocol.rs"]

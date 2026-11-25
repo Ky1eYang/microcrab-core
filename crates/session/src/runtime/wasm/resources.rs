@@ -3,8 +3,9 @@
 //! Unmapped file/network operations remain typed Unsupported. General process
 //! and shell imports share one admitted Session-owned resource mapping.
 mod execution;
+pub(super) use execution::launch_private_shell;
 pub(super) mod files;
-use super::microcrab::host::{filesystem as fs, net, process, types};
+use super::microcrab::host0_1_0::{filesystem as fs, net, process, types};
 use super::{ImportFailure, RuntimeState, ToolContext};
 use microcrab_host_api::{self as host, FsApi};
 use serde_json::{Value, json};
@@ -13,6 +14,24 @@ use std::{
     time::{Duration, Instant, UNIX_EPOCH},
 };
 use wasmtime::{StoreContextMut, component::Linker};
+
+/// Private capture needs the complete raw owner; do not fall back to a text or
+/// remote capture route when any required operation is absent.
+pub(super) fn private_shell_supported(host: &dyn host::Host) -> bool {
+    [
+        "shell.launch-private",
+        "process.stdout",
+        "process.stderr",
+        "process.watch",
+        "process.status",
+        "process.wait",
+        "process.close-stdin",
+        "process.kill-tree",
+        "process.release",
+    ]
+    .into_iter()
+    .all(|operation| host.supports(operation))
+}
 
 /// Availability describes Runtime mappings, independently of backend support.
 pub(super) fn supported_operation(name: &str) -> bool {
@@ -488,10 +507,14 @@ pub(super) mod tests {
             next_output: 1,
             borrowed_processes: Default::default(),
             admitted_process_scope: None,
+            process_launch_uncertain: false,
             process_grants: Default::default(),
             binding: None,
             tool_context: invoked.then_some(invocation),
             operation_scope: invoked.then(|| ("read".into(), json!({"path": "allowed"}))),
+            web: None,
+            private_bytes: None,
+            guest_observation: None,
             confinement_diagnostic: None,
             operation_cancelled: false,
             operation_diagnostic: None,
@@ -510,6 +533,7 @@ pub(super) mod tests {
             cache_points_remaining: if invoked { 2 } else { 0 },
             patch_plan: None,
             patch_receipts: Vec::new(),
+            patch_version_refs: Vec::new(),
             input_bytes_remaining: 1024,
             output_bytes_remaining: 1024,
         }

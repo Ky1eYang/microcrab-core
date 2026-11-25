@@ -66,6 +66,30 @@ pub trait Reference: Send + Sync + 'static {
     fn read(&self, id: &str) -> Result<Option<ReferenceContent>, Self::Error>;
 
     fn change(&self) -> Result<Option<Value>, Self::Error>;
+
+    /// Capture the owner/legacy projection and an optional model-only override
+    /// from the same catalog observation. Custom references keep their exact data.
+    fn projections(&self) -> Result<ReferenceProjection, Self::Error> {
+        Ok(ReferenceProjection {
+            exact: self.change()?,
+            short_model: None,
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ReferenceProjection {
+    pub exact: Option<Value>,
+    pub short_model: Option<Value>,
+}
+
+impl ReferenceProjection {
+    pub(crate) fn value(&self, short_model: bool) -> Option<&Value> {
+        if short_model && let Some(value) = &self.short_model {
+            return Some(value);
+        }
+        self.exact.as_ref()
+    }
 }
 
 #[async_trait]
@@ -73,7 +97,7 @@ trait ErasedReference: Send + Sync {
     async fn load(&self) -> Result<(), Error>;
     fn list(&self) -> Result<Vec<ReferenceInfo>, Error>;
     fn read(&self, id: &str) -> Result<Option<ReferenceContent>, Error>;
-    fn change(&self) -> Result<Option<Value>, Error>;
+    fn projections(&self) -> Result<ReferenceProjection, Error>;
 }
 
 struct Erased<R: Reference>(R);
@@ -92,8 +116,8 @@ impl<R: Reference> ErasedReference for Erased<R> {
         self.0.read(id).map_err(reference_error)
     }
 
-    fn change(&self) -> Result<Option<Value>, Error> {
-        self.0.change().map_err(reference_error)
+    fn projections(&self) -> Result<ReferenceProjection, Error> {
+        self.0.projections().map_err(reference_error)
     }
 }
 
@@ -143,8 +167,8 @@ impl DynReference {
         self.inner.read(id)
     }
 
-    pub(crate) fn change(&self) -> Result<Option<Value>, Error> {
-        self.inner.change()
+    pub(crate) fn projections(&self) -> Result<ReferenceProjection, Error> {
+        self.inner.projections()
     }
 }
 
@@ -542,7 +566,7 @@ mod tests {
                 Failure::Read => {
                     reference_message(read_id(&References::new(vec![reference]).unwrap(), "entry"))
                 }
-                Failure::Change => reference_message(reference.change()),
+                Failure::Change => reference_message(reference.projections()),
                 Failure::None => unreachable!("only failure cases are exercised"),
             };
             assert_eq!(message, "sample reference failed");

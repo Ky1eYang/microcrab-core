@@ -84,6 +84,105 @@ fn explicit_content_sampling_and_reduced_native_caps_are_allowed() {
 }
 
 #[test]
+fn authored_tool_calls_are_exact_ordered_and_not_insertable() {
+    let mut chat = chat();
+    chat["messages"].as_array_mut().unwrap().push(json!({
+        "role":"assistant", "content":null, "tool_calls":[
+            {"id":"first","type":"function","function":{"name":"echo","arguments":"{}"}},
+            {"id":"second","type":"function","function":{"name":"echo","arguments":"{ }"}}
+        ]
+    }));
+    let mut responses = responses();
+    let items = responses["input"].as_array_mut().unwrap();
+    items.insert(
+        3,
+        json!({"type":"function_call","call_id":"other","name":"echo","arguments":"{ }"}),
+    );
+    let mut anthropic = anthropic();
+    anthropic["messages"][1]["content"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"type":"tool_use","id":"other","name":"echo","input":{"second":true}}));
+    let google = json!({"contents":[
+        {"role":"user","parts":[{"text":"hello"}]},
+        {"role":"model","parts":[
+            {"functionCall":{"id":"first","name":"echo","args":{}}},
+            {"functionCall":{"id":"second","name":"echo","args":{"second":true}}}
+        ]}
+    ],"generationConfig":{"maxOutputTokens":128}});
+
+    for (authored, user, group, first, args, rewrite) in [
+        (
+            chat,
+            "/messages/1/content",
+            "/messages/2/tool_calls",
+            0,
+            "/function/arguments",
+            json!("{ }"),
+        ),
+        (
+            responses,
+            "/input/0/content/0/text",
+            "/input",
+            2,
+            "/arguments",
+            json!("{ }"),
+        ),
+        (
+            anthropic,
+            "/messages/0/content/0/text",
+            "/messages/1/content",
+            2,
+            "/input",
+            json!({"changed":true}),
+        ),
+        (
+            google,
+            "/contents/0/parts/0/text",
+            "/contents/1/parts",
+            0,
+            "/functionCall/args",
+            json!({"changed":true}),
+        ),
+    ] {
+        let args = format!("{group}/{first}{args}");
+        let mut replacement = authored.clone();
+        *replacement.pointer_mut(user).unwrap() = json!("rewritten user text");
+        validate(&authored, &replacement).unwrap();
+        *replacement.pointer_mut(&args).unwrap() = rewrite;
+        assert!(validate(&authored, &replacement).is_err(), "changed {args}");
+
+        let mut replacement = authored.clone();
+        replacement
+            .pointer_mut(group)
+            .unwrap()
+            .as_array_mut()
+            .unwrap()
+            .swap(first, first + 1);
+        assert!(
+            validate(&authored, &replacement).is_err(),
+            "reordered {group}"
+        );
+
+        let mut replacement = authored.clone();
+        replacement
+            .pointer_mut(group)
+            .unwrap()
+            .as_array_mut()
+            .unwrap()
+            .remove(first);
+        assert!(
+            validate(&authored, &replacement).is_err(),
+            "removed from {group}"
+        );
+        assert!(
+            validate(&replacement, &authored).is_err(),
+            "inserted into {group}"
+        );
+    }
+}
+
+#[test]
 fn native_frozen_values_and_stream_mode_are_exact() {
     for (old, pointer) in [
         (chat(), "/messages/0/content"),

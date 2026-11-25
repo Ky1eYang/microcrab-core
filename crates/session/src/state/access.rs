@@ -1,5 +1,11 @@
 //! Shared snapshots, queued custom writes, and atomic Session hook commits.
+mod bytes;
 mod secrets;
+pub(crate) use bytes::RedirectDestination;
+pub use bytes::{
+    BytesVariableAvailability, BytesVariableKind, BytesVariableLifecycle, BytesVariableMetadata,
+    BytesWriteReceipt, PreparedBytesWrite,
+};
 pub use secrets::PreparedSecretWrite;
 #[cfg(test)]
 mod tests;
@@ -38,6 +44,8 @@ pub struct VariableInspection {
     pub values: Value,
     pub metadata: Value,
     pub descriptors: BTreeMap<String, VariableDescriptor>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub bytes: BTreeMap<String, BytesVariableMetadata>,
     pub witness: VariableWitness,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -64,12 +72,18 @@ enum Writer {
 #[derive(Clone)]
 struct LiveState {
     snapshot: SessionState,
+    bytes: bytes::ByteVariables,
+    image_host: Option<Arc<dyn microcrab_host_api::Host>>,
+    #[cfg(feature = "wasm")]
+    file_versions: Option<Arc<crate::runtime::wasm::FileVersionOwner>>,
+    short_model_refs: bool,
     /// Live-owner commit counter, separate from frozen Recover serialization.
     variables_revision: u64,
     runtime_instance_id: String,
     processes: Arc<dyn crate::runtime::execution::process::ProcessControl>,
     executions: Arc<crate::runtime::execution::ExecutionRegistry>,
     permission: Option<crate::policy::PermissionObservation>,
+    permission_model_names: Option<Arc<std::collections::BTreeSet<String>>>,
     builtins: Map<String, Value>,
     references_installed: bool,
     references_revision: u64,
@@ -85,12 +99,13 @@ struct LiveState {
     #[cfg(feature = "wasm")]
     wasm: Arc<crate::runtime::wasm::EpochInstances>,
     /// Last projection returned by each reference kind. Not a custom variable.
-    reference_projection: Map<String, Value>,
+    reference_projection: Vec<(String, super::reference::ReferenceProjection)>,
 }
 fn inspection_metadata(live: &LiveState) -> Result<Value, Error> {
     let mut metadata = live.snapshot.variables.metadata();
     // Historical custom metadata must not describe the live framework object.
     metadata.remove(crate::admission::variables::EXECUTION_CAPACITY_KEY);
+    metadata.remove("permission");
     for name in ["agent_init", "agent_initialization_pending"] {
         metadata.insert(
             name.into(),
@@ -145,7 +160,13 @@ impl State {
                     snapshot.limits.clone(),
                 ),
                 permission: None,
+                permission_model_names: None,
                 snapshot,
+                bytes: Default::default(),
+                image_host: None,
+                #[cfg(feature = "wasm")]
+                file_versions: None,
+                short_model_refs: false,
                 variables_revision: 0,
                 runtime_instance_id: uuid::Uuid::new_v4().to_string(),
                 builtins: Map::new(),
@@ -161,7 +182,7 @@ impl State {
                 cache_points: Arc::new(crate::runtime::cache::Collector::default()),
                 #[cfg(feature = "wasm")]
                 wasm: Arc::new(crate::runtime::wasm::EpochInstances::default()),
-                reference_projection: Map::new(),
+                reference_projection: Default::default(),
             })),
             writer: Writer::Detached,
             actor: VariableRole::Client,
@@ -180,6 +201,44 @@ impl State {
             messaging: Default::default(),
             notice_inbox: Arc::new(Mutex::new(Weak::new())),
         }
+    }
+
+    #[cfg(feature = "wasm")]
+    pub(crate) fn install_file_versions(&self, owner: Arc<crate::runtime::wasm::FileVersionOwner>) {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .file_versions = Some(owner);
+    }
+
+    #[cfg(feature = "wasm")]
+    pub(crate) fn file_versions(&self) -> Option<Arc<crate::runtime::wasm::FileVersionOwner>> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .file_versions
+            .clone()
+    }
+
+    pub(crate) fn set_short_model_refs(&self, enabled: bool) {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .short_model_refs = enabled;
+    }
+
+    pub(crate) fn short_model_refs(&self) -> bool {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .short_model_refs
+    }
+
+    pub(crate) fn install_image_host(&self, host: Option<Arc<dyn microcrab_host_api::Host>>) {
+        self.inner
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .image_host = host;
     }
 
     pub(crate) fn install_inbox(&self, inbox: Weak<crate::admission::inbox::Inbox>) {
@@ -389,6 +448,7 @@ impl State {
             state.variables_revision = 0;
         }
         state.snapshot = snapshot;
+        state.bytes.clear();
         state.builtins.clear();
         state.reference_projection.clear();
         state.references_loaded = false;
@@ -419,6 +479,15 @@ impl State {
             .selected_mode
             .clone()
     }
+    /// Exact live identity and selected mode, without projecting other State facts.
+    pub(crate) fn permission_position(&self) -> (String, Option<String>) {
+        let live = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        (
+            live.runtime_instance_id.clone(),
+            live.snapshot.selected_mode.clone(),
+        )
+    }
+
     /// Issuer mode and its literal instructions, observed under one State lock.
     pub(crate) fn selected_mode_instructions(&self) -> (String, String) {
         let live = self.inner.lock().unwrap_or_else(|error| error.into_inner());
@@ -484,6 +553,17 @@ impl State {
             .unwrap_or_else(|e| e.into_inner())
             .permission = Some(permission);
     }
+    pub(crate) fn set_model_permission_names(
+        &self,
+        definitions: &[microcrab_protocol::ToolDefinition],
+    ) {
+        let names = definitions.iter().map(|tool| tool.name.clone()).collect();
+        self.inner
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .permission_model_names = Some(Arc::new(names));
+    }
+
     pub(crate) fn install_processes(
         &self,
         processes: Arc<dyn crate::runtime::execution::process::ProcessControl>,
@@ -591,7 +671,7 @@ impl State {
     /// Public read-only facts use the same derivation as model State. Handles and
     /// custom-variable mutation remain separate from this ephemeral view.
     pub fn view(&self) -> Result<Value, Error> {
-        current_view(|| {
+        current_view(false, || {
             self.inner
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
@@ -600,7 +680,7 @@ impl State {
     }
     /// Explicit owner inspection includes all custom values; automatic projections stay visible-only.
     pub fn view_all(&self) -> Result<Value, Error> {
-        current_view(|| {
+        current_view(false, || {
             self.inner
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
@@ -616,8 +696,8 @@ impl State {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .clone();
-        let values =
-            current_projection(&live.clone().with_all_variables()).map_err(projection_error)?;
+        let values = current_projection(&live.clone().with_all_variables(), false)
+            .map_err(projection_error)?;
         let metadata = inspection_metadata(&live)?;
         let custom = live.snapshot.variables.metadata();
         let mut descriptors = BTreeMap::new();
@@ -669,6 +749,11 @@ impl State {
             values,
             metadata,
             descriptors,
+            bytes: if self.actor == VariableRole::Client {
+                live.bytes.metadata()
+            } else {
+                BTreeMap::new()
+            },
             witness: live.witness(),
         })
     }
@@ -709,11 +794,15 @@ impl State {
             .as_value();
         if let Value::Object(values) = &mut values {
             values.remove(crate::admission::variables::EXECUTION_CAPACITY_KEY);
+            values.remove("permission");
         }
         values
     }
     pub fn extract(&self, key: &str) -> Option<Value> {
-        if key == crate::admission::variables::EXECUTION_CAPACITY_KEY {
+        if matches!(
+            key,
+            crate::admission::variables::EXECUTION_CAPACITY_KEY | "permission"
+        ) {
             return None;
         }
         self.inner
@@ -735,6 +824,7 @@ impl State {
     pub(crate) fn clear_ephemeral_variables(&self) {
         let mut live = self.inner.lock().unwrap_or_else(|error| error.into_inner());
         live.snapshot.variables.clear_ephemeral();
+        live.bytes.clear();
     }
     pub(super) fn wasm_extract(&self, key: &str) -> Result<Option<Value>, Error> {
         let Writer::Session(owner) = &self.writer else {
@@ -847,6 +937,17 @@ impl State {
             return Err(Error::VariableConflict);
         }
         reject_owned_keys(&state.snapshot.references, &change)?;
+        if change
+            .set
+            .keys()
+            .chain(&change.remove)
+            .chain(change.scoped_set.iter().map(|entry| &entry.name))
+            .any(|name| state.bytes.owns(name))
+        {
+            return Err(Error::VariableForbidden(
+                "Bytes variables require the typed Client endpoint".into(),
+            ));
+        }
         let mut variables = state.snapshot.variables.clone();
         variables.change(&change, actor)?;
         crate::admission::variables::admit(
@@ -896,6 +997,7 @@ impl State {
             || live.snapshot.epoch_id != original.snapshot.epoch_id
             || live.snapshot.last_turn_id != original.snapshot.last_turn_id
             || live.snapshot.limits != original.snapshot.limits
+            || live.short_model_refs != original.short_model_refs
             || live.reference_projection != original.reference_projection
         {
             return false;
@@ -943,7 +1045,7 @@ impl State {
         reference: super::reference::DynReference,
     ) -> Result<(), Error> {
         validate_custom_key(reference.kind())?;
-        let projection = reference.change()?;
+        let projection = reference.projections()?;
         let original = self
             .inner
             .lock()
@@ -960,18 +1062,33 @@ impl State {
             references.push(reference.clone());
         }
         candidate.snapshot.references = References::new(references)?;
+        if original.bytes.owns(reference.kind()) {
+            return Err(Error::config(
+                "reference kind conflicts with a live Bytes variable",
+            ));
+        }
         candidate
             .snapshot
             .references
             .validate_variables(&candidate.snapshot.variables)?;
-        if let Some(projection) = projection {
-            candidate
+        let previous = candidate
+            .reference_projection
+            .iter()
+            .position(|(kind, _)| kind == reference.kind());
+        match (
+            previous,
+            projection.exact.is_some() || projection.short_model.is_some(),
+        ) {
+            (Some(index), true) => candidate.reference_projection[index].1 = projection,
+            (Some(index), false) => {
+                candidate.reference_projection.remove(index);
+            }
+            (None, true) => candidate
                 .reference_projection
-                .insert(reference.kind().to_owned(), projection);
-        } else {
-            candidate.reference_projection.remove(reference.kind());
+                .push((reference.kind().to_owned(), projection)),
+            (None, false) => {}
         }
-        let values = current_projection(&candidate).map_err(projection_error)?;
+        let values = current_projection(&candidate, true).map_err(projection_error)?;
         crate::admission::Admission::serialized(
             crate::admission::AdmissionSource::StateDelivery,
             crate::LimitKind::ContextBytes,
@@ -982,6 +1099,7 @@ impl State {
         if live.runtime_instance_id != original.runtime_instance_id
             || live.variables_revision != original.variables_revision
             || live.references_revision != original.references_revision
+            || live.short_model_refs != original.short_model_refs
             || live.reference_projection != original.reference_projection
             || live.active_correspondents != original.active_correspondents
             || live.snapshot.communication != original.snapshot.communication
@@ -1005,12 +1123,7 @@ impl State {
 
     pub(crate) fn refresh_reference_projection(&self) -> Result<(), Error> {
         let references = self.snapshot().references.clone();
-        let mut projection = Map::new();
-        for reference in references.iter() {
-            if let Some(value) = reference.change()? {
-                projection.insert(reference.kind().to_owned(), value);
-            }
-        }
+        let projection = capture_reference_projections(&references)?;
         self.inner
             .lock()
             .unwrap_or_else(|error| error.into_inner())
@@ -1033,13 +1146,7 @@ impl State {
         })?;
         let projection = if read_references {
             let references = self.snapshot().references.clone();
-            let mut projection = Map::new();
-            for reference in references.iter() {
-                if let Some(value) = reference.change()? {
-                    projection.insert(reference.kind().to_owned(), value);
-                }
-            }
-            Some(projection)
+            Some(capture_reference_projections(&references)?)
         } else {
             None
         };
@@ -1077,17 +1184,37 @@ impl State {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .clone();
-        current_projection(&live)
+        current_projection(&live, true)
     }
 
     pub(crate) fn model_variables(&self) -> Result<Value, Error> {
-        self.view()
+        current_view(true, || {
+            self.inner
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .clone()
+        })
     }
 
     fn reject_reference_keys(&self, change: &VariablesChange) -> Result<(), Error> {
         let state = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         reject_owned_keys(&state.snapshot.references, change)
     }
+}
+
+fn capture_reference_projections(
+    references: &References,
+) -> Result<Vec<(String, super::reference::ReferenceProjection)>, Error> {
+    references
+        .iter()
+        .filter_map(|reference| match reference.projections() {
+            Ok(projection) if projection.exact.is_none() && projection.short_model.is_none() => {
+                None
+            }
+            Ok(projection) => Some(Ok((reference.kind().to_owned(), projection))),
+            Err(error) => Some(Err(error)),
+        })
+        .collect()
 }
 
 fn reject_owned_keys(references: &References, change: &VariablesChange) -> Result<(), Error> {
@@ -1116,9 +1243,9 @@ pub(crate) fn projection_error(error: crate::policy::PermissionError) -> Error {
         error => Error::config_with_private(error.public_reason(), error.to_string()),
     }
 }
-fn current_view(mut capture: impl FnMut() -> LiveState) -> Result<Value, Error> {
+fn current_view(model: bool, mut capture: impl FnMut() -> LiveState) -> Result<Value, Error> {
     for _ in 0..3 {
-        match current_projection(&capture()) {
+        match current_projection(&capture(), model) {
             Ok(value) => return Ok(value),
             Err(crate::policy::PermissionError::StalePolicy) => continue,
             Err(error) => return Err(projection_error(error)),
@@ -1126,7 +1253,10 @@ fn current_view(mut capture: impl FnMut() -> LiveState) -> Result<Value, Error> 
     }
     Err(Error::StateObservationConflict)
 }
-fn current_projection(live: &LiveState) -> Result<Value, crate::policy::PermissionError> {
+fn current_projection(
+    live: &LiveState,
+    model: bool,
+) -> Result<Value, crate::policy::PermissionError> {
     let witness = live
         .permission
         .as_ref()
@@ -1148,7 +1278,16 @@ fn current_projection(live: &LiveState) -> Result<Value, crate::policy::Permissi
         values.remove(key);
     }
     values.extend(live.builtins.clone());
-    values.extend(live.reference_projection.clone());
+    let short_model = model && live.short_model_refs;
+    values.extend(
+        live.reference_projection
+            .iter()
+            .filter_map(|(kind, projection)| {
+                projection
+                    .value(short_model)
+                    .map(|value| (kind.clone(), value.clone()))
+            }),
+    );
     for key in ["tool_tasks", "jobs", "subagents"] {
         values.remove(key);
     }
@@ -1156,7 +1295,16 @@ fn current_projection(live: &LiveState) -> Result<Value, crate::policy::Permissi
     if executions.is_empty() {
         values.remove("executions");
     } else {
-        values.insert("executions".into(), json!(executions));
+        let rows = if short_model {
+            let metadata: Vec<_> = executions
+                .into_iter()
+                .map(crate::runtime::execution::ModelExecutionMetadata::from)
+                .collect();
+            json!(metadata)
+        } else {
+            json!(executions)
+        };
+        values.insert("executions".into(), rows);
     }
     values.insert(
         crate::admission::variables::EXECUTION_CAPACITY_KEY.into(),
@@ -1196,10 +1344,14 @@ fn current_projection(live: &LiveState) -> Result<Value, crate::policy::Permissi
         values.remove("mode");
         values.remove("mode_prompt");
     }
-    if let Some(permission) = &live.permission {
-        values.insert("permission".into(), permission.project()?);
-    } else {
-        values.remove("permission");
+    // Never expose the model hint (or a legacy value with the same key) in
+    // generic State reads. Keeping this key reserved is independent of visibility.
+    values.remove("permission");
+    if model && let Some(permission) = &live.permission {
+        values.insert(
+            "permission".into(),
+            permission.project(live.permission_model_names.as_deref())?,
+        );
     }
     let eligible = authorized_delegatable_agents(
         &live.catalog,

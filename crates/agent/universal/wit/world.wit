@@ -1,6 +1,6 @@
 package microcrab:universal@0.1.0;
 world universal {
-  include microcrab:agent/agent@0.8.0;
+  include microcrab:agent/agent@0.9.0;
   import microcrab:host/shell@0.1.0;
   import microcrab:host/process@0.1.0;
   // For explicit guest use only; the shell does not call this interface.

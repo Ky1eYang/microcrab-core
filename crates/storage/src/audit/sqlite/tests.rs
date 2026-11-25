@@ -47,7 +47,9 @@ fn root_purge_fences_live_writers_and_removes_only_authorized_descendants() {
     let connection = Connection::open(&path).unwrap();
     connection.execute_batch("CREATE TABLE journal_nodes(session_id TEXT,id TEXT,body BLOB); CREATE TABLE journal_heads(session_id TEXT,cursor BLOB,redo BLOB);
         INSERT INTO journal_heads VALUES('root',NULL,X'00'),('child',NULL,X'00'),('other-child',NULL,X'00'),('private-child',NULL,X'00');
-        INSERT INTO journal_nodes VALUES('root','node',X'00'),('child','node',X'00'),('other-child','node',X'00'),('private-child','node',X'00');").unwrap();
+        INSERT INTO journal_nodes VALUES('root','node',X'00'),('child','node',X'00'),('other-child','node',X'00'),('private-child','node',X'00');
+        CREATE TABLE journal_file_versions(session_id TEXT PRIMARY KEY,body BLOB NOT NULL);
+        INSERT INTO journal_file_versions VALUES('root',X'00'),('child',X'00'),('other-child',X'00'),('private-child',X'00');").unwrap();
     let mut ledger = crate::usage::SqliteUsageStore::open(
         &path,
         AuditScope::new("owner", "root", "root"),
@@ -86,6 +88,14 @@ fn root_purge_fences_live_writers_and_removes_only_authorized_descendants() {
         .query_row("SELECT count(*) FROM journal_nodes", [], |row| row.get(0))
         .unwrap();
     assert_eq!(count, 2);
+    let versions = connection
+        .prepare("SELECT session_id FROM journal_file_versions ORDER BY session_id")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(versions, ["other-child", "private-child"]);
     let count: u64 = connection
         .query_row("SELECT count(*) FROM audit_streams", [], |row| row.get(0))
         .unwrap();

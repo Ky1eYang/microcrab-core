@@ -6,6 +6,22 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
 
+/// Canonical bare MIME witness for a private stream. It describes the declared
+/// content, not a validation of the bytes. Use application/octet-stream when unknown.
+pub fn is_capture_mime(value: &str) -> bool {
+    fn token(value: &str) -> bool {
+        !value.is_empty()
+            && value.as_bytes()[0].is_ascii_alphanumeric()
+            && value.bytes().all(|byte| {
+                byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"!#$&^_.+-".contains(&byte)
+            })
+    }
+    value.len() <= 127
+        && value
+            .split_once('/')
+            .is_some_and(|(major, minor)| token(major) && token(minor))
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentInfo {

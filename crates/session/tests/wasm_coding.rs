@@ -420,10 +420,12 @@ fn components_without_current_describe_exports_are_rejected() {
 }
 
 #[tokio::test]
-#[ignore = "parent gate builds the coding component and sets MICROCRAB_CODING_WASM"]
+#[ignore = "set MICROCRAB_LEGACY_CODING_WASM to the historical stateless Coding component"]
 async fn actual_coding_component_reads_writes_edits_searches_and_rejects_conflicts() {
+    // This compatibility fixture intentionally exercises direct detached invocation.
+    // Current Coding requires an owned Session for its Init State publication.
     let bytes =
-        std::fs::read(std::env::var_os("MICROCRAB_CODING_WASM").expect("built coding component"))
+        std::fs::read(std::env::var_os("MICROCRAB_LEGACY_CODING_WASM").expect("historical stateless coding component"))
             .unwrap();
     let root = tempfile::tempdir().unwrap();
     let host =

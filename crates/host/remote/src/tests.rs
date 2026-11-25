@@ -4,11 +4,13 @@ mod automatic_recovery;
 mod automatic_recovery_followup;
 mod diagnostics;
 mod failure_causes;
+mod glob_ignore;
 mod heartbeat;
 mod mutations;
 mod processes;
 mod readiness;
 mod reconciliation;
+mod web_transport;
 
 #[tokio::test]
 async fn typed_glob_preserves_directory_opt_in_kinds_and_truncation() {
@@ -222,9 +224,10 @@ async fn cancelled_late_reply_is_discarded_without_losing_route() {
     assert!(host.is_ready());
     host.detach(1);
 }
-#[test]
-fn duplicate_transfer_declarations_cannot_grow_pending_map() {
+#[tokio::test]
+async fn duplicate_transfer_declarations_cannot_grow_pending_map() {
     let host = RemoteHost::new(descriptor()).unwrap();
+    let _peer = ready(&host, 1).await;
     let (sender, _receiver) = oneshot::channel();
     host.pending.lock().unwrap().insert(
         "request".into(),
@@ -256,7 +259,7 @@ use microcrab_host_protocol::{
     payload_digest,
 };
 use serde_json::json;
-fn descriptor() -> HostDescriptor {
+pub(super) fn descriptor() -> HostDescriptor {
     let mut descriptor = HostDescriptor {
         protocol_version: microcrab_host_protocol::PROTOCOL_VERSION,
         host_id: "host-1".into(),
@@ -307,10 +310,34 @@ async fn ready_with_scope(
     generation: u64,
     scope: BindingScope,
 ) -> mpsc::Receiver<HostFrame> {
+    ready_with_extensions(host, generation, scope, (false, false)).await
+}
+async fn ready_with_extensions(
+    host: &Arc<RemoteHost>,
+    generation: u64,
+    scope: BindingScope,
+    glob: (bool, bool),
+) -> mpsc::Receiver<HostFrame> {
     let (outbound, mut receiver) = mpsc::channel(32);
     host.set_scope(scope).unwrap();
-    host.attach_with_lease(outbound, generation, format!("lease-{generation}"))
-        .unwrap();
+    host.attach_route_with_glob_capabilities(
+        outbound,
+        generation,
+        format!("lease-{generation}"),
+        host.descriptor.bridge_instance_id.clone(),
+        None,
+        glob,
+    )
+    .unwrap();
+    finish_ready(host, generation, &mut receiver).await;
+    receiver
+}
+
+async fn finish_ready(
+    host: &Arc<RemoteHost>,
+    generation: u64,
+    receiver: &mut mpsc::Receiver<HostFrame>,
+) {
     let task = {
         let host = host.clone();
         tokio::spawn(async move { host.reconcile().await })
@@ -320,7 +347,7 @@ async fn ready_with_scope(
         operation_id,
         method: HostRequest::Recovery,
         ..
-    } = next_request(&mut receiver).await
+    } = next_request(receiver).await
     else {
         panic!("expected recovery")
     };
@@ -344,7 +371,7 @@ async fn ready_with_scope(
             operation_id,
             method: HostRequest::ProcessInventory,
             ..
-        } = next_request(&mut receiver).await
+        } = next_request(receiver).await
         else {
             panic!("expected job inventory")
         };
@@ -360,7 +387,6 @@ async fn ready_with_scope(
     }
     task.await.unwrap().unwrap();
     assert!(host.is_ready());
-    receiver
 }
 #[tokio::test]
 async fn reconnect_fences_stale_routes_and_requires_reconciliation() {

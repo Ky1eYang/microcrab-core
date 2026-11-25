@@ -102,8 +102,8 @@ async fn assert_reopened(
         route_witness: None,
         navigation_boundary: Some(microcrab_session::NavigationBoundary::Internal),
     };
-    let node = HistoryNode::new(None, checkpoint);
-    node.validate(&cursor.checkpoint_id).unwrap();
+    let (node, _) = crate::history::dedup::split_v5(None, &checkpoint).unwrap();
+    node.validate_header(&cursor.checkpoint_id).unwrap();
     assert_measurement(&restored, version);
     assert_eq!(serde_json::to_value(&restored).unwrap(), *expected);
     journal.close().await.unwrap();

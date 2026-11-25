@@ -19,6 +19,7 @@ pub(super) struct ProcessController {
     pub session: String,
     pub handle: ProcessHandle,
     pub captured: bool,
+    pub private: bool,
     pub stopping: CancellationToken,
     cancel_state: Mutex<CancelState>,
     cancel_changed: tokio::sync::Notify,
@@ -76,6 +77,7 @@ impl ProcessController {
             session,
             handle,
             captured,
+            private: false,
             stopping: CancellationToken::new(),
             cancel_state: Mutex::new(CancelState::default()),
             cancel_changed: tokio::sync::Notify::new(),
@@ -111,7 +113,9 @@ impl ProcessController {
 #[async_trait]
 impl ExecutionController for ProcessController {
     fn capabilities(&self) -> ExecutionCapabilities {
-        ExecutionCapabilities { input: true }
+        ExecutionCapabilities {
+            input: !self.private,
+        }
     }
     async fn write(
         &self,
@@ -119,6 +123,9 @@ impl ExecutionController for ProcessController {
         eof: bool,
         cancellation: CancellationToken,
     ) -> Result<(), Error> {
+        if self.private {
+            return Err(Error::denied("private shell does not accept input"));
+        }
         self.registry
             .source_write(
                 &self.session,
@@ -224,6 +231,65 @@ pub(super) async fn pump(
     }
     Ok(())
 }
+/// These streams are taken directly from the Host by the single owner; unlike
+/// guest pipe imports they do not allocate a Vec per Host frame before capture.
+/// Local Host bounds each frame; no raw payload enters Host/Shell diagnostic text.
+pub(super) async fn pump_private(
+    controller: Arc<ProcessController>,
+    writer: OutputWriter,
+) -> Result<(), Error> {
+    let host = controller.registry.source_host()?;
+    let context = controller
+        .registry
+        .source_context(controller.stopping.clone());
+    ProcessApi::close_stdin(host.as_ref(), &context, controller.handle)
+        .await
+        .map_err(|_| Error::tool("private shell could not close stdin"))?;
+    let owner = &controller;
+    let writer_ref = &writer;
+    let read = |stderr: bool| async move {
+        let controller = owner;
+        let writer = writer_ref;
+        while let Some(frame) = controller
+            .registry
+            .source_read_pipe(
+                &controller.session,
+                controller.handle,
+                stderr,
+                controller.stopping.clone(),
+            )
+            .await
+            .map_err(|_| Error::tool("private output pipe capture failed"))?
+        {
+            if !stderr {
+                writer.append_private(&frame)?;
+            }
+        }
+        Ok::<_, Error>(())
+    };
+    let wait = async {
+        ProcessApi::wait(host.as_ref(), &context, controller.handle)
+            .await
+            .map_err(|_| Error::tool("private shell wait failed"))
+    };
+    let (_, _, status) = tokio::select! {
+        biased;
+        _ = controller.stopping.cancelled() => return Err(Error::Cancelled),
+        result = async { tokio::try_join!(read(false), read(true), wait) } => result?,
+    };
+    if controller.cancellation_confirmed().await? {
+        writer.confirm_cancelled()?;
+    } else if status.code == Some(0) && status.signal.is_none() {
+        writer.finish(Ok(()))?;
+    } else {
+        writer.finish(Err(super::super::ToolFailure::failed(
+            "process_exit",
+            "Private shell did not exit successfully",
+        )))?;
+    }
+    Ok(())
+}
+
 async fn read_pipe(
     controller: Arc<ProcessController>,
     stderr: bool,

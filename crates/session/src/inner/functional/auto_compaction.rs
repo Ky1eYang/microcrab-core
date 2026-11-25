@@ -7,7 +7,7 @@ use crate::runtime::journal::RoundContinuation;
 impl SessionInner {
     pub(crate) async fn retry_auto_compaction(self: &Arc<Self>) -> Result<bool, Error> {
         self.ensure_open()?;
-        let _operation = self.reserve().await?;
+        let _operation = self.reserve_model().await?;
         let continuation = self
             .continuation
             .lock()
@@ -118,12 +118,13 @@ impl SessionInner {
         // not advance rounds, renew budgets, reset execution or admit inbox input.
         self.persist(context, continuation.clone()).await?;
         self.observe_context(context)?;
+        let helper_issuer = self.functional_issuer(issued.clone());
         let generated = subagents::auto_compact::run(
             self.one_shots.as_ref(),
             self.client.clone(),
             self.auditor.inner.clone(),
             Arc::new(self.state.clone()),
-            &issued,
+            &helper_issuer,
             cancellation,
         )
         .await;

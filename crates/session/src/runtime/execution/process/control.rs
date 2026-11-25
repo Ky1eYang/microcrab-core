@@ -3,7 +3,7 @@ use super::ProcessRegistry;
 use crate::Error;
 use async_trait::async_trait;
 use microcrab_host_api::{
-    ShellRequest,
+    PrivateShellRequest, ShellRequest,
     process::{ProcessHandle, ProcessSpec},
 };
 use serde_json::Value;
@@ -38,6 +38,16 @@ pub trait ProcessControl: Send + Sync {
         request: ShellRequest,
         cancellation: CancellationToken,
     ) -> Result<ProcessHandle, Error>;
+    /// Runtime-only capture; the returned Host identity is never lifted to a guest.
+    async fn launch_private_shell(
+        &self,
+        _tool: &str,
+        _call_id: &str,
+        _request: PrivateShellRequest,
+        _cancellation: CancellationToken,
+    ) -> Result<ProcessHandle, Error> {
+        Err(Error::tool("private shell capture is unsupported"))
+    }
     async fn launch_process(
         &self,
         tool: &str,

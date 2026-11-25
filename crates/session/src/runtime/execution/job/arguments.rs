@@ -9,7 +9,19 @@ pub(crate) struct Arguments<'a> {
     pub(super) batch: bool,
     pub(super) action: &'static str,
     pub(super) args: Value,
+    pub(super) redirect: Option<Redirect<'a>>,
 }
+
+pub(super) struct Redirect<'a> {
+    pub(super) channel: &'a str,
+    pub(super) expected_mime: &'a str,
+    pub(super) variable: &'a str,
+}
+
+pub(crate) fn is_redirect(arguments: &Value) -> bool {
+    arguments.get("action").and_then(Value::as_str) == Some(super::REDIRECT)
+}
+
 pub(crate) fn canonical(action: &str) -> Option<&'static str> {
     Some(match action {
         "status" => "status",
@@ -18,6 +30,7 @@ pub(crate) fn canonical(action: &str) -> Option<&'static str> {
         "write" => "write",
         "cancel" => "cancel",
         "release" => "release",
+        super::REDIRECT => super::REDIRECT,
         _ => return None,
     })
 }
@@ -91,6 +104,50 @@ pub(crate) fn validate(arguments: &Value) -> Result<Arguments<'_>, Error> {
         .and_then(Value::as_str)
         .and_then(canonical)
         .ok_or_else(|| Error::tool("job requires supported action"))?;
+    let redirect = if action == super::REDIRECT {
+        if batch {
+            return Err(Error::tool(
+                "job redirect requires one scalar execution handle",
+            ));
+        }
+        let (session, number) = parse_handle(ids[0].as_ref())?;
+        if ids[0].as_ref() != format!("{session}/{number}") {
+            return Err(invalid_handle());
+        }
+        let object = arguments
+            .get("args")
+            .and_then(Value::as_object)
+            .ok_or_else(|| {
+                Error::tool("job redirect requires channel, expected_mime and variable")
+            })?;
+        if object.len() != 3 {
+            return Err(Error::tool(
+                "job redirect requires only channel, expected_mime and variable",
+            ));
+        }
+        let channel = object
+            .get("channel")
+            .and_then(Value::as_str)
+            .filter(|channel| *channel == "stdout")
+            .ok_or_else(|| Error::tool("job redirect requires the exact stdout channel"))?;
+        let expected_mime = object
+            .get("expected_mime")
+            .and_then(Value::as_str)
+            .filter(|mime| microcrab_agent_types::is_capture_mime(mime))
+            .ok_or_else(|| Error::tool("job redirect requires a canonical concrete MIME type"))?;
+        let variable = object
+            .get("variable")
+            .and_then(Value::as_str)
+            .filter(|name| microcrab_protocol::valid_secret_key(name))
+            .ok_or_else(|| Error::tool("job redirect requires a literal Bytes variable name"))?;
+        Some(Redirect {
+            channel,
+            expected_mime,
+            variable,
+        })
+    } else {
+        None
+    };
     let args = arguments.get("args").cloned().unwrap_or_else(|| json!({}));
     let object = args
         .as_object()
@@ -99,6 +156,7 @@ pub(crate) fn validate(arguments: &Value) -> Result<Arguments<'_>, Error> {
         "read" => &["cursor", "max_bytes"],
         "wait" => &["revision"],
         "write" => &["data", "eof"],
+        super::REDIRECT => &["channel", "expected_mime", "variable"],
         _ => &[],
     };
     if object.keys().any(|key| !allowed.contains(&key.as_str())) {
@@ -132,6 +190,7 @@ pub(crate) fn validate(arguments: &Value) -> Result<Arguments<'_>, Error> {
         batch,
         action,
         args,
+        redirect,
     })
 }
 

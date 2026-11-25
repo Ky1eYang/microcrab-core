@@ -15,7 +15,7 @@ pub(crate) fn shell_name(host: &HostInfo) -> Option<&str> {
         !matches!(
             *name,
             "read"
-                | "read_image"
+                | "view_image"
                 | "write"
                 | "edit"
                 | "patch"
@@ -49,7 +49,7 @@ fn mode(
     let permissions = tools
         .iter()
         .map(|tool| {
-            let action = if matches!(tool.name.as_str(), "read" | "read_image" | "glob" | "grep") {
+            let action = if matches!(tool.name.as_str(), "read" | "glob" | "grep") {
                 Action::Allow
             } else if matches!(
                 tool.name.as_str(),
@@ -128,19 +128,6 @@ pub fn describe(host: &HostInfo) -> Result<Vec<AgentInfo>, String> {
             "offset_line":limit(1,u64::MAX,"First line, one-based positive u64. Omission defaults to 1; null is invalid."),
             "max_lines":limit(200,10000,"Line cap, 1..=10000, also bounded by max_bytes. Omission defaults to 200; null is invalid."),
             "max_bytes":limit(65536,1048576,"UTF-8 content byte cap, 1..=1048576. Omission defaults to 65536; null is invalid.")
-        }), &["path"]));
-    }
-    if [
-        "filesystem.stat",
-        "filesystem.open",
-        "filesystem.read",
-        "filesystem.close",
-    ]
-    .iter()
-    .all(|capability| linked(host, capability))
-    {
-        tools.push(tool("read_image", "Read one PNG, JPEG, GIF or WebP image into model vision input. The source must be an ordinary file, at most20MiB; Host, guest memory and Context capacity may impose smaller bounds. No text conversion or resizing is performed.", json!({
-            "path":text("Host image path, workspace-relative or absolute where the configured Host filesystem policy permits it. Nonempty, <=4096 UTF-8 bytes, no NUL; null is invalid.")
         }), &["path"]));
     }
     if linked(host, "write") {
@@ -236,13 +223,8 @@ pub fn describe(host: &HostInfo) -> Result<Vec<AgentInfo>, String> {
             .inject("hints", hints)
             .map_err(|e| e.to_string())?;
     }
-    let tool_media_output_bytes = tools
-        .iter()
-        .filter(|tool| tool.name == "read_image")
-        .map(|tool| (tool.name.clone(), 20 * 1024 * 1024))
-        .collect();
     Ok(vec![AgentInfo {
-        tool_media_output_bytes,
+        tool_media_output_bytes: Default::default(),
         name: "coding".into(),
         modes: vec![
             mode(

@@ -222,8 +222,18 @@ async fn concrete_tool_snapshot_mode_override_constraints_and_recovery_preserve_
         let requests = model.0.lock().unwrap();
         assert_eq!(row(&requests[0], "patch")["kind"], "static");
         assert_eq!(row(&requests[0], "patch")["action"], "deny");
-        for tool in ["read", "sleep", "job"] {
+        for tool in ["read", "sleep"] {
             assert_eq!(row(&requests[0], tool)["action"], "allow");
+        }
+        for request in [&requests[0], &requests[5]] {
+            assert_eq!(row(request, "job")["kind"], "conditional");
+            let job = compiled(request, "job");
+            for (action, expected) in [("status", Action::Allow), ("redirect", Action::Ask)] {
+                assert_eq!(
+                    evaluate_compiled(&job, &json!({"action":action})).unwrap(),
+                    expected,
+                );
+            }
         }
         assert_eq!(row(&requests[1], "patch")["action"], "ask");
         assert_eq!(row(&requests[2], "patch")["action"], "allow");
@@ -363,7 +373,14 @@ async fn model_groups_equivalent_tools_while_management_rows_keep_exact_owner_wi
             .iter()
             .find(|row| row["kind"] == "static" && row["action"] == "allow")
             .unwrap();
-        assert_eq!(allowed["tools"], json!(["job", "read", "sleep"]));
+        assert_eq!(allowed["tools"], json!(["read", "sleep"]));
+        let job = compiled(&requests[0], "job");
+        for (action, expected) in [("read", Action::Allow), ("redirect", Action::Ask)] {
+            assert_eq!(
+                evaluate_compiled(&job, &json!({"action":action})).unwrap(),
+                expected,
+            );
+        }
         let communication = groups
             .iter()
             .filter(|group| {
@@ -391,8 +408,12 @@ async fn model_groups_equivalent_tools_while_management_rows_keep_exact_owner_wi
                 .all(|row| row.get("owners").is_none() && row.get("tool").is_none())
         );
     }
-    let inventory = session.permission_inventory().unwrap();
-    for mode in inventory["modes"].as_array().unwrap() {
+    let list = session
+        .permission_list(microcrab_session::policy::PermissionListView::Management)
+        .unwrap();
+    let value = serde_json::to_value(list).unwrap();
+    assert!(session.state_view().unwrap().get("permission").is_none());
+    for mode in value["tool_inventory"]["modes"].as_array().unwrap() {
         let rows = mode["compiled"].as_array().unwrap();
         let fixture_tools = ["job", "patch", "read", "sleep"];
         let fixture_rows = rows

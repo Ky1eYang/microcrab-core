@@ -18,7 +18,7 @@ fn shell_tool(host: &HostInfo) -> Result<Option<(&str, &'static str)>, String> {
         .filter(|name| {
             !matches!(
                 *name,
-                "job" | "delegate" | "sleep" | "expand" | "switch_mode"
+                "job" | "delegate" | "sleep" | "expand" | "switch_mode" | "view_image"
             )
         })
         .ok_or("Host shell must provide a portable, nonreserved tool name")?;
@@ -34,11 +34,17 @@ fn shell_tool(host: &HostInfo) -> Result<Option<(&str, &'static str)>, String> {
 
 const SHELL_UNAVAILABLE: &str = "Shell execution is unavailable on this Host; linked shell and process capabilities are required.";
 
+fn private_shell(host: &HostInfo) -> bool {
+    host.capabilities
+        .iter()
+        .any(|capability| capability == "shell.launch-private")
+}
+
 pub fn describe(host: &HostInfo) -> Result<Vec<AgentInfo>, String> {
     let shell = shell_tool(host)?;
     let execution = "Returns a complete result or a buffered receipt with id=session_id/execution_id and optional nonconsuming initial stdout/stderr.";
     let yield_description = "Initial wait, 0..=60000 ms; zero requests an immediate receipt. Omission defaults to 1000; null is invalid. Ending the wait does not terminate or restart the process.";
-    let tools = shell.into_iter().map(|(name, description)| ToolDefinition {
+    let mut tools: Vec<_> = shell.into_iter().map(|(name, description)| ToolDefinition {
         name: name.into(),
         description: format!("{description} {execution}"),
         parameters: json!({
@@ -52,6 +58,15 @@ pub fn describe(host: &HostInfo) -> Result<Vec<AgentInfo>, String> {
             "additionalProperties":false
         }),
     }).collect();
+    if private_shell(host)
+        && let Some(tool) = tools.first_mut()
+    {
+        tool.parameters["properties"]["capture"] = json!({"type":"string","enum":["text","private"],"description":"Omit for ordinary text. Private capture retains raw stdout without an initial page, discards stderr and closes stdin; it always returns an execution handle."});
+        tool.parameters["properties"]["media_type"] = json!({"type":"string","maxLength":127,"pattern":"^[a-z0-9][a-z0-9!#$&^_.+-]*/[a-z0-9][a-z0-9!#$&^_.+-]*$","description":"Required for private capture only. Declared MIME (use application/octet-stream if unknown); this does not verify the contents."});
+        tool.parameters["allOf"] = json!([
+            {"if":{"properties":{"capture":{"const":"private"}},"required":["capture"]},"then":{"required":["media_type"]},"else":{"not":{"required":["media_type"]}}}
+        ]);
+    }
     let (description, mode_description, prompt, rules, mut hints, permissions) = match shell {
         Some((name, description)) => (
             "Universal agent for executing commands on the configured Host.",
@@ -59,9 +74,13 @@ pub fn describe(host: &HostInfo) -> Result<Vec<AgentInfo>, String> {
             "Use the advertised Host shell, respect its workspace and capabilities, and inspect execution output before claiming completion.",
             vec![Rule { name: "host_scope".into(), description: "Use the advertised Host shell and keep the working directory within the configured root.".into() }],
             vec![Hint { name: "shell_syntax".into(), description: description.into() }],
-            serde_json::from_value(json!([
-                {"tool":{"kind":"exact","value":name}, "args":[], "action":"allow"}
-            ])).map_err(|e| e.to_string())?,
+            {
+                let mut rules = vec![json!({"tool":{"kind":"exact","value":name}, "args":[], "action":"allow"})];
+                if private_shell(host) {
+                    rules.push(json!({"tool":{"kind":"exact","value":name}, "args":[{"pointer":"/capture","matcher":{"kind":"exact","value":"private"}}], "action":"ask"}));
+                }
+                serde_json::from_value(Value::Array(rules)).map_err(|e| e.to_string())?
+            },
         ),
         None => (
             "Universal conversational agent. Shell execution is unavailable on this Host.",
@@ -116,10 +135,12 @@ pub fn invoke_with_shell(
     }
     let args: Value = serde_json::from_str(arguments).map_err(|e| e.to_string())?;
     let object = args.as_object().ok_or("arguments must be a JSON object")?;
-    if object
-        .keys()
-        .any(|key| !matches!(key.as_str(), "command" | "cwd" | "yield_ms"))
-    {
+    if object.keys().any(|key| {
+        !matches!(
+            key.as_str(),
+            "command" | "cwd" | "yield_ms" | "capture" | "media_type"
+        )
+    }) {
         return Err("unknown shell argument".into());
     }
     let command = object
@@ -140,6 +161,17 @@ pub fn invoke_with_shell(
         && !value.as_u64().is_some_and(|value| value <= 60_000)
     {
         return Err("yield_ms must be 0..=60000 milliseconds".into());
+    }
+    match (object.get("capture"), object.get("media_type")) {
+        (None, None) => {}
+        (Some(mode), None) if mode.as_str() == Some("text") && private_shell(host) => {}
+        (Some(mode), Some(mime))
+            if mode.as_str() == Some("private")
+                && private_shell(host)
+                && mime
+                    .as_str()
+                    .is_some_and(microcrab_agent_types::is_capture_mime) => {}
+        _ => return Err("private capture requires Host support and a canonical media_type".into()),
     }
     shell(arguments)
 }
@@ -202,7 +234,8 @@ mod component {
         ) -> Result<microcrab::agent::execution::ToolOutput, microcrab::agent::execution::ToolFailure>
         {
             use microcrab::agent::execution::{
-                self, BufferedOutput, FailureKind, FinalOutput, ToolFailure, ToolOutput,
+                self, BufferedOutput, ContentKind, FailureKind, FinalOutput, OutputChannel,
+                ProcessSource, ToolFailure, ToolOutput,
             };
             use microcrab::host::{process, shell};
             let failure = |code: &str, message: String| ToolFailure {
@@ -235,8 +268,23 @@ mod component {
                     .and_then(serde_json::Value::as_str)
                     .map(str::to_owned),
             };
-            // Reserve output ownership before admitting any external effects.
-            let output = execution::create(&["stdout".into(), "stderr".into()])?;
+            // Select the sink and reserve ownership before any external effect.
+            if args.get("capture").and_then(serde_json::Value::as_str) == Some("private") {
+                let media_type = args["media_type"].as_str().expect("validated MIME");
+                let output = execution::create(&[OutputChannel {
+                    name: "stdout".into(),
+                    kind: ContentKind::Bytes(media_type.into()),
+                }])?;
+                execution::launch_private_shell(&output, &request)?;
+                return Ok(ToolOutput::Buffered(BufferedOutput {
+                    output,
+                    include_initial: false,
+                }));
+            }
+            let output = execution::create(&["stdout", "stderr"].map(|name| OutputChannel {
+                name: name.into(),
+                kind: ContentKind::Text,
+            }))?;
             let handle = shell::launch(&request).map_err(|error| {
                 let mut reported = host_failure(error);
                 if matches!(reported.kind, FailureKind::Timeout) {
@@ -298,7 +346,7 @@ mod component {
                 &serde_json::json!({"id":handle.id,"pid":handle.pid,"loss_seen":initial.truncated}),
             )
             .map_err(|e| failure("serialization", e.to_string()))?;
-            execution::retain_process(&output, handle, true)?;
+            execution::retain_process(&output, handle, ProcessSource::ShellText)?;
             execution::attach_guest(&output, &state)?;
             Ok(ToolOutput::Buffered(BufferedOutput {
                 output,
@@ -554,6 +602,31 @@ mod tests {
             );
         }
     }
+    #[test]
+    fn private_capture_is_host_gated_and_asks_without_changing_text_default() {
+        let mut host = host(OsFamily::Unix);
+        let private =
+            r#"{"command":"produce","capture":"private","media_type":"application/octet-stream"}"#;
+        assert!(invoke_with_shell(&host, "bash", private, |_| panic!("must not launch")).is_err());
+        host.capabilities.push("shell.launch-private".into());
+        let agents = describe(&host).unwrap();
+        let tool = &agents[0].tools[0];
+        assert!(tool.parameters["properties"]["capture"].is_object());
+        let rules = serde_json::to_value(&agents[0].modes[0].permissions).unwrap();
+        assert_eq!(rules[0]["action"], "allow");
+        assert_eq!(rules[1]["action"], "ask");
+        assert_eq!(rules[1]["args"][0]["matcher"]["value"], "private");
+        assert!(invoke_with_shell(&host, "bash", private, |_| Ok("launch".into())).is_ok());
+        for args in [
+            r#"{"command":"produce","capture":"private"}"#,
+            r#"{"command":"produce","media_type":"image/png"}"#,
+            r#"{"command":"produce","capture":"private","media_type":"image/PNG"}"#,
+            r#"{"command":"produce","capture":"private","media_type":"image/png;foo=bar"}"#,
+        ] {
+            assert!(invoke_with_shell(&host, "bash", args, |_| panic!("must not launch")).is_err());
+        }
+    }
+
     #[test]
     fn missing_shell_ports_degrade_catalog_and_never_invoke_host() {
         for (family, name) in [

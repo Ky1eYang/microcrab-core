@@ -1,5 +1,33 @@
 // Private Host source implementation shares registry ownership and admission checks.
 impl ProcessRegistry {
+    pub(crate) fn attach_private_output(
+        self: &Arc<Self>,
+        session: &str,
+        handle: ProcessHandle,
+        writer: crate::runtime::execution::OutputWriter,
+    ) -> Result<Arc<dyn crate::runtime::execution::ExecutionController>, Error> {
+        let process = self
+            .owned_process(session, handle)
+            .filter(|process| process.private)
+            .ok_or_else(|| Error::denied("private process source is absent"))?;
+        if process.bridged.swap(true, Ordering::AcqRel) {
+            return Err(Error::tool("private process source already adopted"));
+        }
+        let mut controller =
+            super::source::ProcessController::new(self.clone(), session.into(), handle, false);
+        controller.private = true;
+        let controller = Arc::new(controller);
+        let worker_controller = controller.clone();
+        tokio::spawn(async move {
+            if super::source::pump_private(worker_controller, writer.clone())
+                .await
+                .is_err()
+            {
+                let _ = writer.interrupt("private capture interrupted");
+            }
+        });
+        Ok(controller)
+    }
     pub(crate) fn output_controller(
         self: &Arc<Self>,
         session: &str,
@@ -9,7 +37,7 @@ impl ProcessRegistry {
         let resource = self
             .owned_process(session, handle)
             .ok_or_else(|| Error::denied("process belongs to another Session"))?;
-        if resource.capture != captured {
+        if resource.private || resource.capture != captured {
             return Err(Error::tool("process capture kind mismatch"));
         }
         if resource.bridged.swap(true, Ordering::AcqRel) {
@@ -39,7 +67,7 @@ impl ProcessRegistry {
         handle: ProcessHandle,
         stderr: bool,
         cancellation: CancellationToken,
-    ) -> Result<Option<Vec<u8>>, Error> {
+    ) -> Result<Option<Bytes>, Error> {
         self.read_pipe_scoped(
             session,
             handle,
@@ -122,7 +150,8 @@ impl ProcessRegistry {
         let process = self
             .owned_process(session, handle)
             .ok_or_else(|| Error::denied("process belongs to another Session"))?;
-        if process.capture != captured || process.bridged.load(Ordering::Acquire) {
+        if process.private || process.capture != captured || process.bridged.load(Ordering::Acquire)
+        {
             return Err(Error::tool("process output is unavailable for adoption"));
         }
         if process.bridged.swap(true, Ordering::AcqRel) {
@@ -184,7 +213,7 @@ impl ProcessRegistry {
         let process = self
             .owned_process(session, handle)
             .ok_or_else(|| Error::denied("process belongs to another Session"))?;
-        if process.capture != captured {
+        if process.private || process.capture != captured {
             return Err(Error::tool("process capture kind mismatch"));
         }
         if process.bridged.swap(true, Ordering::AcqRel) {

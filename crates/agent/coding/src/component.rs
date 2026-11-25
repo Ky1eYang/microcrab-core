@@ -2,8 +2,8 @@
 use crate::host::*;
 include!(concat!(env!("OUT_DIR"), "/guest-bindings.rs"));
 use microcrab::host::{
-    cache_points, file_mutation, filesystem, glob, grep, process, shell, text_read, text_write,
-    tool_types, types,
+    cache_points, file_mutation, glob, grep, process, shell, text_read, text_write, tool_types,
+    types,
 };
 
 struct Coding;
@@ -96,31 +96,7 @@ fn mutation_from_abi(request: file_mutation::FileMutation) -> FileMutation {
         }),
     }
 }
-impl crate::image::ImageFiles for ImportedHost {
-    type Handle = u64;
-    fn image_stat(&mut self, path: &str) -> Result<(u64, bool), OperationError> {
-        let metadata = filesystem::stat(path).map_err(host_error)?;
-        Ok((
-            metadata.size,
-            matches!(metadata.kind, filesystem::FileKind::File),
-        ))
-    }
-    fn image_open(&mut self, path: &str) -> Result<u64, OperationError> {
-        filesystem::open(path, filesystem::OpenFlags::READ)
-            .map(|handle| handle.id)
-            .map_err(host_error)
-    }
-    fn image_read(&mut self, id: u64, offset: u64, len: u32) -> Result<Vec<u8>, OperationError> {
-        filesystem::read(filesystem::FileHandle { id }, offset, len).map_err(host_error)
-    }
-    fn image_close(&mut self, id: u64) -> Result<(), OperationError> {
-        filesystem::close(filesystem::FileHandle { id }).map_err(host_error)
-    }
-}
 impl Host for ImportedHost {
-    fn read_image(&mut self, path: &str) -> Result<MediaAttachment, OperationError> {
-        crate::image::read(self, path)
-    }
     fn preflight_mutations(
         &mut self,
         requests: Vec<FileMutation>,
@@ -341,9 +317,16 @@ impl Guest for Coding {
         arguments: String,
     ) -> Result<microcrab::agent::execution::ToolOutput, microcrab::agent::execution::ToolFailure>
     {
-        use microcrab::agent::execution::{self, BufferedOutput, FinalOutput, ToolOutput};
+        use microcrab::agent::execution::{
+            self, BufferedOutput, ContentKind, FinalOutput, OutputChannel, ProcessSource,
+            ToolOutput,
+        };
         let checked = checked_host(&host_info).map_err(reported_failure)?;
-        let output = execution::create(&["result".into(), "stdout".into(), "stderr".into()])?;
+        let output =
+            execution::create(&["result", "stdout", "stderr"].map(|name| OutputChannel {
+                name: name.into(),
+                kind: ContentKind::Text,
+            }))?;
         let mut host = ImportedHost {
             output: Some(output),
             process: None,
@@ -353,20 +336,6 @@ impl Guest for Coding {
         let result =
             crate::invoke(&checked, &name, &arguments, &mut host).map_err(reported_failure)?;
         let content = result.content;
-        if !result.attachments.is_empty() {
-            return Ok(ToolOutput::Final(FinalOutput {
-                content,
-                failure: None,
-                attachments: result
-                    .attachments
-                    .into_iter()
-                    .map(|attachment| execution::MediaAttachment {
-                        media_type: attachment.media_type,
-                        data: attachment.data,
-                    })
-                    .collect(),
-            }));
-        }
         let reserved = host
             .output
             .take()
@@ -399,7 +368,7 @@ impl Guest for Coding {
                 &serde_json::json!({"id":handle.id,"pid":handle.pid,"loss_seen":initial.truncated}),
             )
             .map_err(|e| reported_failure(e.to_string()))?;
-            execution::retain_process(&output, process_handle(handle), true)?;
+            execution::retain_process(&output, process_handle(handle), ProcessSource::ShellText)?;
             execution::attach_guest(&output, &state)?;
             return Ok(ToolOutput::Buffered(BufferedOutput {
                 output,

@@ -1,9 +1,47 @@
 //! Provider-call guard: one start/end pair, including future cancellation by drop.
-use crate::Content;
 use crate::error::Error;
-use microcrab_auditor::{AuditBody, AuditOutcome, Auditor, Moment};
+use crate::{Content, ModelAttempt, ResponseCompletedAt};
+use microcrab_auditor::{
+    AuditBody, AuditOutcome, Auditor, HookContext, HookPayload, Moment, VariableView,
+};
 use microcrab_protocol::{Response, Usage};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use tokio_util::sync::CancellationToken;
+
+pub(crate) async fn intervene_request(
+    auditor: &dyn Auditor,
+    content: &Content,
+    variables: &dyn VariableView,
+    cancellation: &CancellationToken,
+    call_id: &str,
+    request: String,
+) -> Result<String, Error> {
+    let injection = tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => return Err(Error::Cancelled),
+        result = auditor.intervene(
+            Moment::RequestPrepared,
+            HookContext {
+                epoch: content.epoch,
+                subagent: content.subagent.clone(),
+                turn: content.turn_id,
+                round: content.round,
+                call_id: Some(call_id.to_owned()),
+                request_body: Some(request.as_str()),
+                max_request_bytes: Some(content.max_bytes),
+                variables,
+                payload: HookPayload::None,
+            },
+        ) => result?,
+    };
+    match injection.request_body {
+        Some(replacement) => {
+            crate::validate_request_rewrite(&request, &replacement, content.max_bytes)?;
+            Ok(replacement)
+        }
+        None => Ok(request),
+    }
+}
 
 fn observer_enabled(auditor: &dyn Auditor) -> bool {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| auditor.is_enabled())).unwrap_or_else(
@@ -27,8 +65,10 @@ fn publish_observation(auditor: &dyn Auditor, moment: Moment, body: AuditBody) {
 pub(crate) struct ProviderCallAudit<'a> {
     auditor: &'a dyn Auditor,
     terminal: Option<AuditBody>,
-    started: Option<Instant>,
-    call_id: uuid::Uuid,
+    started: Instant,
+    started_at_unix_ms: Option<u64>,
+    normalized_at: Option<Instant>,
+    call_id: String,
     finished: bool,
     streamed_chars: u64,
     stream_timing: crate::observation::StreamTiming,
@@ -44,19 +84,19 @@ impl<'a> ProviderCallAudit<'a> {
         call_id: String,
     ) -> Self {
         let enabled = observer_enabled(auditor);
-        let started = Some(Instant::now());
-        let identity = uuid::Uuid::parse_str(&call_id).unwrap_or(uuid::Uuid::nil());
+        let started = Instant::now();
+        let started_at_unix_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .ok()
+            .and_then(|duration| u64::try_from(duration.as_millis()).ok());
         let terminal = enabled.then(|| {
             let body = AuditBody {
                 epoch: content.epoch,
                 subagent: content.subagent.clone(),
                 turn_id: content.turn_id,
                 round: content.round,
-                call_id: Some(call_id),
-                started_at_unix_ms: SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .ok()
-                    .map(|elapsed| millis(elapsed.as_millis())),
+                call_id: Some(call_id.clone()),
+                started_at_unix_ms,
                 ..AuditBody::default()
             };
             let mut start = body.clone();
@@ -68,7 +108,9 @@ impl<'a> ProviderCallAudit<'a> {
             auditor,
             terminal,
             started,
-            call_id: identity,
+            started_at_unix_ms,
+            normalized_at: None,
+            call_id,
             finished: false,
             streamed_chars: 0,
             stream_timing: crate::observation::StreamTiming::default(),
@@ -115,12 +157,8 @@ impl<'a> ProviderCallAudit<'a> {
     pub(crate) fn measured_error(&self, error: Error) -> Error {
         match error {
             Error::ProviderIdleTimeout(mut facts) => {
-                facts.elapsed_ms = self
-                    .started
-                    .map_or(0, |start| millis(start.elapsed().as_millis()));
-                facts.first_token_ms = self
-                    .started
-                    .and_then(|start| self.stream_timing.measured(start).0);
+                facts.elapsed_ms = millis(self.started.elapsed().as_millis());
+                facts.first_token_ms = self.stream_timing.measured(self.started).0;
                 facts.streamed_bytes = u64::try_from(self.received.len()).unwrap_or(u64::MAX);
                 facts.streamed_chars = self.streamed_chars;
                 Error::ProviderIdleTimeout(facts)
@@ -129,33 +167,70 @@ impl<'a> ProviderCallAudit<'a> {
         }
     }
 
-    pub(crate) fn finish(mut self, result: &Result<Response, Error>) {
+    /// Record successful normalization before synthetic preview/Finished delivery
+    /// can wait on an observer or a stream consumer. No error can use this sample
+    /// as completion evidence, including cancellation during that delivery.
+    pub(crate) fn normalized(&mut self) {
+        self.normalized_at.get_or_insert_with(Instant::now);
+    }
+
+    pub(crate) fn finish(mut self, result: &Result<Response, Error>) -> Option<ModelAttempt> {
         let (outcome, usage) = match result {
             Ok(response) => (AuditOutcome::Accepted, Some(response.usage.clone())),
             Err(error) => (outcome_of(error), None),
         };
         if let Some(body) = &mut self.terminal {
-            body.payload = microcrab_auditor::HookPayload::RoundCompleted {
+            body.payload = HookPayload::RoundCompleted {
                 response: result.as_ref().ok().cloned(),
                 status: body.response_status,
                 usage: usage.clone(),
             };
         }
-        self.publish_terminal(outcome, usage);
+        let elapsed_ms = if result.is_ok() {
+            self.normalized_at.and_then(|end| self.elapsed_ms_at(end))
+        } else {
+            self.elapsed_ms_at(Instant::now())
+        };
+        let attempt = result.is_ok().then(|| ModelAttempt {
+            call_id: self.call_id.clone(),
+            response_completed_at_ms: self
+                .started_at_unix_ms
+                .zip(elapsed_ms)
+                .and_then(|(start, elapsed)| start.checked_add(elapsed))
+                .and_then(ResponseCompletedAt::new),
+        });
+        self.publish_terminal(
+            outcome,
+            usage,
+            elapsed_ms,
+            attempt
+                .as_ref()
+                .and_then(|attempt| attempt.response_completed_at_ms),
+        );
+        attempt
     }
 
-    fn publish_terminal(&mut self, outcome: AuditOutcome, usage: Option<Usage>) {
+    fn elapsed_ms_at(&self, terminal: Instant) -> Option<u64> {
+        let elapsed = terminal.checked_duration_since(self.started)?;
+        u64::try_from(elapsed.as_millis()).ok()
+    }
+
+    fn publish_terminal(
+        &mut self,
+        outcome: AuditOutcome,
+        usage: Option<Usage>,
+        elapsed_ms: Option<u64>,
+        response_completed_at_ms: Option<ResponseCompletedAt>,
+    ) {
         if self.finished {
             return;
         }
         self.finished = true;
-        let first_token_ms = self
-            .started
-            .and_then(|started| self.stream_timing.measured(started).0);
+        let (first_token_ms, generation_ms) = self.stream_timing.measured(self.started);
         tracing::warn!(
             call_id = %self.call_id,
             outcome = ?outcome,
-            elapsed_ms = self.started.map(|started| millis(started.elapsed().as_millis())),
+            elapsed_ms,
             first_token_ms,
             streamed_bytes = self.received.len(),
             streamed_chars = self.streamed_chars,
@@ -169,15 +244,11 @@ impl<'a> ProviderCallAudit<'a> {
         }
         body.outcome = Some(outcome);
         body.usage = usage;
-        body.elapsed_ms = self
-            .started
-            .map(|started| millis(started.elapsed().as_millis()));
-        if let Some(started) = self.started {
-            let (first, generation) = self.stream_timing.measured(started);
-            body.first_token_ms = first;
-            body.generation_ms = generation;
-            body.timing_source = first.map(|_| "transport_stream".to_owned());
-        }
+        body.elapsed_ms = elapsed_ms;
+        body.response_completed_at_ms = response_completed_at_ms.map(ResponseCompletedAt::get);
+        body.first_token_ms = first_token_ms;
+        body.generation_ms = generation_ms;
+        body.timing_source = first_token_ms.map(|_| "transport_stream".to_owned());
         if body.response_status.is_some() {
             match String::from_utf8(std::mem::take(&mut self.received)) {
                 Ok(text) => body.response = Some(text),
@@ -192,7 +263,10 @@ impl Drop for ProviderCallAudit<'_> {
     fn drop(&mut self) {
         // No await/spawn: aborting or dropping a polled provider future still enqueues
         // its terminal audit. An unpolled future never started a logical call.
-        self.publish_terminal(AuditOutcome::Cancelled, None);
+        if !self.finished {
+            let elapsed_ms = self.elapsed_ms_at(Instant::now());
+            self.publish_terminal(AuditOutcome::Cancelled, None, elapsed_ms, None);
+        }
     }
 }
 
@@ -299,31 +373,90 @@ mod tests {
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
         let auditor = microcrab_auditor::ChannelAuditor::from_sender(sender);
         let mut call = ProviderCallAudit::start(&auditor, &content(), "{}", "stream".into());
-        let start = Instant::now() - std::time::Duration::from_millis(200);
-        call.started = Some(start);
+        let start = Instant::now();
+        call.started = start;
+        call.started_at_unix_ms = Some(1_000);
+        call.normalized_at = Some(start + std::time::Duration::from_millis(150));
         call.stream_timing.delta(
             &crate::ModelEvent::TextDelta { text: "a".into() },
             start + std::time::Duration::from_millis(40),
         );
         call.stream_timing
             .complete(start + std::time::Duration::from_millis(140));
-        call.finish(&Ok(Response {
-            provider_metadata: None,
-            content: "a".into(),
-            tool_calls: vec![],
-            usage: Usage::default(),
-        }));
+        call.normalized(); // A second observation must not replace the terminal sample.
+        let attempt = call
+            .finish(&Ok(Response {
+                provider_metadata: None,
+                content: "a".into(),
+                tool_calls: vec![],
+                usage: Usage::default(),
+            }))
+            .unwrap();
         let prepared = receiver.try_recv().unwrap();
         let terminal = receiver.try_recv().unwrap();
         assert_eq!(prepared.event, Moment::RequestPrepared);
         assert_eq!(terminal.event, Moment::RoundCompleted);
         assert_eq!(prepared.call_id, terminal.call_id);
+        assert_eq!(terminal.call_id.as_deref(), Some(attempt.call_id.as_str()));
+        assert_eq!(
+            attempt
+                .response_completed_at_ms
+                .map(ResponseCompletedAt::get),
+            Some(1_150)
+        );
+        assert_eq!(terminal.response_completed_at_ms, Some(1_150));
+        assert_eq!(terminal.elapsed_ms, Some(150));
         assert_eq!(terminal.first_token_ms, Some(40));
         assert_eq!(terminal.generation_ms, Some(100));
         assert_eq!(terminal.timing_source.as_deref(), Some("transport_stream"));
         assert_eq!(terminal.usage.as_ref().unwrap().output_tokens, None);
         assert!(prepared.first_token_ms.is_none());
         assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn normalized_terminal_sample_is_audit_independent_and_validated() {
+        use microcrab_auditor::NoopAuditor;
+        use std::time::Duration;
+        let response = Response {
+            provider_metadata: None,
+            content: "done".into(),
+            tool_calls: vec![],
+            usage: Usage::default(),
+        };
+        for (wall_start, terminal_offset, expected) in [
+            (Some(1_000), Some(150), Some(1_150)),
+            (None, Some(150), None),
+            (Some(1_000), None, None),
+            (Some(1_000), Some(-1), None),
+            (Some(u64::MAX), Some(150), None),
+            (Some(0), Some(0), None),
+            (Some(8_640_000_000_000_000), Some(1), None),
+        ] {
+            let mut call = ProviderCallAudit::start(&NoopAuditor, &content(), "{}", "call".into());
+            let start = Instant::now();
+            call.started = start;
+            call.started_at_unix_ms = wall_start;
+            call.normalized_at = terminal_offset.map(|offset: i64| {
+                let elapsed = Duration::from_millis(offset.unsigned_abs());
+                if offset < 0 {
+                    start - elapsed
+                } else {
+                    start + elapsed
+                }
+            });
+            let attempt = call.finish(&Ok(response.clone())).unwrap();
+            assert_eq!(attempt.call_id, "call");
+            assert_eq!(
+                attempt
+                    .response_completed_at_ms
+                    .map(ResponseCompletedAt::get),
+                expected
+            );
+        }
+        let mut call = ProviderCallAudit::start(&NoopAuditor, &content(), "{}", "cancelled".into());
+        call.normalized();
+        assert!(call.finish(&Err(Error::Cancelled)).is_none());
     }
 
     #[test]

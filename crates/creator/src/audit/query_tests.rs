@@ -1,6 +1,7 @@
 use super::*;
 use serde_json::{Value, json};
 use std::io::Write;
+mod response_wire;
 mod turn_usage;
 
 fn selector() -> AuditQuery {
@@ -33,6 +34,52 @@ fn send(recorder: &mut Recorder, call: &str, wire: &str) {
         .unwrap();
 }
 #[test]
+fn legacy_bodyless_lifecycle_requires_an_exact_unique_call_and_never_fabricates_a_request() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut recorder = Recorder::open(directory.path(), RecorderOptions::default()).unwrap();
+    let start = json!({"event":"request_prepared","call_id":"legacy","epoch":2,
+        "turn_id":3,"round":1,"started_at_unix_ms":100});
+    let terminal = json!({"event":"round_completed","call_id":"legacy","epoch":2,
+        "turn_id":3,"round":1,"started_at_unix_ms":100,"elapsed_ms":12,"outcome":"accepted"});
+    recorder.publish(start).unwrap();
+    recorder.publish(terminal.clone()).unwrap();
+    let exact = AuditQuery {
+        call_id: Some("legacy".into()),
+        ..selector()
+    };
+    let result = query(directory.path(), &exact).unwrap();
+    assert!(result.attempts.is_empty());
+    assert_eq!(result.status, AuditStatus::Missing);
+    let legacy = result.legacy_unlinked_attempt.unwrap();
+    assert_eq!(legacy.call_id, "legacy");
+    assert_eq!(legacy.completion, "succeeded");
+    assert_eq!(legacy.ended_at_ms, Some(112));
+    assert!(
+        query(directory.path(), &selector())
+            .unwrap()
+            .legacy_unlinked_attempt
+            .is_none()
+    );
+    let wrong = AuditQuery {
+        round: Some(2),
+        ..exact.clone()
+    };
+    assert!(
+        query(directory.path(), &wrong)
+            .unwrap()
+            .legacy_unlinked_attempt
+            .is_none()
+    );
+    recorder.publish(terminal).unwrap();
+    assert!(
+        query(directory.path(), &exact)
+            .unwrap()
+            .legacy_unlinked_attempt
+            .is_none()
+    );
+}
+
+#[test]
 fn cancelled_completion_survives_durable_query_and_metadata_projection() {
     let directory = tempfile::tempdir().unwrap();
     let mut recorder = Recorder::open(directory.path(), RecorderOptions::default()).unwrap();
@@ -60,6 +107,89 @@ fn cancelled_completion_survives_durable_query_and_metadata_projection() {
         assert_eq!(
             serde_json::to_value(&metadata.attempts[0]).unwrap()["completion"],
             expected
+        );
+    }
+}
+
+#[test]
+fn selected_response_completion_requires_unambiguous_terminal_timing() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut recorder = Recorder::open(directory.path(), RecorderOptions::default()).unwrap();
+    for (call, outcome, timing, expected) in [
+        (
+            "normalized",
+            "accepted",
+            json!({"response_completed_at_ms":1150}),
+            Some(1150),
+        ),
+        (
+            "legacy",
+            "accepted",
+            json!({"started_at_unix_ms":1000,"elapsed_ms":150}),
+            Some(1150),
+        ),
+        ("missing-start", "accepted", json!({"elapsed_ms":150}), None),
+        (
+            "invalid-explicit",
+            "accepted",
+            json!({"response_completed_at_ms":0,"started_at_unix_ms":1000,"elapsed_ms":150}),
+            None,
+        ),
+        (
+            "contradictory-clocks",
+            "accepted",
+            json!({"response_completed_at_ms":1160,"started_at_unix_ms":1000,"elapsed_ms":150}),
+            None,
+        ),
+        (
+            "overflow",
+            "accepted",
+            json!({"started_at_unix_ms":u64::MAX,"elapsed_ms":150}),
+            None,
+        ),
+        (
+            "outside-date",
+            "accepted",
+            json!({"response_completed_at_ms":8_640_000_000_000_001_u64}),
+            None,
+        ),
+        (
+            "cancelled",
+            "cancelled",
+            json!({"response_completed_at_ms":1150}),
+            None,
+        ),
+    ] {
+        let head = recorder.effective(effective(call, None)).unwrap();
+        recorder.publish(json!({"event":"request_prepared","call_id":call,"sent_request":"{}","started_at_unix_ms":1000})).unwrap();
+        let mut terminal = json!({"event":"round_completed","call_id":call,"outcome":outcome,"response":"not projected"});
+        terminal
+            .as_object_mut()
+            .unwrap()
+            .extend(timing.as_object().unwrap().clone());
+        recorder.publish(terminal).unwrap();
+        let result =
+            query_selected_attempt_metadata(directory.path(), &head, &[(2, 3, 1)]).unwrap();
+        assert!(result.selected_ancestry_complete && result.selected_identities_complete);
+        if outcome == "accepted" {
+            let attempt = &result.attempts[0];
+            assert!(attempt.response.is_none());
+            assert_eq!(attempt.response_completed_at_ms, expected, "{call}");
+        } else {
+            assert!(result.attempts.is_empty());
+        }
+    }
+
+    let head = recorder.effective(effective("conflict", None)).unwrap();
+    send(&mut recorder, "conflict", "{}");
+    for (sample, complete) in [(1150, true), (1150, true), (1160, false), (1150, false)] {
+        recorder.publish(json!({"event":"round_completed","call_id":"conflict","outcome":"accepted","response_completed_at_ms":sample})).unwrap();
+        let result =
+            query_selected_attempt_metadata(directory.path(), &head, &[(2, 3, 1)]).unwrap();
+        assert_eq!(result.selected_identities_complete, complete);
+        assert_eq!(
+            result.attempts[0].response_completed_at_ms,
+            complete.then_some(1150)
         );
     }
 }

@@ -1,4 +1,5 @@
 use microcrab_auditor::AuditorError;
+use microcrab_protocol::ToolDefinition;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -69,6 +70,12 @@ pub struct EffectiveRequest {
     pub history_head: Option<String>,
     pub subagent: Option<String>,
     pub request_body: String,
+}
+
+#[derive(Serialize)]
+pub(super) struct ProtectedRequest {
+    pub frozen_tools: Vec<ToolDefinition>,
+    pub tool_result_ids: Vec<String>,
 }
 
 /// Owned by one blocking operation at a time. The lock guards one authoritative writer,
@@ -335,6 +342,14 @@ impl Recorder {
         self.requests.get(call_id).cloned()
     }
     pub fn effective(&mut self, request: EffectiveRequest) -> Result<String, AuditorError> {
+        self.record_effective(request, None)
+    }
+
+    pub(super) fn record_effective(
+        &mut self,
+        request: EffectiveRequest,
+        protected: Option<ProtectedRequest>,
+    ) -> Result<String, AuditorError> {
         if request.call_id.is_empty() || request.call_id.len() > 1024 {
             return Err(error("invalid audit call identity"));
         }
@@ -347,7 +362,9 @@ impl Recorder {
         let epoch = request.epoch;
         let subagent = request.subagent.clone();
         let mut data = json!({"kind":"effective","call_id":request.call_id,"epoch":request.epoch,"turn":request.turn,"round":request.round,"parent_request":request.parent_request,"history_head":request.history_head,"subagent":request.subagent});
-        if self.options.retention.effective() {
+        if let Some(protected) = protected {
+            data["protected"] = serde_json::to_value(protected).map_err(json_error)?;
+        } else if self.options.retention.effective() {
             data["request_body"] = json!(request.request_body);
         }
         let digest = self.append(data)?;

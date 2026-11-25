@@ -3,7 +3,9 @@ use microcrab_auditor::{Auditor, VariableView};
 use microcrab_session::protocol::Response;
 use microcrab_transport::Content;
 use microcrab_transport::{
-    Client, Error, ModelEvent, OpenAiCompatibleConfig, Protocol, TransportClient, TransportConfig,
+    Client, Error, ImageHostingConfig, ImageHostingGrant, ImageHostingScope, ImageUrlResolver,
+    MediaProjection, ModelEvent, OpenAiCompatibleConfig, ProjectedMedia, Protocol, ResponseOutcome,
+    ToolImagePosition, TransportClient, TransportConfig,
 };
 use std::{sync::Arc, time::Duration};
 use tokio::{sync::mpsc, time::sleep};
@@ -18,7 +20,7 @@ mod tests;
 pub struct RetryingClient {
     inner: Arc<TransportClient>,
     policy: RetryPolicy,
-    media_projection: Option<Arc<microcrab_transport::MediaProjection>>,
+    media_projection: Option<Arc<MediaProjection>>,
 }
 #[derive(Clone, Copy)]
 pub struct RetryPolicy {
@@ -65,28 +67,98 @@ impl RetryingClient {
             media_projection: None,
         })
     }
-    /// The projection instance belongs only to this client's selected route/model.
-    pub fn with_media_projection(
+    /// Explicitly configure hosting for this exact selected provider/model and
+    /// authority. Ordinary Client calls still do not upload any images.
+    pub fn with_image_hosting(
         mut self,
-        projection: Arc<microcrab_transport::MediaProjection>,
-    ) -> Self {
-        self.media_projection = Some(projection);
-        self
+        config: ImageHostingConfig,
+        resolver: Arc<dyn ImageUrlResolver>,
+    ) -> Result<Self, Error> {
+        if !matches!(
+            self.inner.as_ref(),
+            TransportClient::OpenAiCompatible(_) | TransportClient::OpenAiResponses(_)
+        ) {
+            return Err(Error::config(
+                "route protocol has no verified hosted-image fallback",
+            ));
+        }
+        self.media_projection = Some(Arc::new(MediaProjection::new(config, resolver)?));
+        Ok(self)
     }
 
-    /// Opt into a public URL uploader for this exact selected route/model.
-    /// Pass false for unverified routes (including Google without a MIME witness).
-    /// The same resolver may separately be installed on SessionBuilder for input
-    /// attachment resolution. This builder never changes frozen canonical Data.
-    pub fn with_attachment_uploader(
-        self,
-        resolver: Arc<dyn microcrab_session::admission::image::AttachmentResolver>,
-        supports_external_image_urls: bool,
-    ) -> Self {
-        self.with_media_projection(Arc::new(microcrab_transport::MediaProjection::new(
-            Arc::new(media::AttachmentImageUrlResolver(resolver)),
-            supports_external_image_urls,
-        )))
+    /// Only trusted request construction with fresh attachment provenance can
+    /// issue a grant. Do not derive positions by scanning retained history.
+    pub fn authorize_image_hosting<'a>(
+        &'a self,
+        scope: &ImageHostingScope,
+        content: &'a Content,
+        positions: &[ToolImagePosition],
+    ) -> Result<ImageHostingGrant<'a>, Error> {
+        let projection = self.hosting_projection()?;
+        let grant = projection.authorize(scope, content, positions)?;
+        for position in positions {
+            let (media_type, data) = position.data_in(content).ok_or_else(|| {
+                Error::config("image hosting position must identify canonical tool image Data")
+            })?;
+            microcrab_session::admission::image::validate_image(media_type, data)
+                .map_err(|_| Error::config("image hosting image failed admission"))?;
+        }
+        Ok(grant)
+    }
+
+    fn hosting_projection(&self) -> Result<&MediaProjection, Error> {
+        self.media_projection
+            .as_deref()
+            .ok_or_else(|| Error::config("image hosting is not configured on this route"))
+    }
+
+    pub async fn complete_with_image_hosting(
+        &self,
+        grant: ImageHostingGrant<'_>,
+        auditor: &dyn Auditor,
+        variables: &dyn VariableView,
+        cancellation: CancellationToken,
+    ) -> Result<Response, Error> {
+        self.stream_with_image_hosting(grant, auditor, variables, cancellation, None)
+            .await
+    }
+
+    pub async fn stream_with_image_hosting(
+        &self,
+        grant: ImageHostingGrant<'_>,
+        auditor: &dyn Auditor,
+        variables: &dyn VariableView,
+        cancellation: CancellationToken,
+        events: Option<mpsc::Sender<ModelEvent>>,
+    ) -> Result<Response, Error> {
+        self.stream_with_image_hosting_outcome(grant, auditor, variables, cancellation, events)
+            .await
+            .map(|outcome| outcome.response)
+    }
+
+    /// Preserve exact terminal attempt evidence for trusted hosted requests.
+    pub async fn stream_with_image_hosting_outcome(
+        &self,
+        grant: ImageHostingGrant<'_>,
+        auditor: &dyn Auditor,
+        variables: &dyn VariableView,
+        cancellation: CancellationToken,
+        events: Option<mpsc::Sender<ModelEvent>>,
+    ) -> Result<ResponseOutcome, Error> {
+        let content = grant.content();
+        let projected = self
+            .hosting_projection()?
+            .project_tool_images(grant, cancellation.clone())
+            .await?;
+        self.stream_attempts(
+            content,
+            projected.as_ref(),
+            &media::MetadataAudit(auditor),
+            variables,
+            cancellation,
+            events,
+        )
+        .await
     }
 
     pub fn with_function_response_media(mut self, enabled: bool) -> Self {
@@ -106,6 +178,14 @@ impl RetryingClient {
         self.inner = Arc::new(match self.inner.as_ref().clone() {
             TransportClient::OpenAiCompatible(client) => {
                 TransportClient::OpenAiCompatible(client.with_request_options(options)?)
+            }
+            TransportClient::OpenAiResponses(client) => {
+                TransportClient::OpenAiResponses(client.with_request_options(
+                    microcrab_transport::OpenAiResponseRequestOptions {
+                        reasoning_effort: options.reasoning_effort,
+                        prompt_cache_key: None,
+                    },
+                )?)
             }
             client if options.reasoning_effort.is_none() => client,
             _ => {
@@ -166,6 +246,25 @@ fn retryable(error: &Error) -> bool {
 }
 #[async_trait::async_trait]
 impl Client for RetryingClient {
+    fn public_https_image_attempts(&self) -> u8 {
+        self.inner
+            .public_https_image_attempts()
+            .min(self.policy.attempts as u8)
+    }
+
+    async fn stream_public_https_image_attempt(
+        &self,
+        content: &Content,
+        auditor: &dyn Auditor,
+        variables: &dyn VariableView,
+        cancellation: CancellationToken,
+        events: Option<mpsc::Sender<ModelEvent>>,
+    ) -> Result<ResponseOutcome, Error> {
+        self.inner
+            .stream_public_https_image_attempt(content, auditor, variables, cancellation, events)
+            .await
+    }
+
     async fn complete(
         &self,
         content: &Content,
@@ -173,37 +272,14 @@ impl Client for RetryingClient {
         variables: &dyn VariableView,
         cancellation: CancellationToken,
     ) -> Result<Response, Error> {
-        let projected = match &self.media_projection {
-            Some(projection) => {
-                projection
-                    .project_tool_images(content, cancellation.clone())
-                    .await?
-            }
-            None => None,
-        };
-        let mut use_data = false;
         let mut attempt = 0;
         loop {
-            let attempt_content = if use_data {
-                content
-            } else {
-                projected.as_ref().unwrap_or(content)
-            };
             let result = tokio::select! {
                 biased;
                 _ = cancellation.cancelled() => return Err(Error::Cancelled),
-                result = self.inner.complete(attempt_content, auditor, variables, cancellation.clone()) => result,
+                result = self.inner.complete(content, auditor, variables, cancellation.clone()) => result,
             };
             match result {
-                Err(error)
-                    if error.is_remote_image_fetch_rejection()
-                        && projected.is_some()
-                        && !use_data
-                        && attempt + 1 < self.policy.attempts =>
-                {
-                    use_data = true;
-                    attempt += 1;
-                }
                 Err(error) if retryable(&error) && attempt + 1 < self.policy.attempts => {
                     self.delay(attempt, &cancellation).await?;
                     attempt += 1;
@@ -220,24 +296,42 @@ impl Client for RetryingClient {
         cancellation: CancellationToken,
         events: Option<mpsc::Sender<ModelEvent>>,
     ) -> Result<Response, Error> {
-        let projected = match &self.media_projection {
-            Some(projection) => {
-                projection
-                    .project_tool_images(content, cancellation.clone())
-                    .await?
-            }
-            None => None,
-        };
-        let mut use_data = false;
+        self.stream_admitted_outcome(content, auditor, variables, cancellation, events)
+            .await
+            .map(|outcome| outcome.response)
+    }
+
+    async fn stream_admitted_outcome(
+        &self,
+        content: &Content,
+        auditor: &dyn Auditor,
+        variables: &dyn VariableView,
+        cancellation: CancellationToken,
+        events: Option<mpsc::Sender<ModelEvent>>,
+    ) -> Result<ResponseOutcome, Error> {
+        self.stream_attempts(content, None, auditor, variables, cancellation, events)
+            .await
+    }
+}
+
+impl RetryingClient {
+    async fn stream_attempts(
+        &self,
+        content: &Content,
+        mut projected: Option<&ProjectedMedia>,
+        auditor: &dyn Auditor,
+        variables: &dyn VariableView,
+        cancellation: CancellationToken,
+        events: Option<mpsc::Sender<ModelEvent>>,
+    ) -> Result<ResponseOutcome, Error> {
         let mut attempt = 0;
         loop {
-            let attempt_content = if use_data {
-                content
-            } else {
-                projected.as_ref().unwrap_or(content)
-            };
+            let (attempt_content, hosted) = media::attempt_content(content, projected);
+            if !hosted {
+                projected = None;
+            }
             let (sender, mut receiver) = mpsc::channel(16);
-            let future = self.inner.stream(
+            let future = self.inner.stream_admitted_outcome(
                 attempt_content,
                 auditor,
                 variables,
@@ -267,6 +361,15 @@ impl Client for RetryingClient {
                     result = &mut future => break result,
                 }
             };
+            let rejected_hosted = hosted
+                && result
+                    .as_ref()
+                    .is_err_and(|error| error.is_remote_image_fetch_rejection());
+            if rejected_hosted {
+                if let Some(media) = projected.take() {
+                    media.invalidate();
+                }
+            }
             // A provider can enqueue its final deltas and return Ready during the
             // same poll. Drain those events before observing success or retrying.
             while let Ok(event) = receiver.try_recv() {
@@ -280,14 +383,10 @@ impl Client for RetryingClient {
                 }
             }
             match result {
-                Err(error)
-                    if error.is_remote_image_fetch_rejection()
-                        && !published
-                        && projected.is_some()
-                        && !use_data
-                        && attempt + 1 < self.policy.attempts =>
-                {
-                    use_data = true;
+                Err(error) if rejected_hosted => {
+                    if published || attempt + 1 >= self.policy.attempts {
+                        return Err(error);
+                    }
                     attempt += 1;
                 }
                 Err(error)

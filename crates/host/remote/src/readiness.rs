@@ -211,6 +211,20 @@ impl RemoteHost {
         }
         Ok(())
     }
+    /// Subscribe before sampling [`Self::readiness`]. Each change is a wake to
+    /// resample the current route and readiness, not an ordered transition log
+    /// or an admission witness. Diagnostic-only updates do not wake observers.
+    /// The receiver carries no payload; use `changed()` without borrowing it.
+    pub fn watch_readiness(&self) -> watch::Receiver<()> {
+        self.readiness_observation.subscribe()
+    }
+
+    /// Called at a committed route/readiness transition while its locks are held.
+    /// This never calls back into a consumer or waits for it to process the signal.
+    pub(super) fn publish_readiness_change(&self) {
+        self.readiness_observation.send_replace(());
+    }
+
     /// One coherent owner snapshot; callers need not combine independently read scalar ports.
     pub fn readiness(&self) -> Value {
         let route = self.route.lock().unwrap_or_else(|e| e.into_inner());
@@ -320,6 +334,7 @@ impl RemoteHost {
         state.cause = Some(cause);
         state.revision = state.revision.wrapping_add(1);
         self.readiness_changed.notify_waiters();
+        self.publish_readiness_change();
     }
     /// Reserve an owned pass synchronously, before the cancelled caller returns.
     /// Another abandonment during a pass requests one follow-up, not another worker.
@@ -344,6 +359,7 @@ impl RemoteHost {
         state.phase = Phase::Reconciling;
         state.pass = state.pass.wrapping_add(1);
         self.readiness_changed.notify_waiters();
+        self.publish_readiness_change();
         Some((state.pass, state.revision))
     }
     pub(super) fn owns_reconciliation(&self, generation: u64, pass: u64) -> bool {
@@ -372,6 +388,7 @@ impl RemoteHost {
         state.phase = Phase::Reconciling;
         state.pass = state.pass.wrapping_add(1);
         self.readiness_changed.notify_waiters();
+        self.publish_readiness_change();
         Ok((state.pass, state.revision))
     }
     pub(super) fn finish_reconciliation(
@@ -412,26 +429,28 @@ impl RemoteHost {
             return false;
         }
         state.reconciling = false;
-        self.readiness_changed.notify_waiters();
-        if result.is_ok() && state.revision == revision {
+        let ready = result.is_ok() && state.revision == revision;
+        if ready {
             state.ready = true;
             state.phase = Phase::Ready;
             state.cause = None;
-            return true;
+        } else {
+            state.phase = Phase::Unready;
+            // Wire failures were captured before ToolError conversion. Never replace
+            // their code/message/identity with a generic reconciliation wrapper.
+            if state.revision == revision
+                && (!preserve_cause || state.cause.is_none())
+                && let Err(error) = result
+            {
+                state.cause = Some(Cause::phase(
+                    LocalCode::ReconciliationFailed,
+                    original_message(error),
+                ));
+            }
         }
-        state.phase = Phase::Unready;
-        // Wire failures were captured before ToolError conversion. Never replace
-        // their code/message/identity with a generic reconciliation wrapper.
-        if state.revision == revision
-            && (!preserve_cause || state.cause.is_none())
-            && let Err(error) = result
-        {
-            state.cause = Some(Cause::phase(
-                LocalCode::ReconciliationFailed,
-                original_message(error),
-            ));
-        }
-        false
+        self.readiness_changed.notify_waiters();
+        self.publish_readiness_change();
+        ready
     }
     pub(super) fn record_cleanup_failure(&self, generation: u64, error: &ToolError) {
         let route = self.route.lock().unwrap_or_else(|e| e.into_inner());
@@ -453,6 +472,7 @@ impl RemoteHost {
             ));
             state.revision = state.revision.wrapping_add(1);
             self.readiness_changed.notify_waiters();
+            self.publish_readiness_change();
         }
     }
     pub(super) fn abandon_reconciliation(&self, generation: u64, pass: u64) {
@@ -466,7 +486,6 @@ impl RemoteHost {
         let mut state = self.readiness.lock().unwrap_or_else(|e| e.into_inner());
         if state.pass == pass && state.reconciling {
             state.reconciling = false;
-            self.readiness_changed.notify_waiters();
             state.phase = Phase::Unready;
             if state.cause.is_none() {
                 state.cause = Some(Cause::phase(
@@ -474,6 +493,8 @@ impl RemoteHost {
                     "Host reconciliation was cancelled locally",
                 ));
             }
+            self.readiness_changed.notify_waiters();
+            self.publish_readiness_change();
         }
     }
 }

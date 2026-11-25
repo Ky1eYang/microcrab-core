@@ -78,7 +78,7 @@ async fn actual_adapter_sse_events_reach_terminal_audit_without_preview_subscrib
         ),
     ];
     for (protocol, body) in fixtures {
-        let terminal = complete(protocol, "text/event-stream", body).await;
+        let terminal = complete(protocol, "text/event-stream", body, true).await;
         assert_eq!(
             terminal.outcome,
             Some(AuditOutcome::Accepted),
@@ -117,16 +117,18 @@ async fn json_fallback_previews_do_not_create_first_content_or_generation_clocks
         ),
     ];
     for (protocol, body) in fixtures {
-        let terminal = complete(protocol, "application/json", body).await;
-        assert_eq!(
-            terminal.outcome,
-            Some(AuditOutcome::Accepted),
-            "{protocol:?}"
-        );
-        assert!(terminal.first_token_ms.is_none());
-        assert!(terminal.generation_ms.is_none());
-        assert!(terminal.timing_source.is_none());
-        assert_eq!(terminal.usage.unwrap().output_tokens, None);
+        for observer in [false, true] {
+            let terminal = complete(protocol, "application/json", body, observer).await;
+            assert_eq!(
+                terminal.outcome,
+                Some(AuditOutcome::Accepted),
+                "{protocol:?}"
+            );
+            assert!(terminal.first_token_ms.is_none());
+            assert!(terminal.generation_ms.is_none());
+            assert!(terminal.timing_source.is_none());
+            assert_eq!(terminal.usage.unwrap().output_tokens, None);
+        }
     }
 }
 
@@ -134,6 +136,7 @@ async fn complete(
     protocol: Protocol,
     media_type: &str,
     body: &str,
+    observer: bool,
 ) -> microcrab_auditor::AuditRecord {
     let (endpoint, worker) = serve(media_type, body);
     let client = TransportClient::new(TransportConfig {
@@ -145,8 +148,12 @@ async fn complete(
         timeout_ms: 5000,
         max_response_bytes: 65536,
     })
-    .unwrap()
-    .with_observer(std::sync::Arc::new(ActivityObserver));
+    .unwrap();
+    let client = if observer {
+        client.with_observer(std::sync::Arc::new(ActivityObserver))
+    } else {
+        client
+    };
     let content = Content {
         epoch: 1,
         subagent: None,
@@ -171,21 +178,31 @@ async fn complete(
     let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
     let auditor = ChannelAuditor::from_sender(sender);
     let response = client
-        .complete(
+        .stream_admitted_outcome(
             &content,
             &auditor,
             &EmptyVariableView,
             CancellationToken::new(),
+            None,
         )
         .await
         .unwrap();
-    assert_eq!(response.content, "a", "{protocol:?}");
+    assert_eq!(response.response.content, "a", "{protocol:?}");
+    let attempt = response.attempt.unwrap();
     worker.join().unwrap();
     let prepared = receiver.try_recv().unwrap();
     let terminal = receiver.try_recv().unwrap();
     assert_eq!(prepared.event, Moment::RequestPrepared);
     assert_eq!(terminal.event, Moment::RoundCompleted);
     assert_eq!(prepared.call_id, terminal.call_id);
+    assert!(prepared.response_completed_at_ms.is_none());
+    assert_eq!(terminal.call_id.as_deref(), Some(attempt.call_id.as_str()));
+    let sample = attempt.response_completed_at_ms.unwrap().get();
+    assert_eq!(terminal.response_completed_at_ms, Some(sample));
+    assert_eq!(
+        terminal.started_at_unix_ms.unwrap() + terminal.elapsed_ms.unwrap(),
+        sample
+    );
     assert!(receiver.try_recv().is_err());
     terminal
 }

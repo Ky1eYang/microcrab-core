@@ -185,6 +185,7 @@ impl SessionInner {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .content(limits.max_output_tokens)?;
+        let issued = self.functional_issuer(issued);
         let response = subagents::compact::run(
             self.one_shots.as_ref(),
             self.client.clone(),

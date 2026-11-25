@@ -1,11 +1,16 @@
 //! Per-target outcomes stay bounded before any consuming operation starts.
-use super::{ToolContext, ToolOutput, arguments::Arguments, output_budget, resolve};
+use super::{
+    ToolContext, ToolOutput,
+    arguments::Arguments,
+    output_budget, resolve,
+    result::{Batch, Diagnostic, Outcome, ResultBody, Row, Target},
+};
 use crate::{
     Error,
-    runtime::execution::{ExecutionId, ExecutionRegistry, ExecutionSnapshot},
+    runtime::execution::{ExecutionId, ExecutionRegistry},
 };
 use futures_util::{StreamExt, stream};
-use serde_json::{Value, json};
+use serde_json::Value;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
@@ -14,56 +19,10 @@ const CONCURRENCY: usize = 8;
 // their widest projection; these bounds must not grow silently with new fields.
 const METADATA_BYTES: usize = 768;
 const ERROR_BYTES: usize = 256;
-const MIN_PAGE_BYTES: usize = 512;
+const MIN_TEXT_PAGE_BYTES: usize = 512;
+// A private page never has chunks, but retains the bounded MIME/cursor metadata.
+const MIN_PRIVATE_PAGE_BYTES: usize = 576;
 
-fn compact_diagnostic(diagnostic: crate::observation::diagnostics::ToolDiagnostic) -> Value {
-    let mut projection = json!({"code":diagnostic.code,"phase":diagnostic.phase,
-        "effects":diagnostic.effects,"operation":"job"});
-    if let Some(cause) = diagnostic.reason {
-        // Keep the existing per-target envelope reservation. Truncation is an
-        // explicit fact; scalar Job status still exposes the complete diagnostic.
-        let mut reason = String::new();
-        let mut encoded_bytes = 2;
-        for character in cause.as_str().chars() {
-            let width = serde_json::json!(character.to_string()).to_string().len() - 2;
-            if encoded_bytes + width > 96 {
-                break;
-            }
-            reason.push(character);
-            encoded_bytes += width;
-        }
-        let truncated = reason.len() < cause.as_str().len();
-        projection["reason"] = json!(reason);
-        if truncated {
-            projection["reason_truncated"] = json!(true);
-        }
-    }
-    projection
-}
-fn failure(error: &Error) -> Value {
-    compact_diagnostic(error.tool_diagnostic())
-}
-fn metadata(row: ExecutionSnapshot) -> Value {
-    let output = row.output.map(|output| {
-        json!({
-            "bytes":output.bytes,"start_cursor":output.start_cursor,
-            "end_cursor":output.end_cursor,
-            "closed":output.closed
-        })
-    });
-    json!({"execution_id":row.execution_id,"status":row.status,
-        "capabilities":row.capabilities,"output_availability":row.output_availability,
-        "output":output,"failure":row.failure.map(|failure| json!({"kind":failure.kind})),
-        "diagnostic":row.diagnostic.map(|diagnostic| json!({"code":diagnostic.code,
-            "phase":diagnostic.phase,"effects":diagnostic.effects,"operation":"job"}))})
-}
-fn row_result(row: ExecutionSnapshot, compact: bool) -> Result<Value, Error> {
-    if compact {
-        Ok(metadata(row))
-    } else {
-        Ok(serde_json::to_value(row)?)
-    }
-}
 pub(super) async fn operate<const COMPACT: bool>(
     registry: &Arc<ExecutionRegistry>,
     id: ExecutionId,
@@ -72,10 +31,10 @@ pub(super) async fn operate<const COMPACT: bool>(
     maximum: usize,
     revision: Option<u64>,
     cancellation: CancellationToken,
-) -> Result<Value, Error> {
+) -> Result<ResultBody, Error> {
     match action {
-        "status" => row_result(registry.get(id)?, COMPACT),
-        "read" => Ok(serde_json::to_value(
+        "status" => Ok(ResultBody::Execution(Row::new(registry.get(id)?, COMPACT))),
+        "read" => Ok(ResultBody::Read(
             registry.read_capped(
                 id,
                 args.get("cursor").and_then(Value::as_u64).unwrap_or(0),
@@ -84,7 +43,7 @@ pub(super) async fn operate<const COMPACT: bool>(
                     .and_then(Value::as_u64)
                     .map(|value| value as usize),
             )?,
-        )?),
+        )),
         "write" => {
             registry
                 .write(
@@ -94,21 +53,24 @@ pub(super) async fn operate<const COMPACT: bool>(
                     cancellation,
                 )
                 .await?;
-            Ok(json!({"accepted":true}))
+            Ok(ResultBody::Write { accepted: true })
         }
         "cancel" => {
             registry.cancel(id).await?;
-            row_result(registry.get(id)?, COMPACT)
+            Ok(ResultBody::Execution(Row::new(registry.get(id)?, COMPACT)))
         }
         "release" => {
             registry.release(id, cancellation).await?;
-            row_result(registry.get(id)?, COMPACT)
+            Ok(ResultBody::Execution(Row::new(registry.get(id)?, COMPACT)))
         }
         "wait" => {
             let (revision, row) = registry
                 .wait_for_execution_change(id, revision, cancellation)
                 .await?;
-            Ok(json!({"revision":revision,"execution":row_result(row, COMPACT)?}))
+            Ok(ResultBody::Wait {
+                revision,
+                execution: Row::new(row, COMPACT),
+            })
         }
         _ => Err(Error::tool("unsupported execution action")),
     }
@@ -124,6 +86,7 @@ pub(super) async fn execute(
     let registry = context.state.executions();
     let mut ids = Vec::with_capacity(parsed.ids.len());
     let mut handles = Vec::with_capacity(parsed.ids.len());
+    let mut private_page = false;
     for handle in parsed.ids {
         let id = resolve(&handle, &context.session_id)?;
         if ids.contains(&id) {
@@ -131,18 +94,37 @@ pub(super) async fn execute(
         }
         // Resolve every owner before state mutation. A targeted
         // lookup avoids cloning the full registry once per member.
-        registry.get(id)?;
+        let row = registry.get(id)?;
+        private_page |= row
+            .output
+            .is_some_and(|output| output.private_stdout.is_some());
         handles.push(format!("{}/{}", context.session_id, id.0));
         ids.push(id);
     }
     let maximum = output_budget(&context.state.snapshot().limits);
-    let skeleton = json!({"action":parsed.action,"results":handles.iter()
-        .map(|handle| json!({"id":handle,"ok":true,"result":null})).collect::<Vec<_>>()});
+    let skeleton = Batch {
+        action: parsed.action,
+        results: handles
+            .iter()
+            .map(|id| Target {
+                id: id.clone(),
+                ok: true,
+                outcome: Outcome::Result(()),
+            })
+            .collect(),
+    };
     // success and failure wrapper widths agree: true/result vs false/error.
     let overhead = serde_json::to_vec(&skeleton)?.len() - 4 * ids.len();
     let slot = maximum.saturating_sub(overhead) / ids.len();
     let required = if parsed.action == "read" {
-        MIN_PAGE_BYTES.max(ERROR_BYTES)
+        // Targets keep equal slots. A mixed batch needs each slot to be large
+        // enough for the largest envelope; the whole-call cap does not increase.
+        let minimum = if private_page {
+            MIN_PRIVATE_PAGE_BYTES
+        } else {
+            MIN_TEXT_PAGE_BYTES
+        };
+        minimum.max(ERROR_BYTES)
     } else {
         METADATA_BYTES.max(ERROR_BYTES)
     };
@@ -211,7 +193,7 @@ pub(super) async fn execute(
                 }
             }))
             .buffer_unordered(CONCURRENCY)
-            .collect::<Vec<(usize, Value)>>()
+            .collect::<Vec<_>>()
             .await
         }
     };
@@ -223,18 +205,25 @@ pub(super) async fn execute(
         return Ok(super::interrupted());
     };
     results.sort_by_key(|(index, _)| *index);
-    let result = json!({"action":parsed.action,"results":results.into_iter()
-        .map(|(_, value)| value).collect::<Vec<_>>()});
+    let result = Batch {
+        action: parsed.action,
+        results: results.into_iter().map(|(_, value)| value).collect(),
+    };
     let text = serde_json::to_string(&result)?;
     // Per-slot bounds were admitted before effects; exceeding this is an
     // implementation invariant violation, never a post-consumption truncation.
     debug_assert!(text.len() <= maximum);
     Ok(ToolOutput::text(text))
 }
-fn outcome(id: String, result: Result<Value, Error>) -> Value {
-    match result {
-        Ok(result) => json!({"id":id,"ok":true,"result":result}),
-        Err(error) => json!({"id":id,"ok":false,"error":failure(&error)}),
+fn outcome(id: String, result: Result<ResultBody, Error>) -> Target<ResultBody> {
+    let ok = result.is_ok();
+    Target {
+        id,
+        ok,
+        outcome: match result {
+            Ok(result) => Outcome::Result(result),
+            Err(error) => Outcome::Error(Diagnostic::new(error.tool_diagnostic(), true)),
+        },
     }
 }
 
@@ -259,6 +248,16 @@ mod tests {
             start_cursor: u64::MAX,
             end_cursor: u64::MAX,
             closed: false,
+            private_stdout: Some(PrivateOutputMetadata {
+                kind: PrivateOutputKind::Bytes,
+                channel: "stdout".into(),
+                media_type: format!("application/{}", "x".repeat(115)),
+                start_cursor: u64::MAX,
+                end_cursor: u64::MAX,
+                closed: false,
+                truncated: false,
+                available: false,
+            }),
         });
         row.output_availability = Some(OutputAvailability::Released);
         row.failure = Some(ToolFailure {
@@ -273,20 +272,21 @@ mod tests {
             DiagnosticPhase::OutputValidation,
         ));
         row.diagnostic.as_mut().unwrap().effects = EffectKnowledge::MayHaveOccurred;
-        let projected = metadata(row);
+        let projected = ResultBody::Wait {
+            revision: u64::MAX,
+            execution: Row::new(row, true),
+        };
+        assert!(serde_json::to_vec(&projected).unwrap().len() <= METADATA_BYTES);
         assert!(
-            serde_json::to_vec(&json!({"revision":u64::MAX,"execution":projected}))
-                .unwrap()
-                .len()
-                <= METADATA_BYTES
-        );
-        assert!(
-            serde_json::to_vec(&failure(&Error::Denied("private body".into())))
-                .unwrap()
-                .len()
+            serde_json::to_vec(&Diagnostic::new(
+                Error::Denied("private body".into()).tool_diagnostic(),
+                true
+            ))
+            .unwrap()
+            .len()
                 <= ERROR_BYTES
         );
-        let page = OutputPage {
+        let mut page = OutputPage {
             execution_id: ExecutionId(u64::MAX),
             chunks: vec![],
             cursor: u64::MAX,
@@ -295,7 +295,21 @@ mod tests {
             start_cursor: u64::MAX,
             closed: false,
             revision: u64::MAX,
+            private_stdout: Some(PrivateOutputMetadata {
+                kind: PrivateOutputKind::Bytes,
+                channel: "stdout".into(),
+                media_type: format!("application/{}", "x".repeat(115)),
+                start_cursor: u64::MAX,
+                end_cursor: u64::MAX,
+                closed: false,
+                truncated: false,
+                available: false,
+            }),
         };
-        assert!(serde_json::to_vec(&page).unwrap().len() <= MIN_PAGE_BYTES);
+        let length = serde_json::to_vec(&page).unwrap().len();
+        assert!(length > MIN_TEXT_PAGE_BYTES);
+        assert!(length <= MIN_PRIVATE_PAGE_BYTES);
+        page.private_stdout = None;
+        assert!(serde_json::to_vec(&page).unwrap().len() <= MIN_TEXT_PAGE_BYTES);
     }
 }

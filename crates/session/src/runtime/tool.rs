@@ -3,15 +3,21 @@ mod authorization;
 mod catalog;
 mod context;
 pub mod delegate;
+mod dialogue_reply;
 pub mod expand;
-pub(crate) mod external_dialogue;
 pub(crate) mod injection;
 mod messaging;
 pub(crate) mod secret;
 pub mod sleep;
 pub(crate) mod switch_mode;
+pub(crate) mod view_image;
 pub use authorization::{AllowTools, DenyAll};
 pub(crate) use catalog::ToolRegistry;
+pub use dialogue_reply::{
+    AdmittedDialogueReply, DialogueReplyAdapter, DialogueReplyPosition, DialogueReplyReceipt,
+    DialogueReplyRegistration, DialogueReplyRequest, MAX_DIALOGUE_REPLY_RECEIPT_BYTES,
+};
+pub(crate) use dialogue_reply::{DialogueReplyInvocation, DialogueReplyOwner};
 
 pub use super::execution::{FinalOutput, ToolFailure, ToolFailureKind, ToolOutput};
 use crate::Error;
@@ -44,6 +50,12 @@ pub struct ToolContext {
     pub execution_progress: Option<super::execution::ExecutionProgress>,
     resolved_arguments: Option<Arc<secret::ResolvedArguments>>,
     pub(crate) literal_mask: injection::LiteralMask,
+    pub(crate) redirect_destination: Option<crate::state::access::RedirectDestination>,
+    pub(crate) file_version_policy_arguments: Option<Arc<Value>>,
+    pub(crate) image_source: Option<Arc<view_image::Source>>,
+    pub(crate) image_approval_preview: Option<view_image::ApprovalPreview>,
+    pub(crate) image_https: Option<Arc<std::sync::Mutex<Option<view_image::PendingHttps>>>>,
+    pub(crate) image_model: Option<Arc<dyn crate::Client>>,
     redaction: super::execution::InvocationRedaction,
     cache_scope: Option<super::cache::Scope>,
     cache_collector: Arc<super::cache::Collector>,
@@ -59,6 +71,9 @@ pub enum SecretDelivery {
     ForwardPlaceholders,
 }
 
+#[cfg(feature = "wasm")]
+pub(crate) const GLOB_PATH_DEFAULT: &str = "{{var:glob_ignored}}";
+
 /// A callable tool receives live state and invocation-scoped capabilities.
 #[async_trait]
 pub trait Tool: Send + Sync {
@@ -67,6 +82,12 @@ pub trait Tool: Send + Sync {
     /// This is not a per-secret permission or a model-controlled tool-name rule.
     fn secret_delivery(&self) -> SecretDelivery {
         SecretDelivery::Resolve
+    }
+    /// Register literal arguments that cannot be sourced from visible variables
+    /// or Secret interpolation. Chosen by the implementation, not the model.
+    #[cfg(feature = "wasm")]
+    fn uses_literal_sources(&self) -> bool {
+        false
     }
     /// Trusted registered implementation's maximum encoded image output.
     /// Text tools keep zero. This declaration grants no Host or path permission.
@@ -78,10 +99,20 @@ pub trait Tool: Send + Sync {
     fn component_identity(&self) -> Option<&str> {
         None
     }
+    /// Actual negotiated component/Host capability; never inferred from tool text.
+    #[cfg(feature = "wasm")]
+    fn file_version_host(&self) -> Option<&dyn microcrab_host_api::Host> {
+        None
+    }
     /// Component lifecycle identity is independent of any advertised tool name.
     #[cfg(feature = "wasm")]
     fn wasm_lifecycle(&self) -> Option<super::wasm::AgentLifecycle> {
         None
+    }
+    /// Trusted registered WASM adapter links the explicit resolved-path glob import.
+    #[cfg(feature = "wasm")]
+    fn uses_glob_path_default(&self) -> bool {
+        false
     }
     /// Defaults are scoped to this registered tool and remain below native/user rules.
     fn permission_defaults(&self) -> Vec<crate::policy::Permission> {
@@ -96,6 +127,7 @@ pub enum ToolOrigin {
     Builtin,
     Wasm,
     External,
+    DialogueReply,
 }
 
 /// Builtin tool identities reserved by the runtime.
@@ -108,7 +140,7 @@ pub enum BuiltinTool {
     SwitchMode,
     SendMessage,
     Escalate,
-    ReplyExternalSpeaker,
+    ViewImage,
 }
 
 impl BuiltinTool {
@@ -121,7 +153,7 @@ impl BuiltinTool {
             "switch_mode" => Some(Self::SwitchMode),
             "send_message" => Some(Self::SendMessage),
             "escalate" => Some(Self::Escalate),
-            external_dialogue::NAME => Some(Self::ReplyExternalSpeaker),
+            view_image::NAME => Some(Self::ViewImage),
             _ => None,
         }
     }
@@ -135,7 +167,7 @@ impl BuiltinTool {
             Self::SwitchMode => switch_mode::SwitchMode::definition(),
             Self::SendMessage => messaging::SendMessage.definition(),
             Self::Escalate => messaging::Escalate.definition(),
-            Self::ReplyExternalSpeaker => external_dialogue::ReplyExternalSpeaker.definition(),
+            Self::ViewImage => view_image::ViewImage.definition(),
         }
     }
 
@@ -148,17 +180,18 @@ impl BuiltinTool {
             Self::SwitchMode => Arc::new(switch_mode::SwitchMode),
             Self::SendMessage => Arc::new(messaging::SendMessage),
             Self::Escalate => Arc::new(messaging::Escalate),
-            Self::ReplyExternalSpeaker => Arc::new(external_dialogue::ReplyExternalSpeaker),
+            Self::ViewImage => Arc::new(view_image::ViewImage),
         }
     }
 }
 
-/// One catalog entry. Builtin, WASM, and external tools share dispatch but not origin.
+/// One catalog entry. A native Session effect cannot be wrapped as an ordinary Tool.
 #[derive(Clone)]
 pub enum ToolRegistration {
     Builtin(BuiltinTool),
     Wasm(Arc<dyn Tool>),
     External(Arc<dyn Tool>),
+    DialogueReply(DialogueReplyRegistration),
 }
 
 impl ToolRegistration {
@@ -167,15 +200,20 @@ impl ToolRegistration {
             Self::Builtin(_) => ToolOrigin::Builtin,
             Self::Wasm(_) => ToolOrigin::Wasm,
             Self::External(_) => ToolOrigin::External,
+            Self::DialogueReply(_) => ToolOrigin::DialogueReply,
         }
     }
+}
 
-    fn tool(&self) -> Arc<dyn Tool> {
-        match self {
-            Self::Builtin(tool) => tool.implementation(),
-            Self::Wasm(tool) | Self::External(tool) => Arc::clone(tool),
-        }
-    }
+/// The Coding catalog explicitly advertises the new projection in its frozen
+/// read definition. An older exact catalog never silently changes result shapes.
+pub(crate) fn short_model_refs(definitions: &[ToolDefinition]) -> bool {
+    definitions.iter().any(|tool| {
+        tool.name == "read"
+            && tool
+                .description
+                .starts_with("Read text with scoped file version references (fv_).")
+    })
 }
 
 /// Runtime builtin tools, in stable name order.

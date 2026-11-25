@@ -1,9 +1,14 @@
 //! Creator history serializes publication and stages conversation head selection until recovery commits it.
+#[cfg(any(feature = "storage-file", feature = "storage-sqlite"))]
+mod ancestry;
 #[cfg(test)]
 mod commit_observer_tests;
 mod communication;
+#[cfg(any(feature = "storage-file", feature = "storage-sqlite"))]
+mod dedup;
 #[cfg(feature = "storage-file")]
 mod disk;
+mod file_versions;
 #[cfg(all(test, any(feature = "storage-file", feature = "storage-sqlite")))]
 #[path = "history/gateway_tests.rs"]
 mod gateway_tests;
@@ -23,6 +28,9 @@ mod types;
 mod undo;
 #[cfg(test)]
 mod undo_tests;
+
+#[cfg(all(test, any(feature = "storage-file", feature = "storage-sqlite")))]
+mod request_head_tests;
 
 #[cfg(feature = "storage-file")]
 pub use disk::FileJournal;
@@ -519,12 +527,55 @@ impl CreatorJournal {
         if epochs.len() > 1024 {
             return Err(Error::Limit("display audit epoch budget".into()));
         }
-        let selection = self.selection.lock().await;
+        let witness = self.display_witness().await;
         let mut wanted: std::collections::BTreeSet<_> = epochs.iter().copied().collect();
-        let mut next = selection
-            .head
-            .as_ref()
-            .map(|head| head.checkpoint_id.clone());
+        let Some(cursor) = witness.cursor.clone().filter(|_| !wanted.is_empty()) else {
+            return Ok(wanted.into_iter().map(|epoch| (epoch, None)).collect());
+        };
+        #[cfg(any(feature = "storage-file", feature = "storage-sqlite"))]
+        {
+            let stop = |mut requested: std::collections::BTreeSet<_>| {
+                let mut visited = 0;
+                move |node: &ancestry::VerifiedNode| {
+                    visited += 1;
+                    requested.remove(&node.epoch);
+                    requested.is_empty() || visited == 1024
+                }
+            };
+            let nodes = match self.backend.as_ref() {
+                Backend::Memory(_) => None,
+                #[cfg(feature = "storage-file")]
+                Backend::Disk(backend) => Some(
+                    backend
+                        .request_metadata(cursor.clone(), stop(wanted.clone()))
+                        .await?,
+                ),
+                #[cfg(feature = "storage-sqlite")]
+                Backend::Sqlite(backend) => Some(
+                    backend
+                        .request_metadata(cursor.clone(), stop(wanted.clone()))
+                        .await?,
+                ),
+            };
+            if let Some(nodes) = nodes {
+                let mut heads = Vec::new();
+                let incomplete = nodes.last().is_some_and(|tail| tail.parent.is_some());
+                for node in nodes {
+                    if wanted.remove(&node.epoch) {
+                        heads.push((node.epoch, node.request_head));
+                    }
+                }
+                if incomplete && !wanted.is_empty() {
+                    return Err(Error::Limit("display audit ancestry budget".into()));
+                }
+                if self.display_witness().await != witness {
+                    return Err(Error::Busy);
+                }
+                heads.extend(wanted.into_iter().map(|epoch| (epoch, None)));
+                return Ok(heads);
+            }
+        }
+        let mut next = Some(cursor.checkpoint_id);
         let mut seen = std::collections::HashSet::new();
         let mut heads = vec![];
         let mut bytes = 0usize;
@@ -546,6 +597,9 @@ impl CreatorJournal {
                 heads.push((epoch, point.checkpoint.request_head));
             }
             next = point.parent;
+        }
+        if self.display_witness().await != witness {
+            return Err(Error::Busy);
         }
         heads.extend(wanted.into_iter().map(|epoch| (epoch, None)));
         Ok(heads)
@@ -838,6 +892,22 @@ impl CreatorJournal {
 }
 #[async_trait::async_trait]
 impl Journal for CreatorJournal {
+    fn supports_file_versions(&self) -> bool {
+        true
+    }
+    async fn load_file_versions(
+        &self,
+        session: &str,
+    ) -> Result<Option<file_versions::FileVersions>, Error> {
+        self.read_file_versions(session).await
+    }
+    async fn commit_file_versions(
+        &self,
+        session: &str,
+        next: file_versions::FileVersions,
+    ) -> Result<(), Error> {
+        self.store_file_versions(session, next).await
+    }
     fn supports_communication(&self) -> bool {
         true
     }

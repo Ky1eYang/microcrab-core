@@ -1,23 +1,52 @@
 //! Real epoch-bound guest continuations. Runtime storage never borrows linear memory.
-use super::{Compiled, Instance, SessionBinding, ToolContext, epoch::Slot, output};
+use super::{Compiled, Instance, Phase, SessionBinding, ToolContext, epoch::Slot, guest_observation, output};
 use crate::{Error, runtime::execution::OutputWriter};
-use std::{sync::Arc, time::Duration};
+use std::{sync::{Arc, Weak}, time::Duration};
 use tokio_util::sync::CancellationToken;
 use wasmtime::component::Resource;
+
+/// Exact cleanup capability without a strong path back to the Session's slots.
+/// The canonical Execution Registry owns the actual controller and its receipts.
+pub(super) struct Cleanup {
+    registry: Weak<crate::runtime::execution::ExecutionRegistry>,
+    id: crate::runtime::execution::ExecutionId,
+}
+
+impl Cleanup {
+    pub(super) fn capture(context: &ToolContext) -> Option<Self> {
+        Some(Self {
+            registry: Arc::downgrade(&context.state.executions()),
+            id: context.execution_id?,
+        })
+    }
+
+    pub(super) async fn acknowledge(&self) -> Result<(), Error> {
+        let registry = self.registry.upgrade().ok_or(Error::Closed)?;
+        registry.cleanup_controller(self.id).await
+    }
+}
 
 /// Rebind the live counters and producer cancellation per step while retaining
 /// the exact invocation conduit. Reconstructing through `ToolContext::new` would
 /// mint a different process wrapper and lose the sealed argument/redaction binding.
 pub(super) struct Scope {
     invocation: ToolContext,
+    observation: Option<Arc<guest_observation::Scope>>,
+    cleanup: Option<Arc<Cleanup>>,
 }
 impl Scope {
-    pub fn capture(context: &ToolContext) -> Self {
+    pub fn capture(
+        context: &ToolContext,
+        observation: Option<Arc<guest_observation::Scope>>,
+    ) -> Self {
         let mut invocation = context.clone();
         // Progress is supplied by the execution owner, not borrowed by a later
         // guest step. The original admission and execution identities remain.
         invocation.execution_progress = None;
-        Self { invocation }
+        Self { cleanup: Cleanup::capture(&invocation).map(Arc::new), invocation, observation }
+    }
+    pub(super) fn registration(&self) -> Option<Arc<Cleanup>> {
+        self.cleanup.clone()
     }
     fn context(&self, cancel: CancellationToken) -> ToolContext {
         let mut context = self.invocation.clone();
@@ -28,6 +57,13 @@ impl Scope {
         context
     }
 }
+async fn close_web(web: Option<&super::web_transport::Continuation>) -> Result<(), microcrab_host_api::web_transport::WebTransportError> {
+    if let Some(web) = web {
+        web.cleanup().await?;
+    }
+    Ok(())
+}
+
 fn interrupt(writer: &OutputWriter, error: impl std::fmt::Display) {
     let _ = writer.interrupt(format!("Guest producer interrupted: {error}"));
 }
@@ -44,6 +80,16 @@ pub(super) fn start(
     let writer = source.writer.clone();
     tokio::spawn(async move {
         loop {
+            if source.web.is_some() && (slot.cancellation.is_cancelled() || source.controller.cancellation.is_cancelled()) {
+                if let Err(error) = close_web(source.web.as_ref()).await {
+                    interrupt(&writer, error);
+                } else if slot.cancellation.is_cancelled() {
+                    interrupt(&writer, "Session epoch ended");
+                } else {
+                    let _ = writer.confirm_cancelled();
+                }
+                break;
+            }
             if slot.cancellation.is_cancelled() {
                 interrupt(&writer, "Session epoch ended");
                 break;
@@ -61,7 +107,11 @@ pub(super) fn start(
                 match slot.try_lease() {
                     Some(lease) => lease,
                     None => {
-                        let _ = writer.confirm_cancelled();
+                        if let Err(error) = close_web(source.web.as_ref()).await {
+                            interrupt(&writer, error);
+                        } else {
+                            let _ = writer.confirm_cancelled();
+                        }
                         break;
                     }
                 }
@@ -69,6 +119,10 @@ pub(super) fn start(
                 match slot.lease(&cancellation).await {
                     Ok(lease) => lease,
                     Err(error) => {
+                        if let Err(cleanup) = close_web(source.web.as_ref()).await {
+                            interrupt(&writer, cleanup);
+                            break;
+                        }
                         if source.controller.cancellation.is_cancelled() {
                             let _ = writer.confirm_cancelled();
                         } else {
@@ -81,6 +135,8 @@ pub(super) fn start(
             let worker_compiled = compiled.clone();
             let worker_slot = slot.clone();
             let context = scope.context(cancellation.clone());
+            let observation = scope.observation.clone();
+            let web = source.web.as_ref().map(super::web_transport::Continuation::step);
             let binding = if context.state.is_attached() {
                 Some(SessionBinding::from_state(context.state.clone()))
             } else {
@@ -93,12 +149,15 @@ pub(super) fn start(
                 output: None,
                 controller: source.controller.clone(),
                 channels: source.channels.clone(),
+                private_mime: None,
                 driver: None,
+                web: None,
                 retained: Default::default(),
                 cleanup: None,
                 attached: true,
             };
             let runtime = tokio::runtime::Handle::current();
+            let failure_writer = writer.clone();
             let dispatch = tracing::dispatcher::get_default(Clone::clone);
             let result = tokio::task::spawn_blocking(move || {
                 tracing::dispatcher::with_default(&dispatch, || {
@@ -112,6 +171,9 @@ pub(super) fn start(
                             Some(context),
                             operation_scope,
                             |bindings, store, boundary| {
+                                store.data_mut().guest_observation =
+                                    observation.map(|scope| (scope, Phase::Drive));
+                                store.data_mut().web = web;
                                 store.data_mut().borrowed_processes =
                                     retained.keys().copied().collect();
                                 store.data_mut().process_grants = retained;
@@ -125,8 +187,9 @@ pub(super) fn start(
                                 let result = bindings
                                     .call_drive(&mut *store, borrowed, &state, is_cancelled)
                                     .map_err(|error| {
-                                        boundary
-                                            .failure(error, crate::observation::wasm::Phase::Drive)
+                                        let error = worker_compiled.execution_failure(boundary, error, Phase::Drive);
+                                        let _ = failure_writer.interrupt_wasm(&error);
+                                        error
                                     })?;
                                 match result {
                                     Ok(step) => {
@@ -155,6 +218,14 @@ pub(super) fn start(
                 })
             })
             .await;
+            if source.web.is_some()
+                && (is_cancelled || !matches!(&result, Ok(Ok(Ok(step))) if !step.finished))
+            {
+                if let Err(error) = close_web(source.web.as_ref()).await {
+                    interrupt(&writer, error);
+                    break;
+                }
+            }
             match result {
                 Ok(Ok(Ok(step))) => {
                     if is_cancelled {
@@ -169,7 +240,7 @@ pub(super) fn start(
                     // An explicit wake request is time-sliced; zero never becomes
                     // an unbounded empty busy loop starving the executor.
                     let delay = Duration::from_millis(step.wake_after_ms.clamp(1, 60_000));
-                    tokio::select! {biased;_=slot.cancellation.cancelled()=>{interrupt(&writer,"Session epoch ended");break},_=source.controller.cancellation.cancelled()=>{},_=tokio::time::sleep(delay)=>{}}
+                    tokio::select! {biased;_=slot.cancellation.cancelled()=>{},_=source.controller.cancellation.cancelled()=>{},_=tokio::time::sleep(delay)=>{}}
                 }
                 Ok(Ok(Err(failure))) => {
                     let _ = writer.finish(Err(failure));
@@ -232,7 +303,7 @@ mod tests {
             .redaction_handle()
             .merge(&InvocationRedaction::from_snapshot(state.secret_snapshot()).unwrap())
             .unwrap();
-        let scope = Scope::capture(&original);
+        let scope = Scope::capture(&original, None);
         let continued = scope.context(CancellationToken::new());
         state
             .prepare_secret_write(BTreeMap::from([("token".into(), "PRIVATE_NEW".into())]))
@@ -259,7 +330,7 @@ mod tests {
             CancellationToken::new(),
         );
         let original = invocation.cancellation.clone();
-        let scope = Scope::capture(&invocation);
+        let scope = Scope::capture(&invocation, None);
         original.cancel();
         invocation.state.update(|snapshot| {
             snapshot.turn_id = Some(20);
@@ -289,7 +360,7 @@ mod proof_tests {
         original.call_id = "original-call".into();
         original.tool = "producer".into();
         super::super::test_admission::admit(&mut original, Some("component-a".into()));
-        let scope = Scope::capture(&original);
+        let scope = Scope::capture(&original, None);
         original.state.update(|snapshot| {
             snapshot.turn_id = Some(123);
         });

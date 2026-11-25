@@ -12,14 +12,15 @@ mod retention;
 mod status;
 #[cfg(test)]
 mod tests;
-pub use buffer::{BufferedOutput, OutputWriter};
+pub use buffer::{BufferedOutput, OutputWriter, PrivateOutputLease};
 pub use control::{CancellationController, ExecutionController};
-pub(crate) use model::ResolvedOutput;
 pub use model::{
     DelegateChild, ExecutionCapabilities, ExecutionContentField, ExecutionContentPage,
     ExecutionDelivery, ExecutionId, ExecutionNotice, ExecutionNoticeSink, ExecutionSnapshot,
     ExecutionStatus, FinalOutput, MediaAttachment, OutputAvailability, OutputChunk, OutputMetadata,
-    OutputOptions, OutputPage, ToolFailure, ToolFailureKind, ToolOutput,
+    OutputOptions, OutputPage, PrivateOutputKind, PrivateOutputMetadata, ToolFailure,
+    ToolFailureKind, ToolOutput,
 };
+pub(crate) use model::{ModelExecutionMetadata, ResolvedOutput};
 pub use registry::{ExecutionHandle, ExecutionProgress, ExecutionRegistry};
 pub use status::{ExecutionKind, StatusProjection};

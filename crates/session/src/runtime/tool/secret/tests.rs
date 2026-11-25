@@ -390,7 +390,10 @@ async fn constrained_placeholder_is_checked_in_full_after_original_permission_wi
             .is_err()
     );
     assert!(without_witness.begin_dispatch(None).is_err());
-    registry.execute(&resolved, context.clone()).await.unwrap();
+    registry
+        .execute(&resolved, context.clone(), None)
+        .await
+        .unwrap();
     assert_eq!(tool.calls.load(Ordering::SeqCst), 1);
     assert!(context.begin_dispatch(None).is_err());
     assert!(registry.resolve_call(&original, &mut context).is_err());
@@ -456,7 +459,7 @@ async fn only_registered_human_delivery_forwards_placeholders_without_lookup() {
     let mut context = admitted(tool.clone(), state(&[]).await, &original).await;
     let forwarded = registry.resolve_call(&original, &mut context).unwrap();
     assert_eq!(forwarded.arguments, original.arguments);
-    registry.execute(&forwarded, context).await.unwrap();
+    registry.execute(&forwarded, context, None).await.unwrap();
     assert_eq!(tool.calls.load(Ordering::SeqCst), 1);
 }
 #[tokio::test]
@@ -697,7 +700,7 @@ async fn actual_job_write_merges_recipient_before_stdin_echo_and_keeps_rotated_v
         executions
             .install_redaction(invocation_id, context.redaction_handle())
             .unwrap();
-        let output = tools.execute(&resolved, context).await.unwrap();
+        let output = tools.execute(&resolved, context, None).await.unwrap();
         match output {
             ToolOutput::Final(output) => executions
                 .complete_detached(invocation_id, output)

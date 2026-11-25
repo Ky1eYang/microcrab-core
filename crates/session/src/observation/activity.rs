@@ -289,6 +289,9 @@ fn inbox_failure(error: &Error) -> InboxFailureKind {
         Error::Limit(_) => InboxFailureKind::Limit(facts.sanitized_limit().expect("typed limit")),
         Error::Cancelled => InboxFailureKind::Cancelled { reason: None },
         Error::Config(cause) => InboxFailureKind::Config(cause.public_reason().map(str::to_owned)),
+        Error::IncompatibleModelCatalog | Error::ModelCatalogContinuationMismatch => {
+            InboxFailureKind::Config(error.public_reason().map(str::to_owned))
+        }
         Error::Denied(cause) => InboxFailureKind::Denied(cause.public_reason().map(str::to_owned)),
         Error::Tool(cause) => InboxFailureKind::Tool(cause.public_reason().map(str::to_owned)),
         Error::Lifecycle(cause) => {

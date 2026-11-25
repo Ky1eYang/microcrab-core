@@ -2,9 +2,11 @@
 use super::*;
 use microcrab_host_api::Bytes;
 use microcrab_host_api::{
-    ErrorCategory, GlobOutput, GlobRequest, GrepOutput, GrepRequest, HostError, OpContext,
-    ReadOutput, ReadRequest, WriteOutput, WriteRequest,
+    ErrorCategory, GlobIgnoreRuleFile, GlobIgnoreSnapshot, GlobOutput, GlobRequest, GrepOutput,
+    GrepRequest, HostError, OpContext, ReadOutput, ReadRequest, ResolvedGlobOutput, WriteOutput,
+    WriteRequest,
     filesystem::{FileHandle, FileKind, FileMeta, FsApi, OpenOptions},
+    validate_glob_ignore_rules, validate_glob_ignored_paths,
 };
 use microcrab_host_protocol::{ErrorCode, HostRequest, WireError};
 use serde::de::DeserializeOwned;
@@ -216,6 +218,21 @@ impl RemoteHost {
         cancel: CancellationToken,
         expected_generation: Option<u64>,
     ) -> Result<Value, ToolError> {
+        self.call_until(method, cancel, expected_generation, None)
+            .await
+    }
+
+    async fn call_until(
+        &self,
+        method: HostRequest,
+        cancel: CancellationToken,
+        expected_generation: Option<u64>,
+        deadline: Option<Instant>,
+    ) -> Result<Value, ToolError> {
+        // Ephemeral transport has separate admission, scope and reply handling.
+        if method.is_ephemeral() {
+            return Err(unavailable("web transport requires scoped dispatch"));
+        }
         if cancel.is_cancelled() {
             return Err(ToolError::Cancelled);
         }
@@ -280,6 +297,27 @@ impl RemoteHost {
         let control = method.is_control();
         let mutation = method.is_mutation();
         let consumption_key = method.consumption_key();
+        let budget = match deadline {
+            Some(at) => OPERATION_TIMEOUT.min(at.saturating_duration_since(Instant::now())),
+            None => OPERATION_TIMEOUT,
+        };
+        if budget.is_zero() {
+            return Err(ToolError::OperationDeadline);
+        }
+        let remaining_budget_ms = budget.as_millis().max(1) as u32;
+        if matches!(
+            &method,
+            HostRequest::GlobWithIgnoreRules { .. } | HostRequest::GlobWithIgnoredPaths { .. }
+        ) {
+            let frame = HostFrame::Request {
+                request_id: request_id.clone(),
+                operation_id: operation_id.clone(),
+                lease_generation: lease.clone(),
+                remaining_budget_ms,
+                method: method.clone(),
+            };
+            microcrab_host_protocol::encode_frame(&frame).map_err(wire_error)?;
+        }
         if matches!(
             &method,
             HostRequest::PreflightMutations { .. } | HostRequest::Mutate(_)
@@ -291,7 +329,7 @@ impl RemoteHost {
                 request_id: request_id.clone(),
                 operation_id: operation_id.clone(),
                 lease_generation: lease.clone(),
-                remaining_budget_ms: OPERATION_TIMEOUT.as_millis() as u32,
+                remaining_budget_ms,
                 method: method.clone(),
             };
             microcrab_host_protocol::encode_frame(&frame).map_err(|error| {
@@ -373,7 +411,7 @@ impl RemoteHost {
                 request_id,
                 operation_id: operation_id.clone(),
                 lease_generation: lease,
-                remaining_budget_ms: OPERATION_TIMEOUT.as_millis() as u32,
+                remaining_budget_ms,
                 method,
             },
             control,
@@ -384,7 +422,7 @@ impl RemoteHost {
             if stream_read {
                 std::future::pending::<()>().await;
             } else {
-                tokio::time::sleep(OPERATION_TIMEOUT).await;
+                tokio::time::sleep(budget).await;
             }
         };
         let reply = tokio::select! {biased;
@@ -494,6 +532,13 @@ impl RemoteHost {
             route.last_received = Instant::now();
         }
         match frame {
+            HostFrame::Response {
+                request_id,
+                operation_id,
+                result,
+            } if web_transport::is_web_request(&request_id) => {
+                return self.receive_web_response(generation, &request_id, &operation_id, result);
+            }
             HostFrame::Response {
                 request_id,
                 operation_id,
@@ -652,7 +697,13 @@ impl RemoteHost {
                 sequence,
                 data,
                 eof,
-            } => self.accept_chunk(generation, transfer_id, sequence, data, eof)?,
+            } => {
+                if let Some(data) =
+                    self.receive_web_chunk(generation, &transfer_id, sequence, data, eof)?
+                {
+                    self.accept_chunk(generation, transfer_id, sequence, data, eof)?;
+                }
+            }
             HostFrame::ProcessChanged {
                 lease_generation,
                 handle,
@@ -705,6 +756,10 @@ impl RemoteHost {
         else {
             return;
         };
+        if web_transport::is_web_request(request_id) {
+            self.fail_web_request(route, request_id, operation_id);
+            return;
+        }
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         if !pending.get(request_id).is_some_and(|pending| {
             pending.generation == generation && pending.operation_id == operation_id
@@ -743,6 +798,47 @@ impl RemoteHost {
             let _ = pending.sender.send(result);
         }
     }
+    async fn typed_glob_ignore<T: DeserializeOwned>(
+        &self,
+        ctx: &OpContext,
+        method: HostRequest,
+    ) -> Result<T, ToolError> {
+        ctx.check()?;
+        let generation = {
+            let route = self.route.lock().unwrap_or_else(|e| e.into_inner());
+            let route = route
+                .as_ref()
+                .ok_or_else(|| unavailable("Host route is disconnected"))?;
+            let supported = match method {
+                HostRequest::GlobIgnoredPaths | HostRequest::GlobWithIgnoredPaths { .. } => {
+                    route.glob_paths
+                }
+                _ => route.glob_ignore,
+            };
+            if !supported {
+                return Err(ToolError::unsupported(method.method_name()));
+            }
+            route.generation
+        };
+        // A replacement route must independently negotiate the capability.
+        // Wait for readiness normally, then pin the actual request to this route.
+        let value = ctx
+            .run(async {
+                let ready = self.await_ready(&ctx.cancel).await;
+                let result = match ready {
+                    Ok(ready) if ready == generation => {
+                        self.call_until(method, ctx.cancel.clone(), Some(generation), ctx.deadline)
+                            .await
+                    }
+                    Ok(_) => Err(unavailable("Host route changed before request admission")),
+                    Err(error) => Err(error),
+                };
+                Ok(result)
+            })
+            .await??;
+        payload::decode(value)
+    }
+
     pub(crate) async fn typed<T: DeserializeOwned>(
         &self,
         method: HostRequest,
@@ -837,6 +933,181 @@ pub(crate) fn wire_error(error: WireError) -> ToolError {
 
 #[async_trait::async_trait]
 impl Host for RemoteHost {
+    fn web_transport_binding(&self) -> Option<microcrab_host_api::web_transport::ProjectScope> {
+        self.web_binding()
+    }
+
+    async fn http_get(
+        &self,
+        ctx: &OpContext,
+        scope: &microcrab_host_api::web_transport::ConnectionScope,
+        url: &str,
+        max_bytes: u32,
+    ) -> microcrab_host_api::web_transport::WebTransportResult<
+        microcrab_host_api::web_transport::HttpResponse,
+    > {
+        self.web_call(
+            ctx,
+            microcrab_host_protocol::WebTransportRequest::HttpGet {
+                scope: scope.clone(),
+                url: url.to_owned(),
+                max_bytes,
+            },
+        )
+        .await?
+        .http()
+    }
+
+    async fn ws_open(
+        &self,
+        ctx: &OpContext,
+        scope: &microcrab_host_api::web_transport::ConnectionScope,
+        url: &str,
+    ) -> microcrab_host_api::web_transport::WebTransportResult<()> {
+        self.web_call(
+            ctx,
+            microcrab_host_protocol::WebTransportRequest::WsOpen {
+                scope: scope.clone(),
+                url: url.to_owned(),
+            },
+        )
+        .await?
+        .unit()
+    }
+
+    async fn ws_status(
+        &self,
+        ctx: &OpContext,
+        scope: &microcrab_host_api::web_transport::ConnectionScope,
+    ) -> microcrab_host_api::web_transport::WebTransportResult<()> {
+        self.web_call(
+            ctx,
+            microcrab_host_protocol::WebTransportRequest::WsStatus {
+                scope: scope.clone(),
+            },
+        )
+        .await?
+        .unit()
+    }
+
+    async fn ws_send(
+        &self,
+        ctx: &OpContext,
+        scope: &microcrab_host_api::web_transport::ConnectionScope,
+        text: &str,
+    ) -> microcrab_host_api::web_transport::WebTransportResult<()> {
+        self.web_call(
+            ctx,
+            microcrab_host_protocol::WebTransportRequest::WsSend {
+                scope: scope.clone(),
+                text: text.to_owned(),
+            },
+        )
+        .await?
+        .unit()
+    }
+
+    async fn ws_receive(
+        &self,
+        ctx: &OpContext,
+        scope: &microcrab_host_api::web_transport::ConnectionScope,
+        max_bytes: u32,
+    ) -> microcrab_host_api::web_transport::WebTransportResult<
+        microcrab_host_api::web_transport::WsReceive,
+    > {
+        self.web_call(
+            ctx,
+            microcrab_host_protocol::WebTransportRequest::WsReceive {
+                scope: scope.clone(),
+                max_bytes,
+            },
+        )
+        .await?
+        .receive()
+    }
+
+    async fn ws_pull(
+        &self,
+        ctx: &OpContext,
+        scope: &microcrab_host_api::web_transport::ConnectionScope,
+        max_bytes: u32,
+        soft_wait_ms: u32,
+    ) -> microcrab_host_api::web_transport::WebTransportResult<
+        microcrab_host_api::web_transport::WsPull,
+    > {
+        self.web_call(
+            ctx,
+            microcrab_host_protocol::WebTransportRequest::WsPull {
+                scope: scope.clone(),
+                max_bytes,
+                soft_wait_ms,
+            },
+        )
+        .await?
+        .pull()
+    }
+
+    async fn ws_close(
+        &self,
+        ctx: &OpContext,
+        scope: &microcrab_host_api::web_transport::ConnectionScope,
+    ) -> microcrab_host_api::web_transport::WebTransportResult<()> {
+        self.web_call(
+            ctx,
+            microcrab_host_protocol::WebTransportRequest::WsClose {
+                scope: scope.clone(),
+            },
+        )
+        .await?
+        .unit()
+    }
+
+    async fn ws_release_scope(
+        &self,
+        ctx: &OpContext,
+        owner: &microcrab_host_api::web_transport::ConnectionOwner,
+    ) -> microcrab_host_api::web_transport::WebTransportResult<()> {
+        self.web_call(
+            ctx,
+            microcrab_host_protocol::WebTransportRequest::ReleaseScope {
+                owner: owner.clone(),
+            },
+        )
+        .await?
+        .unit()
+    }
+
+    fn file_version_authority(&self) -> Option<String> {
+        let scope = self.scope.lock().ok()?;
+        let scope = scope.as_ref().filter(|scope| scope.is_project())?;
+        let descriptor = &self.descriptor;
+        // Current native Project protocol has a typed Normalize request (not a
+        // discovery capability); browser Conversation carriers are not opted in.
+        // Rejection by an older implementation fails closed at the operation.
+        // Project scope and authenticated Host/workspace identity survive lease
+        // and process reconnects; bridge instance/lease are not file identities.
+        serde_json::to_string(&(
+            "native-remote-v1",
+            scope,
+            &descriptor.host_id,
+            &descriptor.workspace_id,
+            &descriptor.workspace_root,
+            &descriptor.platform,
+            &descriptor.info.description,
+        ))
+        .ok()
+    }
+    fn supports_private_file_read(&self) -> bool {
+        self.private_file_supported()
+    }
+    async fn read_private_file(
+        &self,
+        path: PathBuf,
+        buffer: microcrab_host_api::PrivateFileBuffer,
+        context: &microcrab_host_api::OpContext,
+    ) -> Result<microcrab_host_api::PrivateFileBuffer, ToolError> {
+        self.read_private_file_on_route(path, buffer, context).await
+    }
     fn info(&self) -> Result<HostInfo, ToolError> {
         Ok(self.descriptor.info.clone())
     }
@@ -929,6 +1200,51 @@ impl Host for RemoteHost {
     ) -> Result<GlobOutput, ToolError> {
         self.typed(HostRequest::Glob(request), cancel).await
     }
+    async fn glob_ignore_snapshot(&self, ctx: &OpContext) -> Result<GlobIgnoreSnapshot, ToolError> {
+        let snapshot: GlobIgnoreSnapshot = self
+            .typed_glob_ignore(ctx, HostRequest::GlobIgnoreSnapshot)
+            .await?;
+        validate_glob_ignore_rules(&snapshot.rules)?;
+        Ok(snapshot)
+    }
+
+    async fn glob_with_ignore_rules(
+        &self,
+        ctx: &OpContext,
+        request: GlobRequest,
+        mut rules: Vec<GlobIgnoreRuleFile>,
+    ) -> Result<GlobOutput, ToolError> {
+        ctx.check()?;
+        if request.include_ignored {
+            // No reason to include an irrelevant (possibly invalid) rule list.
+            rules.clear();
+        } else {
+            validate_glob_ignore_rules(&rules)?;
+        }
+        self.typed_glob_ignore(ctx, HostRequest::GlobWithIgnoreRules { request, rules })
+            .await
+    }
+
+    async fn glob_ignored_paths(&self, ctx: &OpContext) -> Result<Vec<String>, ToolError> {
+        let paths: Vec<String> = self
+            .typed_glob_ignore(ctx, HostRequest::GlobIgnoredPaths)
+            .await?;
+        validate_glob_ignored_paths(&paths)?;
+        Ok(paths)
+    }
+
+    async fn glob_with_ignored_paths(
+        &self,
+        ctx: &OpContext,
+        request: GlobRequest,
+        paths: Vec<String>,
+    ) -> Result<ResolvedGlobOutput, ToolError> {
+        ctx.check()?;
+        validate_glob_ignored_paths(&paths)?;
+        self.typed_glob_ignore(ctx, HostRequest::GlobWithIgnoredPaths { request, paths })
+            .await
+    }
+
     async fn grep(
         &self,
         request: GrepRequest,
@@ -1065,13 +1381,9 @@ impl FsApi for RemoteHost {
         let path_buf = path.to_path_buf();
         let bytes = ctx
             .run(async {
-                self.read_file(
-                    path_buf,
-                    20 * 1024 * 1024,
-                    ctx.cancel.clone(),
-                )
-                .await
-                .map_err(ToolError::into_host_error)
+                self.read_file(path_buf, 20 * 1024 * 1024, ctx.cancel.clone())
+                    .await
+                    .map_err(ToolError::into_host_error)
             })
             .await?;
         self.files.insert(bytes.into(), ctx.clone())

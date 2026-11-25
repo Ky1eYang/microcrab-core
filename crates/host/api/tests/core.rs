@@ -26,6 +26,38 @@ impl HostAPI for Empty {}
 impl microcrab_host_api::Host for Empty {}
 
 #[tokio::test]
+async fn web_transport_defaults_are_typed_unsupported_and_never_claim_authority() {
+    use microcrab_host_api::web_transport::{ConnectionScope, ProjectScope, WebTransportError as E};
+    let host: &dyn microcrab_host_api::Host = &Empty;
+    let scope = ConnectionScope {
+        binding: ProjectScope { binding_id: "binding".into(), backend_id: "backend".into(), project_id: "project".into() },
+        session_id: "session".into(),
+        epoch: 3,
+        connection_id: "id".into(),
+    };
+    assert!(!host.supports_web_transport());
+    assert!(host.web_transport_binding().is_none());
+    let ctx = OpContext::default();
+    let results = [
+        host.http_get(&ctx, &scope, "http://example.test:80/path", 1).await.map(drop),
+        host.ws_open(&ctx, &scope, "ws://example.test:80/path").await,
+        host.ws_status(&ctx, &scope).await,
+        host.ws_send(&ctx, &scope, "").await,
+        host.ws_receive(&ctx, &scope, 1).await.map(drop),
+        host.ws_pull(&ctx, &scope, 1, 0).await.map(drop),
+        host.ws_close(&ctx, &scope).await,
+        host.ws_release_scope(&ctx, &scope.owner()).await,
+    ];
+    assert!(results.into_iter().all(|err| err == Err(E::Unsupported)));
+    ctx.cancel.cancel();
+    assert_eq!(host.ws_status(&ctx, &scope).await, Err(E::Cancelled));
+    let expired = OpContext { deadline: Some(Instant::now()), ..Default::default() };
+    assert_eq!(host.ws_status(&expired, &scope).await, Err(E::Timeout));
+    assert_eq!(host.ws_pull(&ctx, &scope, 1, 0).await, Err(E::Cancelled));
+    assert_eq!(host.ws_pull(&expired, &scope, 1, 0).await, Err(E::Timeout));
+}
+
+#[tokio::test]
 async fn tool_extension_ports_are_object_safe_and_map_context_errors() {
     use microcrab_host_api::{ReadRequest, ToolError, tool_api::TextReadApi};
     let host: &dyn TextReadApi = &Empty;

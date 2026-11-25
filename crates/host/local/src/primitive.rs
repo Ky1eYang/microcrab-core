@@ -55,6 +55,7 @@ impl HostAPI for LocalHost {
                     "process.shell-spec",
                     "process.exec",
                     "shell.launch",
+                    "shell.launch-private",
                     "shell.capture-status",
                     "shell.read",
                     "shell.drain",

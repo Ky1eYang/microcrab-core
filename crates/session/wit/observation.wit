@@ -1,0 +1,32 @@
+package microcrab:session@0.2.2;
+
+/// Best-effort diagnostics only. Guest facts are not proof of an effect.
+interface observation {
+  enum level { debug, info, warn, error }
+  enum event-code { checkpoint, failed, limit-exceeded, invalid-envelope, unexpected-reply, effect-uncertain }
+  enum phase { initialize, connect, send, receive, classify, decode, dispatch, cleanup }
+  enum method {
+    none, target, page, runtime, dom, input, web-mcp, browser,
+    target-get-targets, target-attach, target-detach, runtime-enable,
+    runtime-disable, runtime-call-function-on, page-capture-screenshot,
+    web-mcp-enable, web-mcp-invoke,
+  }
+  enum counter { none, raw-messages, raw-bytes, decoded-bytes, elapsed-ms, decoded-tokens }
+  enum confirmation { unknown, not-confirmed, confirmed }
+
+  record event {
+    severity: level,
+    code: event-code,
+    stage: phase,
+    /// Exact method when known, otherwise the family or none.
+    method-family: method,
+    metric: counter,
+    /// These numbers are counts, byte sizes or milliseconds, not opaque IDs.
+    /// Submit zero for both when metric is none.
+    measured: u32,
+    limit: u32,
+    confirmation: confirmation,
+  }
+
+  record-event: func(value: event);
+}

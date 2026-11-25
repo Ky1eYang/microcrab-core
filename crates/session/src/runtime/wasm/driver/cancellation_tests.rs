@@ -535,7 +535,8 @@ fn cooperative_drive_cancel_preserves_real_traps_and_hard_bounds() {
         );
         let id = instance
             .failure_evidence
-            .expect("actual boundary failure retains its evidence");
+            .expect("actual boundary failure retains its evidence")
+            .id;
         assert!(
             !instance.store.data().cooperative_driver_cancellation,
             "{case:?}: failed invocation leaked cooperative policy"
@@ -765,4 +766,90 @@ async fn direct_wasm_and_initialization_proofs_cannot_dispatch_identical_calls_t
     assert_eq!(host.drains.load(Ordering::SeqCst), drains);
     state.executions().close().await.unwrap();
     processes.close().await.unwrap();
+}
+
+
+#[tokio::test]
+async fn wasm_recovery_joins_exact_cleanup_and_publishes_only_one_successor() {
+    use super::super::{EpochInstances, Phase};
+    use crate::observation::diagnostics::{DiagnosticCode, EffectKnowledge};
+    use crate::runtime::{execution::ExecutionController, tool::ToolContext};
+
+    #[derive(Default)]
+    struct Receipt {
+        allowed: AtomicBool,
+        releases: AtomicUsize,
+    }
+    #[async_trait::async_trait]
+    impl ExecutionController for Receipt {
+        async fn cancel(&self, _: CancellationToken) -> Result<(), crate::Error> {
+            Ok(())
+        }
+        async fn release(&self, _: CancellationToken) -> Result<(), crate::Error> {
+            self.releases.fetch_add(1, Ordering::SeqCst);
+            if self.allowed.load(Ordering::SeqCst) {
+                Ok(())
+            } else {
+                Err(crate::Error::tool("exact release has not been acknowledged"))
+            }
+        }
+    }
+    let compiled = probe_compiled();
+    let instances = Arc::new(EpochInstances::default());
+    instances.permit_initialized_session();
+    let old = instances.slot(&compiled).unwrap();
+    let cancel = CancellationToken::new();
+    let mut context = ToolContext::detached(crate::SessionState::new(Default::default()), cancel.clone());
+    context.tool = "recovery_fixture".into();
+    context.call_id = "recovery-fixture-call".into();
+    super::super::test_admission::admit(&mut context, Some(compiled.admission_identity.clone()));
+    let receipt = Arc::new(Receipt::default());
+    context.retain_cleanup(receipt.clone()).unwrap();
+    // The embedding Session owns the exact registry across Store replacement.
+    let _owner = context.state.clone();
+    let old_lease = old.tool_lease(&cancel).await.unwrap();
+    let trap = tokio::task::spawn_blocking({
+        let compiled = compiled.clone();
+        let old = old.clone();
+        let runtime = tokio::runtime::Handle::current();
+        let cancel = cancel.clone();
+        move || old.run(old_lease, |cached| {
+            compiled.run(cached, cancel, old.cancellation.clone(), Some(runtime), None, Some(context), None,
+                |_, store, boundary| core_probe(store, "unreachable").call(&mut *store, ())
+                    .map_err(|error| compiled.execution_failure(boundary, error, Phase::Invoke)))
+        })
+    }).await.unwrap().unwrap_err().tool_diagnostic();
+    assert_eq!(trap.code, DiagnosticCode::WasmTrap);
+    assert_eq!(trap.effects, EffectKnowledge::Unknown);
+    assert_eq!(receipt.releases.load(Ordering::SeqCst), 1);
+    assert!(old.cancellation.is_cancelled());
+    assert!(old.try_lease().is_none());
+    let mut worker = old.tool_lease(&cancel).await.unwrap();
+    let blocked = worker.poisoned().unwrap_err().tool_diagnostic();
+    assert_eq!(blocked.code, DiagnosticCode::WasmPoisoned);
+    assert_eq!(blocked.effects, EffectKnowledge::NotStarted);
+    assert_eq!(blocked.evidence_id, trap.evidence_id);
+    assert!(!worker.acknowledge_retirement(&old).await);
+    assert!(Arc::ptr_eq(&old, &instances.slot(&compiled).unwrap()));
+    receipt.allowed.store(true, Ordering::SeqCst);
+    assert!(worker.acknowledge_retirement(&old).await);
+    drop(worker);
+
+    let select = || tokio::spawn({
+        let instances = instances.clone();
+        let compiled = compiled.clone();
+        let old = old.clone();
+        async move { instances.replace(&compiled, &old).unwrap().unwrap() }
+    });
+    let (a, b) = tokio::join!(select(), select());
+    let (a, b) = (a.unwrap(), b.unwrap());
+    assert!(Arc::ptr_eq(&a, &b));
+    assert_eq!(a.generation, old.generation + 1);
+    assert!(a.tool_lease(&cancel).await.unwrap().ready());
+    instances.end();
+    let next_epoch = instances.slot(&compiled).unwrap();
+    assert!(instances.replace(&compiled, &old).unwrap().is_none());
+    assert!(!Arc::ptr_eq(&a, &next_epoch));
+    instances.close();
+    assert!(instances.replace(&compiled, &old).is_err());
 }

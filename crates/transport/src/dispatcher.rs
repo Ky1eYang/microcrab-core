@@ -95,6 +95,14 @@ impl TransportClient {
 
 #[async_trait::async_trait]
 impl Client for TransportClient {
+    fn public_https_image_attempts(&self) -> u8 {
+        if matches!(self, Self::OpenAiCompatible(_) | Self::OpenAiResponses(_)) {
+            2
+        } else {
+            0
+        }
+    }
+
     async fn complete(
         &self,
         content: &Content,
@@ -120,21 +128,34 @@ impl Client for TransportClient {
         cancellation: CancellationToken,
         events: Option<Sender<ModelEvent>>,
     ) -> Result<Response, Error> {
+        self.stream_admitted_outcome(content, auditor, variables, cancellation, events)
+            .await
+            .map(|outcome| outcome.response)
+    }
+
+    async fn stream_admitted_outcome(
+        &self,
+        content: &Content,
+        auditor: &dyn Auditor,
+        variables: &dyn VariableView,
+        cancellation: CancellationToken,
+        events: Option<Sender<ModelEvent>>,
+    ) -> Result<crate::ResponseOutcome, Error> {
         match self {
             Self::OpenAiCompatible(c) => {
-                c.stream(content, auditor, variables, cancellation, events)
+                c.stream_admitted_outcome(content, auditor, variables, cancellation, events)
                     .await
             }
             Self::OpenAiResponses(c) => {
-                c.stream(content, auditor, variables, cancellation, events)
+                c.stream_admitted_outcome(content, auditor, variables, cancellation, events)
                     .await
             }
             Self::Anthropic(c) => {
-                c.stream(content, auditor, variables, cancellation, events)
+                c.stream_admitted_outcome(content, auditor, variables, cancellation, events)
                     .await
             }
             Self::Google(c) => {
-                c.stream(content, auditor, variables, cancellation, events)
+                c.stream_admitted_outcome(content, auditor, variables, cancellation, events)
                     .await
             }
         }

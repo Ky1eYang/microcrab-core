@@ -1,0 +1,20 @@
+package microcrab:host@0.1.1;
+
+/// Companion to the exact legacy web-transport import. Runtime exposes this
+/// only to an admitted Browser tool on the same connection and Host route.
+interface web-transport-scoped {
+  use microcrab:host/web-transport@0.1.0.{connection-id, transport-error};
+
+  variant ws-pull-result { message(string), empty, closed }
+  record ws-budget-result { transport-ms: u32, guest-ms: u32 }
+
+  /// Whole-message FIFO pull. Zero wait asks for a prompt FIFO observation;
+  /// positive wait is a soft bound, not a new Runtime or Host deadline.
+  /// Empty proves that this pull dequeued nothing; it does not prove liveness.
+  ws-pull: func(id: connection-id, max-bytes: u32, soft-wait-ms: u32) -> result<ws-pull-result, transport-error>;
+  /// Remaining monotonic transport and Guest wall budgets; neither is renewed.
+  ws-budget: func(id: connection-id) -> result<ws-budget-result, transport-error>;
+  /// The Guest has settled its protocol obligations and drained available input.
+  /// This acknowledgement belongs only to the current invocation and generation.
+  ws-settle: func(id: connection-id) -> result<_, transport-error>;
+}

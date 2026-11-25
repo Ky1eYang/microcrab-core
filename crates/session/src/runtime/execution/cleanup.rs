@@ -22,6 +22,13 @@ impl ExecutionRegistry {
         let primary = entry.controller.clone();
         let subordinate = entry.subordinate_cleanups.clone();
         if primary.is_none() && subordinate.is_empty() {
+            if !entry.adopted
+                && let Some(buffer) = &mut entry.buffer
+                && buffer.is_private()
+            {
+                buffer.clear_private();
+                entry.released = true;
+            }
             let (_, receiver) = watch::channel(Some(Ok(())));
             return Ok(receiver);
         }
@@ -88,10 +95,22 @@ impl ExecutionRegistry {
                                 .retain(|current| !Arc::ptr_eq(current, owner));
                         }
                     }
+                    if outcome.is_ok()
+                        && !entry.adopted
+                        && let Some(buffer) = &mut entry.buffer
+                        && buffer.is_private()
+                    {
+                        buffer.clear_private();
+                        entry.released = true;
+                    }
                     if let Err(diagnostic) = &outcome {
                         entry.row.status = ExecutionStatus::Interrupted;
                         entry.row.failure = None;
-                        entry.row.diagnostic = Some(diagnostic.clone());
+                        if !entry.row.diagnostic.as_ref().is_some_and(|prior| {
+                            prior.code == crate::observation::diagnostics::DiagnosticCode::WasmTrap
+                        }) {
+                            entry.row.diagnostic = Some(diagnostic.clone());
+                        }
                         if let Some(buffer) = &mut entry.buffer {
                             if let Err(error) = buffer.flush_redaction() {
                                 entry.row.diagnostic = Some(error.tool_diagnostic());
@@ -107,7 +126,7 @@ impl ExecutionRegistry {
         });
         Ok(receiver)
     }
-    async fn cleanup_controller(&self, id: ExecutionId) -> Result<(), Error> {
+    pub(crate) async fn cleanup_controller(&self, id: ExecutionId) -> Result<(), Error> {
         Self::wait_for_cleanup(self.request_cleanup(id)?).await
     }
     async fn wait_for_cleanup(

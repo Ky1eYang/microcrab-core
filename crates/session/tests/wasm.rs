@@ -5,7 +5,7 @@ use microcrab_session::{
     Error,
     runtime::{
         tool::ToolContext,
-        wasm::{WasmAgent, WasmLimits, load_component_with_host},
+        wasm::{WasmAgent, WasmLimits},
     },
 };
 use serde_json::json;
@@ -17,11 +17,7 @@ fn load_component(
     bytes: &[u8],
     limits: WasmLimits,
 ) -> Result<Vec<std::sync::Arc<dyn microcrab_session::runtime::tool::Tool>>, Error> {
-    microcrab_session::runtime::wasm::load_component(
-        bytes,
-        limits,
-        std::sync::Arc::new(RecordingHost::default()),
-    )
+    Ok(WasmAgent::load(bytes, limits, std::sync::Arc::new(RecordingHost::default()))?.tools())
 }
 
 fn context_with_host(
@@ -76,6 +72,22 @@ fn component(invoke: &str, pages: u32) -> Vec<u8> {
         length = catalog.len()
     );
     typed_agent_fixture::component(&text)
+}
+
+#[test]
+fn old_execution_abi_is_rejected_with_migration_reason() {
+    let mut historical = component("", 1);
+    let name = b"microcrab:agent/execution@0.9.0";
+    let offset = historical
+        .windows(name.len())
+        .position(|bytes| bytes == name)
+        .unwrap();
+    historical[offset + name.len() - 3] = b'8';
+    let result = load_component(&historical, WasmLimits::default());
+    let Err(error) = result else {
+        panic!("historical ABI must not execute")
+    };
+    assert!(error.to_string().contains("must be migrated explicitly"));
 }
 
 #[tokio::test]
@@ -269,10 +281,15 @@ async fn cpu_loop_obeys_wall_deadline_and_cancellation() {
     )
     .await
     .unwrap();
-    assert!(
-        matches!(result, Err(Error::Limit(_))),
-        "unexpected tool outcome"
+    let diagnostic = result.unwrap_err().tool_diagnostic();
+    use microcrab_session::observation::diagnostics::{EffectKnowledge, WasmFailure};
+    assert_eq!(
+        diagnostic.wasm_failure,
+        Some(WasmFailure::WallDeadline {
+            wall_timeout_ms: Some(30),
+        })
     );
+    assert_eq!(diagnostic.effects, EffectKnowledge::Unknown);
 
     let limits = WasmLimits {
         fuel: u64::MAX,
@@ -764,9 +781,6 @@ async fn narrow_shell_import_uses_injected_host_and_is_disabled_for_discovery() 
     let output: serde_json::Value = serde_json::from_str(&final_text(text)).unwrap();
     assert_eq!(output["stdout"], "typed-fixture");
     assert_eq!(host.0.load(Ordering::SeqCst), 1);
-    let tools =
-        load_component_with_host(&shell_component(false), WasmLimits::default(), host).unwrap();
-    assert_eq!(tools[0].definition().name, "bash");
 }
 
 #[tokio::test]
@@ -934,9 +948,9 @@ async fn session_permission_denial_never_reaches_wasm_host() {
                 .items
                 .iter()
                 .find_map(|item| match item {
-                    microcrab_session::context::ContentItem::Tool { call_id, content, .. }
-                        if call_id == "denied" =>
-                    {
+                    microcrab_session::context::ContentItem::Tool {
+                        call_id, content, ..
+                    } if call_id == "denied" => {
                         Some(serde_json::from_str::<serde_json::Value>(content).unwrap())
                     }
                     _ => None,

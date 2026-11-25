@@ -76,6 +76,10 @@ impl Journal for RecordingJournal {
     }
 }
 fn bytes(init: &str) -> Vec<u8> {
+    bytes_with_invoke_guard(init, "")
+}
+
+fn bytes_with_invoke_guard(init: &str, guard: &str) -> Vec<u8> {
     let catalog = r#"[{"name":"init-fixture","modes":[{"name":"execute","role":"both"}],"variables":{},"tools":[{"name":"echo","description":"fixture","parameters":{"type":"object"}}]}]"#;
     let escaped: String = catalog
         .bytes()
@@ -100,6 +104,7 @@ fn bytes(init: &str) -> Vec<u8> {
           i32.const 8 i32.const {length} i32.store i32.const 0)
         (func (export "invoke") (param i32 i32 i32 i32 i32 i32) (result i32)
           global.get $counter i32.const 1 i32.add global.set $counter
+          {guard}
           i32.const 3072 global.get $counter i32.const 48 i32.add i32.store8
           i32.const 16 i32.const 0 i32.store
           i32.const 20 i32.const 3072 i32.store
@@ -281,6 +286,31 @@ fn invoking_model() -> Arc<Model> {
         ..Model::default()
     })
 }
+#[tokio::test]
+async fn wasm_recovery_never_reenters_the_admitted_init_export() {
+    let component = bytes_with_invoke_guard(
+        &counting_init(),
+        "global.get $counter i32.const 3 i32.eq if unreachable end",
+    );
+    let model = invoking_model();
+    let session = builder(&component, model.clone(), Arc::new(RecordingJournal::default()))
+        .build()
+        .unwrap();
+    session.submit("initialized Store returns two").await.unwrap();
+    let epoch = session.state().epoch_id;
+    session.submit("trap on the third increment").await.unwrap();
+    session.submit("replacement Store starts from zero without reentering init").await.unwrap();
+    let outputs = model.outputs.lock().unwrap().clone();
+    assert_eq!(outputs[0], "2");
+    let trap: serde_json::Value = serde_json::from_str(&outputs[1]).unwrap();
+    assert_eq!(trap["diagnostic"]["code"], "wasm_trap");
+    assert_eq!(outputs[2], "1");
+    assert_eq!(session.state().epoch_id, epoch);
+    assert_eq!(session.state().agent_init[0].attempt, 1);
+    assert_eq!(session.execution_snapshots().iter().filter(|row| matches!(row.subject, InvocationSubject::AgentInit { .. })).count(), 1);
+    session.close().await.unwrap();
+}
+
 #[tokio::test]
 async fn init_runs_once_for_session_not_epoch_recovery_or_restore_but_fork_is_new() {
     let component = bytes(&counting_init());

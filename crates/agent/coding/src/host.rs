@@ -155,36 +155,15 @@ impl FileMutation {
     }
 }
 
-/// Binary media is copied through the typed execution ABI, never JSON tool text.
-#[derive(Clone, PartialEq, Eq)]
-pub struct MediaAttachment {
-    pub media_type: String,
-    pub data: Vec<u8>,
-}
-impl std::fmt::Debug for MediaAttachment {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("MediaAttachment")
-            .field("media_type", &self.media_type)
-            .field("byte_len", &self.data.len())
-            .finish()
-    }
-}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InvocationOutput {
     pub content: String,
-    pub attachments: Vec<MediaAttachment>,
 }
 
 /// Adapters preserve structured failures. Runtime authorizes the complete tool call.
 /// Conditional operations serialize cooperating Host writers; unrelated external writers
 /// are not covered by an OS-level compare-and-swap guarantee.
 pub trait Host {
-    fn read_image(&mut self, _path: &str) -> Result<MediaAttachment, OperationError> {
-        Err(OperationError {
-            code: OperationErrorCode::Unsupported,
-            message: "Host image reads are unavailable".into(),
-        })
-    }
     /// Validate and normalize every operation before any mutation; reserve Runtime
     /// output, operation-call and selected evidence budgets for the complete call.
     fn preflight_mutations(

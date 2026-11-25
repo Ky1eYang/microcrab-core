@@ -49,7 +49,16 @@ impl Decoder {
                 })?
                 .to_owned();
             consumed += end + width;
-            self.line(&line, &mut events)?;
+            if let Err(error) = self.line(&line, &mut events) {
+                // A typed rejection in the same network chunk as earlier deltas
+                // must never masquerade as a rejection before any model output.
+                if error.is_remote_image_fetch_rejection() && !events.is_empty() {
+                    return Err(Error::protocol(
+                        "provider rejected a remote image after emitting model output",
+                    ));
+                }
+                return Err(error);
+            }
         }
         self.pending.drain(..consumed);
         if eof {
@@ -121,7 +130,8 @@ impl Decoder {
 
     fn chunk(&mut self, value: Value, events: &mut Vec<ModelEvent>) -> Result<(), Error> {
         if value.get("error").is_some_and(|error| !error.is_null()) {
-            return Err(crate::failure::provider_failure(&value));
+            return Err(crate::media::in_band_fetch_rejection(&value)
+                .unwrap_or_else(|| crate::failure::provider_failure(&value)));
         }
         if let Some(usage) = value.get("usage").filter(|v| !v.is_null()) {
             // Snapshots are cumulative, not separate attempts. Validate each
@@ -355,6 +365,21 @@ fn optional_text(value: Option<&Value>) -> Result<Option<String>, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_typed_image_rejection_cannot_hide_an_earlier_delta_in_the_same_chunk() {
+        let mut decoder = Decoder::default();
+        let error = decoder.push(b"data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\ndata: {\"error\":{\"code\":\"failed_to_download_image\"}}\n\n", false).unwrap_err();
+        assert!(!error.is_remote_image_fetch_rejection());
+        let mut decoder = Decoder::default();
+        let error = decoder
+            .push(
+                b"data: {\"error\":{\"code\":\"failed_to_download_image\"}}\n\n",
+                false,
+            )
+            .unwrap_err();
+        assert!(error.is_remote_image_fetch_rejection());
+    }
 
     #[test]
     fn out_of_order_tool_fragments_use_canonical_call_slots_without_reordering_text_or_reasoning() {

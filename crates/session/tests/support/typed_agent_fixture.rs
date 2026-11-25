@@ -166,6 +166,10 @@ pub fn component(text: &str) -> Vec<u8> {
 /// The supplied core body must return a canonical init-result pointer. It may
 /// call $invoke (the original fixture entry) to exercise imported operations.
 pub fn component_with_init(text: &str, init_body: &str) -> Vec<u8> {
+    wat::parse_str(component_text_with_init(text, init_body)).expect("valid typed 0.9 fixture component")
+}
+
+pub fn component_text_with_init(text: &str, init_body: &str) -> String {
     let start = text
         .find("(func (export \"invoke\") (param \"host-info\"")
         .expect("fixture exports invoke");
@@ -183,7 +187,7 @@ pub fn component_with_init(text: &str, init_body: &str) -> Vec<u8> {
         invoke.find("(realloc (core func ").expect("invoke realloc") + "(realloc (core func ".len();
     let realloc_instance = invoke[realloc_start..].split_whitespace().next().unwrap();
     let types = r#"
-      (import "microcrab:agent/execution@0.8.0" (instance $fixture_execution
+      (import "microcrab:agent/execution@0.9.0" (instance $fixture_execution
         (export "buffer" (type $buffer (sub resource)))
         (type $kind_raw (enum "failed" "timeout" "cancelled"))
         (export "failure-kind" (type $kind (eq $kind_raw)))
@@ -280,6 +284,5 @@ pub fn component_with_init(text: &str, init_body: &str) -> Vec<u8> {
     typed.push_str(&text[..start]);
     typed.push_str(&adapter);
     typed.push_str(&invoke);
-    typed = typed.replacen("(component", &format!("(component{types}"), 1);
-    wat::parse_str(typed).expect("valid typed 0.8 fixture component")
+    typed.replacen("(component", &format!("(component{types}"), 1)
 }

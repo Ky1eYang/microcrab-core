@@ -7,8 +7,15 @@ pub use interaction::{
     AskAttribution, FutureGrantAdoption, FutureGrantPersistence, FutureGrantProposal,
     PermissionInteraction,
 };
+mod list;
 mod profiles;
 mod projection;
+pub(crate) use list::ListBudget;
+pub use list::{
+    CurrentPermissionList, CurrentToolPermission, InitializationPolicy, PermissionInitialization,
+    PermissionInventory, PermissionInventoryMode, PermissionInventoryRule, PermissionInventoryTool,
+    PermissionList, PermissionListError, PermissionListView, PermissionOwner,
+};
 #[cfg(test)]
 mod tests;
 use async_trait::async_trait;
@@ -37,6 +44,13 @@ pub enum PermissionError {
         revision: u64,
         reason: String,
     },
+    #[error("permission denied by controller {controller} revision {revision}: {}", reason.as_str())]
+    SettledDenied {
+        controller: u64,
+        revision: u64,
+        source_kind: crate::observation::diagnostics::PermissionDecisionSource,
+        reason: crate::observation::diagnostics::SafeDiagnosticReason,
+    },
     #[error("admitted invocation has already entered tool execution")]
     AlreadyDispatched,
     #[error("invocation admission proof mismatch: {0}")]
@@ -53,6 +67,18 @@ impl PermissionError {
             DiagnosticCode, DiagnosticLayer, DiagnosticPhase, SafeDiagnosticReason, ToolDiagnostic,
         };
         match self {
+            Self::SettledDenied { source_kind, reason, .. } => {
+                use crate::observation::diagnostics::EffectKnowledge;
+                let mut diagnostic = ToolDiagnostic::new(
+                    DiagnosticCode::PermissionDenied,
+                    DiagnosticLayer::Runtime,
+                    DiagnosticPhase::Authorization,
+                );
+                diagnostic.reason = Some(reason);
+                diagnostic.decision_source = Some(source_kind);
+                diagnostic.effects = EffectKnowledge::NotStarted;
+                crate::Error::Diagnostic(diagnostic)
+            }
             Self::Denied
             | Self::PolicyDenied { .. }
             | Self::AlreadyDispatched
@@ -82,7 +108,7 @@ impl PermissionError {
             Self::AlreadyDispatched => "admitted invocation has already entered tool execution",
             Self::StalePolicy => "permission policy changed",
             Self::ProofMismatch(reason) => reason,
-            Self::Denied | Self::PolicyDenied { .. } => "permission denied by Session policy",
+            Self::Denied | Self::PolicyDenied { .. } | Self::SettledDenied { .. } => "permission denied by Session policy",
         }
     }
 }
@@ -109,6 +135,9 @@ pub trait SessionPermission: Send + Sync {
     fn features(&self) -> PermissionFeatures {
         PermissionFeatures::default()
     }
+    /// Present this invocation to the approving owner. For protected operations
+    /// arguments are a safe preview, not the internal value used for matching
+    /// rules, issuing admission proof, or validating future-grant proposals.
     async fn open_interaction(
         &self,
         _: &PermissionRequest,
@@ -156,6 +185,7 @@ pub struct PermissionController {
     lifetime: RwLock<CancellationToken>,
 }
 impl PermissionController {
+    #[cfg(test)]
     pub(crate) fn compiled_inventory(
         &self,
         snapshot: &PolicySnapshot,
@@ -163,6 +193,7 @@ impl PermissionController {
     ) -> Result<serde_json::Value, PermissionError> {
         projection::project_tools(self, snapshot, tools)
     }
+    #[cfg(test)]
     pub(crate) fn observe(
         self: &Arc<Self>,
         tools: Vec<(String, crate::runtime::tool::ToolOrigin)>,
@@ -544,6 +575,7 @@ impl PermissionController {
         &self,
         snapshot: &PolicySnapshot,
         request: &PermissionRequest,
+        preview: Option<&crate::runtime::tool::view_image::ApprovalPreview>,
         state: &crate::State,
         issuer: &crate::context::Content,
         cancellation: &CancellationToken,
@@ -552,6 +584,7 @@ impl PermissionController {
             Action,
             Option<FutureGrant>,
             Option<Arc<dyn PermissionInteraction>>,
+            Option<interaction::Denial>,
         ),
         PermissionError,
     > {
@@ -566,7 +599,7 @@ impl PermissionController {
                 .clone()
         };
         if !self.adapter.features().interactive_ask {
-            return Ok((Action::Deny, None, None));
+            return Ok((Action::Deny, None, None, Some(interaction::Denial::unavailable())));
         }
         let attribution = AskAttribution {
             controller_id: self.identity,
@@ -576,11 +609,20 @@ impl PermissionController {
         };
         // Opening the lease-backed interaction precedes review. No executor can
         // therefore be bypassed by even a valid automatic reviewer Allow.
-        let interaction = match self.adapter.open_interaction(request, &attribution).await? {
+        let owner_request = preview.map(|preview| PermissionRequest {
+            arguments: preview.owner.clone(),
+            ..request.clone()
+        });
+        let owner_request = owner_request.as_ref().unwrap_or(request);
+        let interaction = match self
+            .adapter
+            .open_interaction(owner_request, &attribution)
+            .await?
+        {
             Some(port) => port,
             None => Arc::new(interaction::CallbackInteraction {
                 adapter: self.adapter.clone(),
-                request: request.clone(),
+                request: owner_request.clone(),
                 deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(120),
             }),
         };
@@ -606,6 +648,7 @@ impl PermissionController {
                     state,
                     issuer,
                     request,
+                    preview.map(|preview| &preview.reviewer),
                     &review_cancellation,
                 )
                 .await
@@ -628,13 +671,22 @@ impl PermissionController {
                     review_cancellation.cancel();
                     if !review_done && review_enabled { let _ = (&mut review).await; }
                     let answer = answer?;
-                    if answer.action == Action::Ask || answer.reason.len() > 512 { return Ok((Action::Deny, None, None)); }
-                    return Ok((answer.action, None, Some(interaction.clone())));
+                    if answer.action == Action::Ask || answer.reason.len() > 512 {
+                        return Ok((Action::Deny, None, None, Some(interaction::Denial::invalid_reply())));
+                    }
+                    let denial = (answer.action != Action::Allow).then(|| interaction::Denial::from_reply(&answer, None, state));
+                    return Ok((answer.action, None, Some(interaction.clone()), denial));
                 },
                 result = &mut review, if !review_done => {
                     review_done = true;
                     let received_at=tokio::time::Instant::now();
-                    if let Ok(result) = result && result.action != Action::Ask && received_at < initial_deadline {
+                    if let Ok(result) = result
+                        && result.action != Action::Ask
+                        // A redacted source preview cannot support an informed
+                        // automatic Allow. An explicit policy or owner can still allow.
+                        && (preview.is_none() || result.action != Action::Allow)
+                        && received_at < initial_deadline
+                    {
                         validate_review_result(&result, request).map_err(|e| PermissionError::InvalidConfiguration(e.to_string()))?;
                         // Exactly one full window, even across the original expiry.
                         deadline = interaction.review(&result, received_at).await?;
@@ -651,7 +703,8 @@ impl PermissionController {
                     // A transport accepted user answer at the timer boundary wins;
                     // retaining a losing review proposal would manufacture authority.
                     let selected_review = answer.reason == "review_auto";
-                    return Ok((answer.action, if selected_review && answer.action == Action::Allow { grant } else { None }, Some(interaction.clone())));
+                    let denial = (answer.action != Action::Allow).then(|| interaction::Denial::from_reply(&answer, Some(&decision), state));
+                    return Ok((answer.action, if selected_review && answer.action == Action::Allow { grant } else { None }, Some(interaction.clone()), denial));
                 }
             }
         }

@@ -1,0 +1,19 @@
+package microcrab:session@0.2.0;
+
+/// Negotiated Coding adapter. Underlying Host versions and mutation CAS stay exact.
+interface file-versions {
+  use microcrab:host/tool-types@0.1.0.{operation-error};
+  use microcrab:host/text-read@0.1.0.{read-request, read-output};
+  use microcrab:host/text-write@0.1.0.{write-request, write-output};
+  use microcrab:host/file-mutation@0.1.0.{file-mutation, mutation-output};
+
+  record versioned-read {
+    page: read-output,
+    reference: string,
+  }
+  read: func(request: read-request) -> result<versioned-read, operation-error>;
+  /// Exact internal CAS in, scoped reference on success. Does not replay effects.
+  write: func(request: write-request) -> result<write-output, operation-error>;
+  preflight: func(requests: list<file-mutation>) -> result<list<file-mutation>, operation-error>;
+  mutate: func(request: file-mutation) -> result<mutation-output, operation-error>;
+}

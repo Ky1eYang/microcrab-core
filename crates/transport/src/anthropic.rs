@@ -6,7 +6,7 @@ use crate::sse::SseFrameReader;
 use crate::{Client, Content, ModelEvent, render_ast};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use futures_util::StreamExt;
-use microcrab_auditor::{Auditor, HookContext, HookPayload, Moment, VariableView};
+use microcrab_auditor::{Auditor, VariableView};
 use microcrab_protocol::{ImageSource, InputPart, Message, Request, Response, ToolCall, Usage};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -411,7 +411,9 @@ impl Anthropic {
                 }
             }
             audit.stream_complete();
-            sse_decoder.finish(request)?
+            let response = sse_decoder.finish(request)?;
+            audit.normalized();
+            response
         } else if is_json {
             let value: Value = serde_json::from_slice(&audit.received).map_err(Error::decode)?;
             // Only explicit plaintext is display evidence. Never expose signatures,
@@ -429,6 +431,7 @@ impl Anthropic {
                 })
                 .collect::<Vec<_>>();
             let response = decode_json_response(value, request)?;
+            audit.normalized();
             for text in reasoning {
                 emit(&events, observation, ModelEvent::ReasoningDelta { text }).await?;
             }
@@ -497,6 +500,19 @@ impl Client for Anthropic {
         cancellation: CancellationToken,
         events: Option<tokio::sync::mpsc::Sender<ModelEvent>>,
     ) -> Result<Response, Error> {
+        self.stream_admitted_outcome(content, auditor, variables, cancellation, events)
+            .await
+            .map(|outcome| outcome.response)
+    }
+
+    async fn stream_admitted_outcome(
+        &self,
+        content: &Content,
+        auditor: &dyn Auditor,
+        variables: &dyn VariableView,
+        cancellation: CancellationToken,
+        events: Option<tokio::sync::mpsc::Sender<ModelEvent>>,
+    ) -> Result<crate::ResponseOutcome, Error> {
         let ast = render_ast(content)?;
         let request = serde_json::to_string(&self.adapt(&ast)?)?;
         if request.len() > content.max_bytes {
@@ -504,32 +520,15 @@ impl Client for Anthropic {
         }
         let call_id = uuid::Uuid::new_v4().to_string();
 
-        let injection = tokio::select! {
-            biased;
-            _ = cancellation.cancelled() => return Err(Error::Cancelled),
-            result = auditor.intervene(
-                Moment::RequestPrepared,
-                HookContext {
-                    epoch: content.epoch,
-                    subagent: content.subagent.clone(),
-                    turn: content.turn_id,
-                    round: content.round,
-                    call_id: Some(call_id.clone()),
-                    request_body: Some(&request),
-                    max_request_bytes: Some(content.max_bytes),
-                    variables,
-                    payload: HookPayload::None,
-                },
-            ) => result?,
-        };
-
-        let request = match injection.request_body {
-            Some(replacement) => {
-                crate::validate_request_rewrite(&request, &replacement, content.max_bytes)?;
-                replacement
-            }
-            None => request,
-        };
+        let request = crate::call::intervene_request(
+            auditor,
+            content,
+            variables,
+            &cancellation,
+            &call_id,
+            request,
+        )
+        .await?;
 
         if cancellation.is_cancelled() {
             return Err(Error::Cancelled);
@@ -555,7 +554,7 @@ impl Client for Anthropic {
             },
         };
         let result = result.map_err(|error| audit.measured_error(error));
-        audit.finish(&result);
+        let attempt = audit.finish(&result);
         let finishing = observation.finish(&result);
         tokio::select! {
             biased;
@@ -563,7 +562,7 @@ impl Client for Anthropic {
             _ = cancellation.cancelled() => {},
         }
 
-        result
+        result.map(|response| crate::ResponseOutcome { response, attempt })
     }
 }
 

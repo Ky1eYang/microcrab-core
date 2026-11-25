@@ -81,7 +81,7 @@ fn timed(user_after: u64, user_action: Action, publication_delay: u64) -> Arc<Ti
         settled: AtomicBool::new(false),
     })
 }
-async fn resolve(adapter: Arc<dyn SessionPermission>, action: Action) -> (Action, Duration) {
+async fn resolve(adapter: Arc<dyn SessionPermission>, action: Action) -> (Action, Duration, Option<interaction::Denial>) {
     let owner = PermissionController::new(adapter);
     let probe = review_probe(action);
     owner.bind(probe, Arc::new(crate::NoopAuditor)).unwrap();
@@ -97,40 +97,115 @@ async fn resolve(adapter: Arc<dyn SessionPermission>, action: Action) -> (Action
         .resolve_ask(
             &policy,
             &request,
+            None,
             &state,
             &issuer(),
             &CancellationToken::new(),
         )
         .await
         .unwrap();
-    (result.0, start.elapsed())
+    (result.0, start.elapsed(), result.3)
 }
 #[tokio::test(start_paused = true)]
 async fn explicit_user_deny_during_grace_overrides_review_allow() {
     let port = timed(2, Action::Deny, 0);
-    let (action, elapsed) =
+    let (action, elapsed, denial) =
         resolve(Arc::new(TimedAdapter(Some(port.clone()))), Action::Allow).await;
     assert_eq!(action, Action::Deny);
+    let denial = denial.unwrap();
+    assert_eq!(denial.source, crate::observation::diagnostics::PermissionDecisionSource::User);
+    assert!(!denial.reason.as_str().contains("review fixture"));
     assert_eq!(elapsed, Duration::from_secs(2));
     assert!(!port.settled.load(Ordering::SeqCst));
 }
 #[tokio::test(start_paused = true)]
 async fn delayed_review_publication_still_gets_full_five_seconds() {
     let port = timed(100, Action::Deny, 3);
-    let (action, elapsed) =
+    let (action, elapsed, denial) =
         resolve(Arc::new(TimedAdapter(Some(port.clone()))), Action::Allow).await;
     assert_eq!(action, Action::Allow);
+    assert!(denial.is_none());
     assert!(elapsed >= Duration::from_secs(8));
     assert_eq!(port.review_calls.load(Ordering::SeqCst), 1);
 }
 #[tokio::test(start_paused = true)]
+async fn settled_review_denial_reaches_model_diagnostic() {
+    use crate::observation::diagnostics::{EffectKnowledge, PermissionDecisionSource};
+    let port = timed(200, Action::Allow, 0);
+    let owner = Arc::new(PermissionController::new(Arc::new(TimedAdapter(Some(port)))));
+    owner.bind(review_probe(Action::Deny), Arc::new(crate::NoopAuditor)).unwrap();
+    owner.bind_one_shot_executor(crate::Session::one_shot_executor()).unwrap();
+    let before = owner.snapshot().unwrap();
+    let mut config = before.config;
+    config.review = true;
+    config.overrides.push(Permission { agent: None, mode: None, tool: Some(Matcher::Exact("job".into())), args: vec![], action: Action::Ask });
+    owner.replace(before.revision, config).unwrap();
+    let context = invocation();
+    let error = owner.admit(&request(&owner, &context, json!({})), &context, &issuer(), None).await.err().unwrap();
+    let result = error.into_runtime_error().tool_diagnostic();
+    assert_eq!(result.decision_source, Some(PermissionDecisionSource::ActionReview));
+    assert_eq!(result.effects, EffectKnowledge::NotStarted);
+    assert_eq!(result.reason.unwrap().as_str(), "Action Review denied the operation: review fixture");
+}
+
+#[tokio::test(start_paused = true)]
+async fn redacted_image_review_cannot_auto_allow() {
+    let port = timed(200, Action::Allow, 0);
+    let owner = PermissionController::new(Arc::new(TimedAdapter(Some(port.clone()))));
+    let probe = review_probe(Action::Allow);
+    owner
+        .bind(probe.clone(), Arc::new(crate::NoopAuditor))
+        .unwrap();
+    owner
+        .bind_one_shot_executor(crate::Session::one_shot_executor())
+        .unwrap();
+    let snapshot = owner.snapshot().unwrap();
+    let context = invocation();
+    let mut request = request(
+        &owner,
+        &context,
+        json!({"image_url":"file:private-witness"}),
+    );
+    request.tool = "view_image".into();
+    let preview = crate::runtime::tool::view_image::ApprovalPreview {
+        owner: json!({"image_url":"file:///workspace/exact.png"}),
+        reviewer: json!({"image_url":"[local file URI redacted]"}),
+    };
+    let result = owner
+        .resolve_ask(
+            &snapshot,
+            &request,
+            Some(&preview),
+            &context.state,
+            &issuer(),
+            &context.cancellation,
+        )
+        .await
+        .unwrap();
+    assert_eq!(probe.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(result.0, Action::Deny);
+    assert_eq!(port.review_calls.load(Ordering::SeqCst), 0);
+    assert!(port.settled.load(Ordering::SeqCst));
+}
+
+#[tokio::test(start_paused = true)]
 async fn review_ask_keeps_waiting_for_user_without_automatic_allow() {
     let port = timed(9, Action::Deny, 0);
-    let (action, elapsed) = resolve(Arc::new(TimedAdapter(Some(port.clone()))), Action::Ask).await;
+    let (action, elapsed, denial) = resolve(Arc::new(TimedAdapter(Some(port.clone()))), Action::Ask).await;
+    assert_eq!(denial.unwrap().source, crate::observation::diagnostics::PermissionDecisionSource::User);
     assert_eq!(action, Action::Deny);
     assert_eq!(elapsed, Duration::from_secs(9));
     assert_eq!(port.review_calls.load(Ordering::SeqCst), 0);
 }
+#[tokio::test(start_paused = true)]
+async fn no_final_reply_identifies_timeout() {
+    let port = timed(200, Action::Deny, 0);
+    let (action, elapsed, denial) = resolve(Arc::new(TimedAdapter(Some(port))), Action::Ask).await;
+    assert_eq!(action, Action::Deny);
+    assert_eq!(elapsed, Duration::from_secs(120));
+    assert_eq!(denial.unwrap().source, crate::observation::diagnostics::PermissionDecisionSource::Timeout);
+}
+
 #[tokio::test]
 async fn missing_executor_prevents_even_valid_reviewer_from_starting() {
     let owner = PermissionController::new(Arc::new(TimedAdapter(None)));
@@ -145,6 +220,7 @@ async fn missing_executor_prevents_even_valid_reviewer_from_starting() {
             .resolve_ask(
                 &p,
                 &request(&owner, &context, json!({})),
+                None,
                 &context.state,
                 &issuer(),
                 &context.cancellation

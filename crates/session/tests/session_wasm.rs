@@ -5,6 +5,9 @@
 #[cfg(feature = "wasm")]
 #[path = "support/typed_agent_fixture.rs"]
 mod typed_agent_fixture;
+#[cfg(feature = "wasm")]
+#[path = "support/guest_observation_fixture.rs"]
+mod guest_observation_fixture;
 
 #[path = "wasm_hostless.rs"]
 mod wasm_hostless;
@@ -29,3 +32,5 @@ mod wasm_communication;
 mod wasm_epoch;
 #[path = "wasm_resources.rs"]
 mod wasm_resources;
+#[path = "wasm_web_transport.rs"]
+mod wasm_web_transport;

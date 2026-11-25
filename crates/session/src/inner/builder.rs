@@ -15,11 +15,21 @@ impl SessionInner {
             }
             None => parts.prompt_config.render_system(parts.agent.as_ref())?,
         };
+        let identity = parts.communication.as_ref().map(|value| &value.identity);
+        let interactive_root = parts.kind == crate::SessionKind::Interactive
+            && parts.is_main
+            && identity.is_none_or(|identity| identity.depth == 0);
         if parts.kind != crate::SessionKind::OneShot {
-            parts.runtime.configure_conversation_tools(
-                parts.communication.as_ref().map(|value| &value.identity),
-                parts.dialogue_reply_store.is_some(),
-            )?;
+            parts
+                .runtime
+                .configure_conversation_tools(identity, interactive_root)?;
+        }
+        if let Some(owner) = &parts.model_admission {
+            // Validate the canonical definition/defaults even while unpublished.
+            parts
+                .runtime
+                .prepare_model_catalog(owner.as_ref(), Some(owner.dialogue_reply()), None)?
+                .provider_defaults()?;
         }
         let context = Context::new(
             system,
@@ -67,6 +77,20 @@ impl SessionInner {
             snapshot.agent_initialization_pending = !parts.runtime.wasm_lifecycles().is_empty();
         });
         state.install_processes(process_control);
+        #[cfg(feature = "wasm")]
+        if let Some(host) = parts.host.clone() {
+            state.install_file_versions(Arc::new(crate::runtime::wasm::FileVersionOwner::new(
+                parts.journal.clone(),
+                host,
+                parts.session_id.clone(),
+            )));
+        }
+        state.set_short_model_refs(crate::runtime::tool::short_model_refs(
+            context.frozen_tools(),
+        ));
+        if interactive_root {
+            state.install_image_host(parts.host.clone());
+        }
         state.install_catalog(parts.catalog.clone(), parts.is_main);
         state.install_agent_metadata(parts.agent.clone());
         state.update(|snapshot| {
@@ -91,21 +115,8 @@ impl SessionInner {
         controller
             .bind_session_id(&parts.session_id)
             .map_err(|e| Error::config_with_private(e.public_reason(), e.to_string()))?;
-        state.install_permission(
-            controller.observe(
-                parts
-                    .runtime
-                    .definitions()
-                    .into_iter()
-                    .filter_map(|tool| {
-                        parts
-                            .runtime
-                            .origin(&tool.name)
-                            .map(|origin| (tool.name, origin))
-                    })
-                    .collect(),
-            ),
-        );
+        state.install_permission(parts.runtime.permission_observation());
+        state.set_model_permission_names(context.frozen_tools());
         controller
             .bind(parts.client.clone(), auditor.clone())
             .map_err(|e| Error::config_with_private(e.public_reason(), e.to_string()))?;
@@ -196,6 +207,9 @@ impl SessionInner {
             let control: std::sync::Weak<dyn crate::runtime::tool::switch_mode::SessionControl> =
                 weak.clone();
             parts.runtime.bind_controls(control);
+            let reply_owner: std::sync::Weak<dyn crate::runtime::tool::DialogueReplyOwner> =
+                weak.clone();
+            parts.runtime.bind_dialogue_reply_owner(reply_owner);
             let parent: std::sync::Weak<dyn crate::runtime::tool::delegate::DelegateParent> =
                 weak.clone();
             parts.runtime.bind_delegate_parent(parent);
@@ -229,6 +243,7 @@ impl SessionInner {
                 parent_relationship: Mutex::new(None),
                 applied_tools: std::sync::atomic::AtomicU64::new(0),
                 route: parts.route,
+                model_admission: parts.model_admission,
                 client: parts.client,
                 auto_compaction: Mutex::new(parts.auto_compaction),
                 auto_compaction_interrupted: AtomicBool::new(false),

@@ -11,13 +11,18 @@ pub mod google;
 pub mod http;
 mod idle;
 pub mod media;
-pub use media::{ImageUrlResolver, MediaProjection};
+pub use media::{
+    HostedImageHint, ImageHintRevocation, ImageHostingConfig, ImageHostingGrant, ImageHostingScope,
+    ImageUpload, ImageUploadError, ImageUrlResolver, MediaProjection, ProjectedMedia,
+    ToolImagePosition,
+};
 pub mod model_metadata;
 mod native_usage;
 mod observation;
 pub mod openai_compatible;
 pub mod openai_response;
 pub mod protocol;
+pub mod public_https;
 mod render;
 mod replay;
 mod state_delta;
@@ -26,7 +31,7 @@ mod rewrite;
 pub(crate) mod sse;
 
 pub use anthropic::{Anthropic, AnthropicConfig};
-pub use client::{Client, ModelEvent};
+pub use client::{Client, ModelAttempt, ModelEvent, ResponseCompletedAt, ResponseOutcome};
 pub use config::{AuthMode, TransportConfig};
 pub use content::{
     AgentExchange, CarrierEnvelopeVersion, Content, ContentItem, ExchangeIntent, ImportantInput,
@@ -48,7 +53,7 @@ pub use observation::{ModelObservation, ModelObserver, ModelRecording, Observati
 pub use openai_compatible::{
     OpenAiCompatible, OpenAiCompatibleConfig, OpenAiCompatibleRequestOptions,
 };
-pub use openai_response::{OpenAiResponse, OpenAiResponseConfig};
+pub use openai_response::{OpenAiResponse, OpenAiResponseConfig, OpenAiResponseRequestOptions};
 pub use protocol::Protocol;
 pub use render::render_ast;
 pub use rewrite::{MAX_REQUEST_REWRITE_BYTES, validate_request_rewrite};

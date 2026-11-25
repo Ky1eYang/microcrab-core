@@ -14,8 +14,8 @@ enum Shape {
     SharedMessages,
 }
 
-/// Replacements preserve the authored protocol, frozen prompt/tool values, stream
-/// mode and output ceiling. Selection uses authored structure, never model names
+/// Replacements preserve the authored protocol, frozen prompt/tool values, native
+/// tool calls, stream mode and output ceiling. Selection uses authored structure, never model names
 /// or replacement-controlled fields; endpoint and authentication stay call-owned.
 pub fn validate_request_rewrite(
     authored: &str,
@@ -45,6 +45,11 @@ pub fn validate_request_rewrite(
     {
         return Err(Error::protocol(
             "request rewrite changed frozen system, instructions or tools",
+        ));
+    }
+    if tool_call_groups(&original, shape) != tool_call_groups(&rewritten, shape) {
+        return Err(Error::protocol(
+            "request rewrite changed authored tool calls",
         ));
     }
     if original.get("stream") != rewritten.get("stream") {
@@ -154,6 +159,43 @@ fn frozen_messages(body: &Value) -> Vec<&Value> {
                 message.get("role").and_then(Value::as_str),
                 Some("system" | "developer")
             )
+        })
+        .collect()
+}
+
+// Keep native call values, order and batching without freezing unrelated text.
+// OpenAI's argument strings are opaque here: parsing them would lose exact bytes.
+fn tool_call_groups(body: &Value, shape: Shape) -> Vec<Vec<&Value>> {
+    let input = match shape {
+        Shape::Responses => "input",
+        _ => "messages",
+    };
+    body[input]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|item| {
+            let calls = match shape {
+                Shape::Chat | Shape::SharedMessages => {
+                    if item.get("tool_calls").is_none() && item.get("function_call").is_none() {
+                        return None;
+                    }
+                    vec![&item["role"], &item["tool_calls"], &item["function_call"]]
+                }
+                Shape::Responses => {
+                    if item["type"] != "function_call" {
+                        return None;
+                    }
+                    vec![item]
+                }
+                Shape::Anthropic => item["content"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter(|block| block["type"] == "tool_use")
+                    .collect(),
+            };
+            (!calls.is_empty()).then_some(calls)
         })
         .collect()
 }

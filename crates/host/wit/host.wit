@@ -121,6 +121,22 @@ interface glob {
   record glob-output { entries: list<glob-entry>, truncated: bool }
   glob: func(request: glob-request) -> result<glob-output, operation-error>;
 }
+/// State-owned Coding search; legacy glob and grep keep their existing contracts.
+interface glob-ignore {
+  use tool-types.{operation-error};
+  use glob.{glob-request, glob-output, glob-entry};
+  /// Bounded JSON array of workspace-relative ignore rule files; limit means incomplete.
+  snapshot: func() -> result<string, operation-error>;
+  /// The Runtime resolves the current glob_ignored State value; the guest cannot supply it as an argument.
+  glob-from-state: func(request: glob-request) -> result<glob-output, operation-error>;
+  enum glob-scan-reason { entries, depth }
+  record glob-scan-incomplete { reason: glob-scan-reason, limit: u32, observed: u32 }
+  record resolved-glob-output { entries: list<glob-entry>, truncated: bool, scan-incomplete: option<glob-scan-incomplete> }
+  /// Initialization only. Returns concrete workspace-relative paths; a trailing slash denotes a directory subtree.
+  glob-ignored-paths: func() -> result<list<string>, operation-error>;
+  /// The explicit path list is the only ignore filter. The legacy include-ignored field must be false.
+  glob-with-ignored-paths: func(request: glob-request, ignored-paths: list<string>) -> result<resolved-glob-output, operation-error>;
+}
 interface grep {
   use tool-types.{operation-error};
   record grep-request { root: string, pattern: string, include-glob: option<string>, case-sensitive: bool, literal: bool, max-matches: u64, max-bytes: u64 }
@@ -141,6 +157,27 @@ interface shell {
   drain: func(h: process-handle, max-bytes: u64) -> result<shell-output, host-error>;
   /// Write bytes and optionally close stdin after the write completes.
   write: func(h: process-handle, data: list<u8>, eof: bool) -> result<_, host-error>;
+}
+
+/// Opt-in native transport. Linking this interface does not authorize network
+/// operations. Runtime exposes it only inside the admitted tool invocation and
+/// independently binds endpoint and handles to the Session's exact Host route.
+interface web-transport {
+  type connection-id = string;
+  enum transport-error {
+    unsupported, denied, invalid-request, limit, cancelled, timeout, stale, closed, outcome-unknown, io,
+  }
+  record http-response { status: u16, body: string }
+  variant ws-receive-result { message(string), timeout, closed }
+  /// One credential-free GET; never follows redirects or truncates the body.
+  http-get: func(url: string, max-bytes: u32) -> result<http-response, transport-error>;
+  ws-open: func(url: string) -> result<connection-id, transport-error>;
+  /// Locally known status; success does not imply a peer liveness probe.
+  ws-status: func(id: connection-id) -> result<_, transport-error>;
+  ws-send: func(id: connection-id, text: string) -> result<_, transport-error>;
+  /// One whole message, never truncated; no operation implicitly reconnects.
+  ws-receive: func(id: connection-id, max-bytes: u32) -> result<ws-receive-result, transport-error>;
+  ws-close: func(id: connection-id) -> result<_, transport-error>;
 }
 
 world host {

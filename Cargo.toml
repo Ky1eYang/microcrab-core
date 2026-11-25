@@ -21,7 +21,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.20"
+version = "0.2.38"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/Ky1eYang/microcrab-core"

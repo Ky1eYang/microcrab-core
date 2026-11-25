@@ -15,13 +15,18 @@ pub mod shell;
 mod tool;
 pub mod tool_api;
 pub mod types;
+pub mod web_transport;
 
 pub use bytes::Bytes;
 pub use cache::{CachePointRequest, FileCachePoint, MAX_CACHE_POINT_BYTES};
 pub use facade::HostAPI;
 pub use files::{
-    GlobEntry, GlobEntryKind, GlobOutput, GlobRequest, GrepMatch, GrepOutput, GrepRequest,
-    ReadOutput, ReadRequest, WriteOutput, WritePrecondition, WriteRequest,
+    GlobEntry, GlobEntryKind, GlobIgnoreRuleFile, GlobIgnoreSnapshot, GlobOutput, GlobRequest,
+    GlobScanIncomplete, GlobScanReason, GrepMatch, GrepOutput, GrepRequest,
+    MAX_GLOB_IGNORE_RULE_BYTES, MAX_GLOB_IGNORE_RULE_FILES, MAX_GLOB_IGNORE_RULE_LINES_PER_FILE,
+    MAX_GLOB_IGNORED_PATH_BYTES, MAX_GLOB_IGNORED_PATHS, ReadOutput, ReadRequest,
+    ResolvedGlobOutput, WriteOutput, WritePrecondition, WriteRequest, glob_ignore_rule_json_bytes,
+    glob_ignored_path_json_bytes, validate_glob_ignore_rules, validate_glob_ignored_paths,
 };
 pub use filesystem::FsApi;
 pub use futures_util::{Stream, stream};
@@ -32,10 +37,12 @@ pub use mutation::{
 pub use net::NetApi;
 pub use process::ProcessApi;
 pub use shell::{
-    ExpiredRange, ShellApi, ShellCaptureStatus, ShellOutput, ShellPosition, ShellRequest,
+    ExpiredRange, PrivateShellRequest, ShellApi, ShellCaptureStatus, ShellOutput, ShellPosition,
+    ShellRequest,
 };
 pub use tool::{
-    FailureReason, Host, HostInfo, OsFamily, ToolError, WorkspaceFile, WorkspaceSnapshot,
+    FailureReason, Host, HostInfo, OsFamily, PrivateFileBuffer, ToolError, WorkspaceFile,
+    WorkspaceSnapshot,
 };
 pub use tool_api::FileMutationApi;
 pub use types::{

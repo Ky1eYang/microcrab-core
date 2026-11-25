@@ -215,15 +215,23 @@ impl SqliteAuditStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(failure)?;
         reply_writers.delete(&tx, owner, root)?;
-        let has_history: bool = tx
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='journal_heads')",
-                [],
-                |row| row.get(0),
-            )
-            .map_err(failure)?;
-        if has_history {
-            for table in ["journal_nodes", "journal_heads"] {
+        for table in [
+            "journal_nodes",
+            "journal_heads",
+            "journal_file_versions",
+            "journal_blobs",
+            "journal_ancestry_index",
+        ] {
+            // Older databases need not have the sidecar table. The same exact
+            // root/registered descendants predicate applies to all history rows.
+            let exists: bool = tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+                    [table],
+                    |row| row.get(0),
+                )
+                .map_err(failure)?;
+            if exists {
                 tx.execute(&format!("DELETE FROM {table} WHERE session_id=?3 OR session_id IN (SELECT session FROM audit_streams WHERE owner=?1 AND root_session=?2)"), params![owner,root,root]).map_err(failure)?;
             }
         }

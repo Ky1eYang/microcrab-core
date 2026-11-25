@@ -18,6 +18,15 @@ pub struct ShellRequest {
     /// Shared retained UTF-8 byte budget for stdout and stderr.
     pub output_bytes: usize,
 }
+/// Select exclusive Runtime-owned raw pipe capture before launch. The Host must
+/// not start its text capture or expose a text fallback for this request. MIME
+/// and retention belong to the Runtime's selected channel, not the Host.
+/// This native contract is not carried by the JSON Shell protocol.
+pub struct PrivateShellRequest {
+    pub command: String,
+    pub cwd: Option<PathBuf>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShellPosition {
     pub line: u64,
@@ -54,6 +63,15 @@ pub struct ShellCaptureStatus {
 /// conflicts for shell-launched processes. Kill retains capture until release.
 #[async_trait]
 pub trait ShellApi: Send + Sync {
+    /// Optional capability; never fall back to text Shell or a carrier that does
+    /// not explicitly support private raw capture. Raw pipes follow ProcessApi.
+    async fn launch_private(
+        &self,
+        _ctx: &OpContext,
+        _request: PrivateShellRequest,
+    ) -> Result<ProcessHandle> {
+        Err(HostError::unsupported_known("shell.launch-private"))
+    }
     async fn launch(&self, _ctx: &OpContext, _request: ShellRequest) -> Result<ProcessHandle> {
         Err(HostError::unsupported_known("shell.launch"))
     }

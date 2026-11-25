@@ -72,11 +72,6 @@ pub(crate) fn yield_ms() -> u64 {
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ReadImageArgs {
-    path: String,
-}
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct ReadArgs {
     path: String,
     #[serde(default = "one")]
@@ -183,17 +178,6 @@ pub fn invoke<H: Host>(
         return Err(invalid("null arguments are not supported"));
     }
     let content = match name {
-        "read_image" => {
-            let a: ReadImageArgs = parse(arguments)?;
-            text(&a.path, 4096, true)?;
-            let attachment = operation(host.read_image(&a.path))?;
-            return Ok(InvocationOutput {
-                content: encode(
-                    &json!({"media_type":attachment.media_type,"bytes":attachment.data.len()}),
-                )?,
-                attachments: vec![attachment],
-            });
-        }
         "read" => {
             let a: ReadArgs = parse(arguments)?;
             text(&a.path, 4096, true)?;
@@ -351,10 +335,7 @@ pub fn invoke<H: Host>(
         }
         _ => Err(invalid("unknown tool")),
     }?;
-    Ok(InvocationOutput {
-        content,
-        attachments: Vec::new(),
-    })
+    Ok(InvocationOutput { content })
 }
 
 fn replace<H: Host>(

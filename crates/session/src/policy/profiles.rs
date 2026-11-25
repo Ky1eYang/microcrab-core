@@ -33,6 +33,27 @@ pub(super) fn native(tools: &[(String, ToolOrigin)], _agent: &str, _mode: &str) 
                 });
                 return vec![send, reply];
             }
+            if name == "job" {
+                let mut redirect = rule(name, Action::Ask);
+                redirect.args.push(super::ArgumentPredicate {
+                    pointer: "/action".into(),
+                    matcher: Matcher::Exact(crate::runtime::execution::job::REDIRECT.into()),
+                });
+                return vec![rule(name, Action::Allow), redirect];
+            }
+            if name == crate::runtime::tool::view_image::NAME {
+                return ["file:*", "bytes:*", "inline:*", "https:*"]
+                    .into_iter()
+                    .map(|pattern| {
+                        let mut source = rule(name, Action::Allow);
+                        source.args.push(super::ArgumentPredicate {
+                            pointer: "/image_url".into(),
+                            matcher: Matcher::Glob(pattern.into()),
+                        });
+                        source
+                    })
+                    .collect();
+            }
             vec![rule(
                 name,
                 if matches!(name.as_str(), "switch_mode" | "escalate" | "send_message") {
@@ -72,6 +93,65 @@ pub(super) fn guest(tools: &[(String, ToolOrigin)], rules: &[Permission]) -> Vec
 mod tests {
     use super::*;
     #[test]
+    fn view_image_defaults_allow_each_supported_source_without_blanket_allow() {
+        let rules = native(
+            &[("view_image".into(), ToolOrigin::Builtin)],
+            "agent",
+            "mode",
+        );
+        assert_eq!(rules.len(), 4);
+        assert!(
+            rules
+                .iter()
+                .all(|rule| rule.args[0].pointer == "/image_url")
+        );
+        assert!(
+            rules
+                .iter()
+                .all(|rule| rule.action == Action::Allow && rule.args.len() == 1)
+        );
+        let policy = microcrab_permission::PolicySnapshot {
+            revision: 0,
+            config: microcrab_permission::PermissionConfig {
+                defaults: rules,
+                ..Default::default()
+            },
+        };
+        let compiled = microcrab_permission::compile(&policy, "view_image").unwrap();
+        for source in [
+            serde_json::json!({"image_url":"file:digest"}),
+            serde_json::json!({"image_url":"bytes:digest"}),
+            serde_json::json!({"image_url":"inline:digest"}),
+            serde_json::json!({"image_url":"https:digest"}),
+        ] {
+            assert_eq!(
+                microcrab_permission::evaluate_compiled(&compiled, &source).unwrap(),
+                Action::Allow
+            );
+        }
+        assert_eq!(
+            microcrab_permission::evaluate_compiled(&compiled, &serde_json::json!({})).unwrap(),
+            Action::Deny
+        );
+        let mut policy = policy;
+        let mut deny_file = rule("view_image", Action::Deny);
+        deny_file.args.push(super::super::ArgumentPredicate {
+            pointer: "/image_url".into(),
+            matcher: Matcher::Glob("file:*".into()),
+        });
+        policy.config.overrides.push(deny_file);
+        let compiled = microcrab_permission::compile(&policy, "view_image").unwrap();
+        assert_eq!(
+            microcrab_permission::evaluate_compiled(&compiled, &serde_json::json!({"image_url":"file:digest"})).unwrap(),
+            Action::Deny
+        );
+        assert_eq!(
+            microcrab_permission::evaluate_compiled(&compiled, &serde_json::json!({"image_url":"bytes:digest"})).unwrap(),
+            Action::Allow
+        );
+    }
+
+    #[test]
     fn reserved_mode_switch_has_native_ask_while_job_keeps_allow() {
         let rules = native(
             &[
@@ -82,8 +162,31 @@ mod tests {
             "agent",
             "mode",
         );
-        assert_eq!(rules.len(), 2);
+        assert_eq!(rules.len(), 3);
         assert_eq!(rules[0].action, Action::Ask);
-        assert_eq!(rules[1].action, Action::Allow);
+        let policy = microcrab_permission::PolicySnapshot {
+            revision: 0,
+            config: microcrab_permission::PermissionConfig {
+                defaults: rules,
+                ..Default::default()
+            },
+        };
+        let compiled = microcrab_permission::compile(&policy, "job").unwrap();
+        for action in [
+            "status", "read", "wait", "write", "cancel", "release", "redirect",
+        ] {
+            assert_eq!(
+                microcrab_permission::evaluate_compiled(
+                    &compiled,
+                    &serde_json::json!({"action":action})
+                )
+                .unwrap(),
+                if action == "redirect" {
+                    Action::Ask
+                } else {
+                    Action::Allow
+                },
+            );
+        }
     }
 }

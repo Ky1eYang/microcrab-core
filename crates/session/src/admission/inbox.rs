@@ -236,6 +236,7 @@ pub(crate) struct InboxState {
     execution_started_at_ms: Option<u64>,
     execution_ended_at_ms: Option<u64>,
     pub paused: bool,
+    pub model_admission_paused: bool,
     pub retired: bool,
     pub retiring: bool,
     next_id: u64,
@@ -376,7 +377,7 @@ impl InboxState {
             active: self.active,
             execution_started_at_ms: self.execution_started_at_ms,
             execution_ended_at_ms: self.execution_ended_at_ms,
-            paused: self.paused,
+            paused: self.is_paused(),
             max_items: USER_ITEMS,
             max_bytes: USER_BYTES,
             used_bytes: self.user_bytes,
@@ -716,8 +717,11 @@ impl InboxState {
             || !self.carriers.is_empty()
             || self.notices.iter().any(|entry| entry.lane != Lane::Observe)
     }
+    pub fn is_paused(&self) -> bool {
+        self.paused || self.model_admission_paused
+    }
     pub fn has_next_turn(&self) -> bool {
-        !self.paused
+        !self.is_paused()
             && !self.active
             && !self.retired
             && !self.retiring

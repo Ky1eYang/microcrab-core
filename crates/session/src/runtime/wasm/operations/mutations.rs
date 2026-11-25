@@ -1,7 +1,7 @@
 //! Invocation-bound file mutation plan. Reservations happen before the first
 //! capture; publication awaits the actual Host owner even after cancellation.
-use super::super::microcrab::host::file_mutation as wire;
-use super::super::microcrab::host::text_write as write;
+use super::super::microcrab::host0_1_0::file_mutation as wire;
+use super::super::microcrab::host0_1_0::text_write as write;
 use super::*;
 
 fn decode(
@@ -55,6 +55,14 @@ fn paths(request: &host::FileMutation) -> Vec<PathBuf> {
         host::FileMutation::Write(r) => vec![r.path.clone()],
         host::FileMutation::Delete(r) => vec![r.path.clone()],
         host::FileMutation::Move(r) => vec![r.path.clone(), r.destination.clone()],
+    }
+}
+
+fn version_target(request: &host::FileMutation) -> Option<(&PathBuf, &str)> {
+    match request {
+        host::FileMutation::Write(request) => Some((&request.path, &request.content)),
+        host::FileMutation::Move(request) => Some((&request.destination, &request.content)),
+        host::FileMutation::Delete(_) => None,
     }
 }
 
@@ -151,8 +159,21 @@ async fn validate_preflight(
 }
 
 pub(in crate::runtime::wasm) fn preflight(
+    caller: StoreContextMut<'_, RuntimeState>,
+    requests: (Vec<wire::FileMutation>,),
+) -> wasmtime::Result<(Result<Vec<wire::FileMutation>, abi::OperationError>,)> {
+    preflight_impl(caller, requests, false)
+}
+pub(in crate::runtime::wasm) fn preflight_versioned(
+    caller: StoreContextMut<'_, RuntimeState>,
+    requests: (Vec<wire::FileMutation>,),
+) -> wasmtime::Result<(Result<Vec<wire::FileMutation>, abi::OperationError>,)> {
+    preflight_impl(caller, requests, true)
+}
+fn preflight_impl(
     mut caller: StoreContextMut<'_, RuntimeState>,
     (requests,): (Vec<wire::FileMutation>,),
+    versioned: bool,
 ) -> wasmtime::Result<(Result<Vec<wire::FileMutation>, abi::OperationError>,)> {
     let state = caller.data_mut();
     let result = (|| {
@@ -197,7 +218,7 @@ pub(in crate::runtime::wasm) fn preflight(
             ));
         }
         let output_budget = state.output_bytes_remaining;
-        let (normalized, evidence_bytes, points, active, receipt_bytes) = bridge(
+        let (normalized, evidence_bytes, points, active, receipt_bytes, references) = bridge(
             state,
             Vec::new(),
             args,
@@ -307,8 +328,48 @@ pub(in crate::runtime::wasm) fn preflight(
                             })?);
                         }
                     }
+                    let mut references = Vec::with_capacity(normalized.len());
+                    if versioned {
+                        use crate::runtime::wasm::file_versions as refs;
+                        let owner =
+                            refs::owner(&invocation).map_err(super::versioned::ledger_error)?;
+                        let mut ledger = owner
+                            .ledger(host.as_ref(), &invocation)
+                            .await
+                            .map_err(super::versioned::ledger_error)?;
+                        for request in &normalized {
+                            let witness = if let Some((path, content)) = version_target(request) {
+                                let path = refs::path(
+                                    host.as_ref(),
+                                    &token,
+                                    path.to_str().unwrap_or_default(),
+                                )
+                                .await
+                                .map_err(host_error)?;
+                                let digest = super::versioned::sha(content);
+                                let alias = ledger
+                                    .issue(&path, &digest, false)
+                                    .map_err(super::versioned::ledger_error)?;
+                                Some((path, digest, alias))
+                            } else {
+                                None
+                            };
+                            references.push(witness);
+                        }
+                        ledger
+                            .commit()
+                            .await
+                            .map_err(super::versioned::ledger_error)?;
+                    }
                     Ok((
-                        (normalized, evidence_bytes, points, active, receipt_bytes),
+                        (
+                            normalized,
+                            evidence_bytes,
+                            points,
+                            active,
+                            receipt_bytes,
+                            references,
+                        ),
                         response_size,
                     ))
                 })
@@ -368,6 +429,7 @@ pub(in crate::runtime::wasm) fn preflight(
         state.output_bytes_remaining -= receipt_bytes;
         state.cache_points_remaining = cache_points_remaining;
         state.patch_receipts = patch_receipts;
+        state.patch_version_refs = references;
         state.patch_plan = Some(active);
         state.cooperative_driver_cancellation = true;
         Ok(output)
@@ -376,12 +438,28 @@ pub(in crate::runtime::wasm) fn preflight(
 }
 
 pub(in crate::runtime::wasm) fn mutate(
+    caller: StoreContextMut<'_, RuntimeState>,
+    request: (wire::FileMutation,),
+) -> wasmtime::Result<(Result<wire::MutationOutput, abi::OperationError>,)> {
+    mutate_impl(caller, request, false)
+}
+pub(in crate::runtime::wasm) fn mutate_versioned(
+    caller: StoreContextMut<'_, RuntimeState>,
+    request: (wire::FileMutation,),
+) -> wasmtime::Result<(Result<wire::MutationOutput, abi::OperationError>,)> {
+    mutate_impl(caller, request, true)
+}
+fn mutate_impl(
     mut caller: StoreContextMut<'_, RuntimeState>,
     (request,): (wire::FileMutation,),
+    versioned: bool,
 ) -> wasmtime::Result<(Result<wire::MutationOutput, abi::OperationError>,)> {
     let state = caller.data_mut();
     let mut receipt_index = None;
     let result = (|| {
+        if versioned != !state.patch_version_refs.is_empty() {
+            return Err(invalid("mutation ABI differs from its preflight"));
+        }
         let request = decode(request)?;
         let value = serde_json::to_value(&request)
             .map_err(|_| invalid("mutation request serialization failed"))?;
@@ -410,8 +488,12 @@ pub(in crate::runtime::wasm) fn mutate(
             .into_iter()
             .map(|p| p.to_string_lossy().into())
             .collect();
+        let reference = receipt_index
+            .and_then(|index| state.patch_version_refs.get(index))
+            .cloned()
+            .flatten();
         let args = json!({"request":value,"_file_mutation":true});
-        bridge(state, resources, args, move |host, token, _| {
+        bridge(state, resources, args, move |host, token, invocation| {
             Box::pin(async move {
                 let out = host::tool_api::FileMutationApi::mutate(host.as_ref(), &token, request)
                     .await
@@ -419,25 +501,66 @@ pub(in crate::runtime::wasm) fn mutate(
                 // Capacity was reserved before publication. A violating Host diagnostic
                 // is truncated without losing the committed outcome.
                 let diagnostic = out.diagnostic.map(|s| s.chars().take(256).collect());
-                Ok((
-                    wire::MutationOutput {
-                        version: out.version,
-                        bytes: out.bytes as u64,
-                        source_removed: out.source_removed,
-                        destination_written: out.destination_written,
-                        diagnostic,
-                    },
-                    0,
-                ))
+                let exact = wire::MutationOutput {
+                    version: out.version,
+                    bytes: out.bytes as u64,
+                    source_removed: out.source_removed,
+                    destination_written: out.destination_written,
+                    diagnostic,
+                };
+                let mut projected = exact.clone();
+                if versioned {
+                    projected.version = None;
+                    if exact.destination_written {
+                        let publication = async {
+                            use crate::runtime::wasm::file_versions as refs;
+                            let (path, digest, alias) = reference
+                                .ok_or_else(|| crate::Error::tool("missing reserved version"))?;
+                            let invocation = invocation.ok_or_else(|| {
+                                crate::Error::tool("file version invocation absent")
+                            })?;
+                            let owner = refs::owner(&invocation)?;
+                            let mut ledger = owner.ledger(host.as_ref(), &invocation).await?;
+                            let version = exact
+                                .version
+                                .as_deref()
+                                .filter(|version| *version == digest)
+                                .ok_or_else(|| {
+                                    crate::Error::tool("unexpected Host mutation version")
+                                })?;
+                            ledger.confirm(&path, version, &alias)?;
+                            ledger.commit().await?;
+                            Ok::<_, crate::Error>(alias)
+                        }
+                        .await;
+                        match publication {
+                            Ok(alias) => projected.version = Some(alias),
+                            Err(_) => {
+                                let guidance = "mutation committed; version reference unavailable; reread destination and do not replay";
+                                projected.diagnostic = Some(match &exact.diagnostic {
+                                    Some(diagnostic) => format!("{diagnostic}; {guidance}"),
+                                    None => guidance.into(),
+                                });
+                            }
+                        }
+                    }
+                }
+                Ok(((exact, projected), 0))
             })
         })
     })();
     if let Some(index) = receipt_index {
         let receipt = &mut state.patch_receipts[index];
         match &result {
-            Ok(out) => {
+            Ok((exact, projected)) => {
                 receipt["status"] = json!("committed");
-                receipt["outcome"] = json!({"version":out.version,"bytes":out.bytes,"source_removed":out.source_removed,"destination_written":out.destination_written,"diagnostic":out.diagnostic});
+                receipt["outcome"] = json!({"version":exact.version,"bytes":exact.bytes,"source_removed":exact.source_removed,"destination_written":exact.destination_written,"diagnostic":exact.diagnostic});
+                if versioned {
+                    receipt["version_ref"] = json!(projected.version);
+                    if projected.diagnostic != exact.diagnostic {
+                        receipt["projection_diagnostic"] = json!(projected.diagnostic);
+                    }
+                }
             }
             Err(error) => {
                 receipt["status"] = json!(match error.code {
@@ -465,16 +588,18 @@ pub(in crate::runtime::wasm) fn mutate(
         }
     }
     if receipt_index.is_some()
-        && result.as_ref().map_or(true, |out| out.diagnostic.is_some())
+        && result
+            .as_ref()
+            .map_or(true, |(_, out)| out.diagnostic.is_some())
         && let Some(plan) = state.patch_plan.as_mut()
     {
         plan.clear();
     }
     if result
         .as_ref()
-        .is_ok_and(|out| out.source_removed || out.destination_written)
+        .is_ok_and(|(out, _)| out.source_removed || out.destination_written)
     {
         state.known_write_committed = true;
     }
-    finish(state, result)
+    finish(state, result.map(|(_, projected)| projected))
 }

@@ -161,9 +161,11 @@ fn test_openai_responses_adapt() {
     let request = sample_request();
     let adapted = client.adapt(&request).unwrap();
 
-    assert_eq!(
-        adapted["instructions"].as_str(),
-        Some("You are a helpful assistant.")
+    assert!(adapted.get("instructions").is_none());
+    assert!(
+        adapted["prompt_cache_key"]
+            .as_str()
+            .is_some_and(|key| key.starts_with("mc_v1_") && key.len() == 38)
     );
     assert_eq!(adapted["model"].as_str(), Some("gpt-4.5-preview"));
     assert_eq!(adapted["max_output_tokens"].as_u64(), Some(1024));
@@ -175,16 +177,19 @@ fn test_openai_responses_adapt() {
 
     let input = adapted["input"].as_array().unwrap();
     // input items:
-    // 1. user message
-    // 2. assistant message ("Calling tool")
-    // 3. function_call
-    // 4. function_call_output
-    assert_eq!(input.len(), 4);
-    assert_eq!(input[0]["role"], "user");
-    assert_eq!(input[1]["role"], "assistant");
-    assert_eq!(input[2]["type"], "function_call");
-    assert_eq!(input[2]["call_id"], "call_123");
-    assert_eq!(input[2]["name"], "get_weather");
-    assert_eq!(input[3]["type"], "function_call_output");
+    // 1. developer message (system prompt)
+    // 2. user message
+    // 3. assistant message ("Calling tool")
+    // 4. function_call
+    // 5. function_call_output
+    assert_eq!(input.len(), 5);
+    assert_eq!(input[0]["role"], "developer");
+    assert_eq!(input[0]["content"], "You are a helpful assistant.");
+    assert_eq!(input[1]["role"], "user");
+    assert_eq!(input[2]["role"], "assistant");
+    assert_eq!(input[3]["type"], "function_call");
     assert_eq!(input[3]["call_id"], "call_123");
+    assert_eq!(input[3]["name"], "get_weather");
+    assert_eq!(input[4]["type"], "function_call_output");
+    assert_eq!(input[4]["call_id"], "call_123");
 }

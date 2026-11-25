@@ -25,14 +25,6 @@ impl AgentPeer for SessionInner {
     ) -> Result<crate::state::communication::inbox::QueuedReceipt, Error> {
         self.escalate_owned(arguments, invocation).await
     }
-    async fn reply_external_speaker(
-        &self,
-        arguments: Value,
-        invocation: crate::runtime::tool::ToolContext,
-    ) -> Result<crate::runtime::tool::ToolOutput, Error> {
-        self.reply_external_speaker_owned(arguments, invocation)
-            .await
-    }
     async fn enqueue_authenticated(
         &self,
         carrier: crate::state::communication::inbox::AcceptedCarrier,

@@ -10,7 +10,7 @@ use microcrab_session::{
     runtime::{
         Runtime, ToolRegistration,
         tool::{AllowTools, Tool, ToolContext},
-        wasm::{WasmLimits, load_component},
+        wasm::{WasmAgent, WasmLimits},
     },
 };
 use serde_json::{Value, json};
@@ -107,7 +107,7 @@ fn component() -> Vec<u8> {
 }
 
 fn tools() -> Vec<Arc<dyn Tool>> {
-    load_component(
+    WasmAgent::load(
         &component(),
         WasmLimits {
             memory_bytes: 128 * 1024,
@@ -116,6 +116,7 @@ fn tools() -> Vec<Arc<dyn Tool>> {
         fixture_host(),
     )
     .unwrap()
+    .tools()
 }
 
 struct Script {
@@ -215,7 +216,7 @@ fn session(tools: &[Arc<dyn Tool>], script: Arc<Script>) -> Session {
 
 #[tokio::test]
 async fn retained_instance_resets_fuel_for_each_invocation() {
-    let tools = load_component(
+    let tools = WasmAgent::load(
         &component(),
         WasmLimits {
             fuel: 2_000_000,
@@ -224,7 +225,8 @@ async fn retained_instance_resets_fuel_for_each_invocation() {
         },
         fixture_host(),
     )
-    .unwrap();
+    .unwrap()
+    .tools();
     let script = Script::new(&[
         &["fuel", "fuel"],
         &["fuel", "fuel"],
@@ -355,7 +357,7 @@ async fn ordinary_guest_error_keeps_mutated_memory_and_completes_post_return() {
 }
 
 #[tokio::test]
-async fn actual_trap_is_structured_and_poisons_same_epoch_until_transition() {
+async fn actual_traps_replace_only_the_store_and_leave_context_epoch_unchanged() {
     let tools = tools();
     let script = Script::new(&[
         &["count_a"],
@@ -371,7 +373,7 @@ async fn actual_trap_is_structured_and_poisons_same_epoch_until_transition() {
     ]);
     let session = session(&tools, script.clone());
     session.submit("trap then try same epoch").await.unwrap();
-    session.submit("still poisoned next turn").await.unwrap();
+    session.submit("use the same replacement next turn").await.unwrap();
     let outputs = script.results();
     assert_eq!(outputs.len(), 4);
     assert_eq!(outputs[0], json!(1));
@@ -379,24 +381,13 @@ async fn actual_trap_is_structured_and_poisons_same_epoch_until_transition() {
     assert_eq!(outputs[1]["diagnostic"]["layer"], "guest");
     assert_eq!(outputs[1]["diagnostic"]["phase"], "guest_execution");
     assert_eq!(outputs[1]["diagnostic"]["effects"], "unknown");
-    assert!(
-        outputs[1]["error"]
-            .as_str()
-            .unwrap()
-            .contains("original cause is unavailable")
+    assert_eq!(
+        outputs[1]["diagnostic"]["wasm_failure"],
+        json!({"cause":"unreachable"})
     );
     let evidence_id = outputs[1]["diagnostic"]["evidence_id"].as_u64().unwrap();
-    for output in &outputs[2..] {
-        assert_eq!(output["diagnostic"]["evidence_id"], evidence_id);
-        assert_eq!(output["diagnostic"]["code"], "wasm_poisoned");
-        assert_eq!(output["diagnostic"]["layer"], "runtime");
-        assert_eq!(output["diagnostic"]["phase"], "validation");
-        assert_eq!(output["diagnostic"]["effects"], "not_started");
-        let message = output["error"].as_str().unwrap();
-        assert!(message.contains("same epoch"));
-        assert!(message.contains("compaction"));
-        assert!(message.contains("do not automatically replay"));
-    }
+    assert_eq!(outputs[2], json!(1));
+    assert_eq!(outputs[3], json!(2));
     let epoch = session.state().epoch_id;
     assert_eq!(epoch, 0);
     assert!(
@@ -429,8 +420,71 @@ async fn actual_trap_is_structured_and_poisons_same_epoch_until_transition() {
     assert_eq!(outputs[4], json!(1));
     let new_id = outputs[5]["diagnostic"]["evidence_id"].as_u64().unwrap();
     assert_ne!(new_id, evidence_id);
-    assert_eq!(outputs[6]["diagnostic"]["code"], "wasm_poisoned");
-    assert_eq!(outputs[6]["diagnostic"]["evidence_id"], new_id);
+    assert_eq!(outputs[6], json!(1));
+    session.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn recurring_fuel_traps_are_fresh_failures_without_weakening_the_budget() {
+    // The guest's finite loop fits under 2,000,000 fuel but not this non-default
+    // allowance, which must be reported exactly rather than guessing the default.
+    let tools = WasmAgent::load(
+        &component(),
+        WasmLimits {
+            fuel: 123_456,
+            memory_bytes: 128 * 1024,
+            ..Default::default()
+        },
+        fixture_host(),
+    )
+    .unwrap()
+    .tools();
+    let script = Script::with_arguments(
+        &[
+            &["count_a"],
+            &["fuel"],
+            &["count_b"],
+            &[],
+            &["fuel"],
+            &["count_a"],
+            &[],
+        ],
+        json!({"body":"PRIVATE_PAYLOAD", "path":"/private/endpoint"}),
+    );
+    let session = session(&tools, script.clone());
+    session
+        .submit("exhaust fuel after successful call")
+        .await
+        .unwrap();
+    session.submit("try again in same epoch").await.unwrap();
+    let outputs = script.results();
+    assert_eq!(outputs.len(), 5);
+    assert_eq!(outputs[0], json!(1));
+    let failure = &outputs[1]["diagnostic"];
+    assert_eq!(failure["code"], "wasm_trap");
+    assert_eq!(failure["effects"], "unknown");
+    let id = failure["evidence_id"].as_u64().unwrap();
+    let cause = json!({"cause":"out_of_fuel", "fuel_limit":123_456});
+    assert_eq!(failure["wasm_failure"], cause);
+    assert_eq!(outputs[2], json!(1));
+    assert_eq!(outputs[3]["diagnostic"]["code"], "wasm_trap");
+    assert_eq!(outputs[3]["diagnostic"]["effects"], "unknown");
+    assert_eq!(outputs[3]["diagnostic"]["wasm_failure"], cause);
+    assert_ne!(outputs[3]["diagnostic"]["evidence_id"], id);
+    assert_eq!(outputs[4], json!(1));
+    for output in &outputs[1..] {
+        let text = output.to_string();
+        for private in [
+            "PRIVATE_PAYLOAD",
+            "/private/endpoint",
+            "private_secret_guest_name",
+            "wasm_frames",
+            "backtrace",
+        ] {
+            assert!(!text.contains(private), "leaked {private}");
+        }
+    }
+    assert_eq!(session.state().epoch_id, 0);
     session.close().await.unwrap();
 }
 
@@ -536,7 +590,7 @@ impl tracing::Subscriber for EvidenceCapture {
 }
 
 #[tokio::test]
-async fn direct_trap_logs_error_with_typed_secret_free_evidence_and_poison_reuses_id() {
+async fn direct_trap_logs_error_with_typed_secret_free_evidence_and_rejects_replay() {
     use tracing::instrument::WithSubscriber;
     let tools = tools();
     let trap = tools
@@ -551,43 +605,17 @@ async fn direct_trap_logs_error_with_typed_secret_free_evidence_and_poison_reuse
     invocation.call_id = "private-call-secret /private/call".into();
     invocation.session_id = "private-session-secret /private/session".into();
     let arguments = json!({"password":"private-body-secret", "path":"/private/guest"});
-    let first = trap
-        .execute_initialized(arguments.clone(), invocation.clone())
-        .with_subscriber(capture.clone())
-        .await
-        .err()
-        .unwrap()
-        .tool_diagnostic();
-    let poisoned = trap
-        .execute_initialized(arguments.clone(), invocation)
-        .with_subscriber(capture.clone())
-        .await
-        .err()
-        .unwrap()
-        .tool_diagnostic();
-    assert_eq!(
-        first.code,
-        microcrab_session::observation::diagnostics::DiagnosticCode::WasmTrap
-    );
-    assert_eq!(
-        first.effects,
-        microcrab_session::observation::diagnostics::EffectKnowledge::Unknown
-    );
+    let admitted = trap.admitted_context(arguments.clone(), invocation)
+        .with_subscriber(capture.clone()).await.unwrap();
+    let first = trap.execute(arguments.clone(), admitted.clone())
+        .with_subscriber(capture.clone()).await.err().unwrap().tool_diagnostic();
+    let replay = trap.execute(arguments.clone(), admitted)
+        .with_subscriber(capture.clone()).await.err().unwrap().tool_diagnostic();
+    assert_eq!(first.code, microcrab_session::observation::diagnostics::DiagnosticCode::WasmTrap);
+    assert_eq!(first.effects, microcrab_session::observation::diagnostics::EffectKnowledge::Unknown);
     assert!(first.evidence_id.is_some());
-    assert_eq!(
-        poisoned.code,
-        microcrab_session::observation::diagnostics::DiagnosticCode::WasmPoisoned
-    );
-    assert_eq!(
-        poisoned.effects,
-        microcrab_session::observation::diagnostics::EffectKnowledge::NotStarted
-    );
-    assert_eq!(poisoned.evidence_id, first.evidence_id);
-    assert_eq!(
-        capture.0.lock().unwrap().len(),
-        1,
-        "poison rejection must not emit another failure"
-    );
+    assert_ne!(replay.code, microcrab_session::observation::diagnostics::DiagnosticCode::WasmTrap);
+    assert_eq!(capture.0.lock().unwrap().len(), 1, "a replay must not enter the guest");
     let fresh = trap
         .execute_initialized(
             arguments,
@@ -651,7 +679,7 @@ fn compile_describe_and_instantiation_failures_log_safe_boundary_phases() {
     let mut ids = BTreeSet::new();
     for bytes in bad_components {
         let error = tracing::dispatcher::with_default(&dispatch, || {
-            load_component(&bytes, WasmLimits::default(), fixture_host())
+            WasmAgent::load(&bytes, WasmLimits::default(), fixture_host())
         })
         .err()
         .expect("fixture must fail at Wasmtime boundary");
@@ -673,4 +701,162 @@ fn compile_describe_and_instantiation_failures_log_safe_boundary_phases() {
     assert_eq!(events[0].fields["cause"], "\"wasmtime_error\"");
     assert_eq!(events[1].fields["cause"], "\"unreachable\"");
     assert_eq!(events[2].fields["cause"], "\"unreachable\"");
+}
+
+
+async fn wait_for_observation(predicate: impl Fn() -> bool) {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !predicate() {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("process-local observation queue did not drain");
+}
+
+#[tokio::test]
+async fn guest_observations_survive_trap_without_inventing_lifecycle_identity() {
+    use crate::guest_observation_fixture::{NOTE, component_with_reporting_init, instrument};
+    use sha2::{Digest, Sha256};
+    use tracing::instrument::WithSubscriber;
+
+    let text = instrument(&component_text(), NOTE, NOTE);
+    let bytes = component_with_reporting_init(&text);
+    let capture = EvidenceCapture::default();
+    let dispatch = tracing::Dispatch::new(capture.clone());
+    let agent = tracing::dispatcher::with_default(&dispatch, || {
+        WasmAgent::load(&bytes, WasmLimits::default(), fixture_host())
+    })
+    .unwrap();
+    let tool = agent
+        .tools()
+        .into_iter()
+        .find(|tool| tool.definition().name == "trap")
+        .unwrap();
+    let mut state = SessionState::new(Default::default());
+    state.epoch_id = 7;
+    let mut context = ToolContext::detached(state, CancellationToken::new());
+    context.session_id = "private-session".into();
+    context.call_id = "private-operation".into();
+    let arguments = json!({"password":"private-argument"});
+    let context = tool
+        .admitted_context(arguments.clone(), context)
+        .with_subscriber(capture.clone())
+        .await
+        .unwrap();
+    let execution = context.execution_id.unwrap().0.to_string();
+    let failure = tool
+        .execute(arguments, context)
+        .with_subscriber(capture.clone())
+        .await
+        .err()
+        .unwrap()
+        .tool_diagnostic();
+    assert_eq!(
+        failure.wasm_failure,
+        Some(microcrab_session::observation::diagnostics::WasmFailure::Unreachable)
+    );
+    let is_guest = |ev: &CapturedEvidence| {
+        ev.fields
+            .get("observation")
+            .is_some_and(|v| v == "\"wasm_guest_event\"")
+    };
+    wait_for_observation(|| {
+        capture
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|ev| is_guest(ev))
+            .count()
+            == 3
+    })
+    .await;
+    let events = capture.0.lock().unwrap();
+    let events = events.iter().filter(|ev| is_guest(ev)).collect::<Vec<_>>();
+    for (event, stage) in events.into_iter().zip(["describe", "init", "invoke"]) {
+        let fields = &event.fields;
+        assert_eq!(fields["source"], "\"guest\"");
+        assert_eq!(fields["lifecycle_stage"], format!("{stage:?}"));
+        assert_eq!(
+            fields["component_sha256"],
+            format!("{:x}", Sha256::digest(&bytes))
+        );
+        assert_eq!(fields["guest_phase"], "Phase::Receive");
+        assert_eq!(fields["method"], "Method::RuntimeEnable");
+        assert_eq!(fields["measured"], "42");
+        assert_eq!(fields["limit"], "100");
+        assert_eq!(event.level, tracing::Level::WARN);
+        if stage == "invoke" {
+            assert_eq!(
+                fields["operation_sha256"],
+                format!("\"{:x}\"", Sha256::digest(b"private-operation"))
+            );
+            assert_eq!(
+                fields["session_sha256"],
+                format!("\"{:x}\"", Sha256::digest(b"private-session"))
+            );
+            assert_eq!(fields["epoch"], "7");
+            assert_eq!(fields["execution_id"], execution);
+        } else {
+            for field in [
+                "operation_sha256",
+                "session_sha256",
+                "epoch",
+                "execution_id",
+            ] {
+                assert!(
+                    !fields.contains_key(field),
+                    "invented lifecycle field {field}"
+                );
+            }
+        }
+        assert!(!format!("{fields:?}").contains("private-"));
+    }
+}
+
+#[tokio::test]
+async fn guest_observation_flood_is_suppressed_without_changing_final_output() {
+    use crate::guest_observation_fixture::{NOTE, instrument};
+    use tracing::instrument::WithSubscriber;
+
+    let reports = 128;
+    let mut flood = format!("i32.const {reports} local.set $remaining (loop $flood {NOTE}");
+    flood.push_str(" local.get $remaining i32.const 1 i32.sub local.tee $remaining br_if $flood)");
+    let bytes = typed_agent_fixture::component(&instrument(&component_text(), "", &flood));
+    let observed = WasmAgent::load(&bytes, WasmLimits::default(), fixture_host())
+        .unwrap()
+        .tools();
+    let unobserved = tools();
+    let capture = EvidenceCapture::default();
+    for tools in [&observed, &unobserved] {
+        let tool = tools
+            .iter()
+            .find(|tool| tool.definition().name == "count_a")
+            .unwrap();
+        let result = tool
+            .execute_initialized(
+                json!({}),
+                ToolContext::detached(
+                    SessionState::new(Default::default()),
+                    CancellationToken::new(),
+                ),
+            )
+            .with_subscriber(capture.clone())
+            .await
+            .unwrap();
+        assert_eq!(final_text(result), "1");
+    }
+    let is_suppression = |ev: &CapturedEvidence| ev.fields.contains_key("suppressed");
+    wait_for_observation(|| capture.0.lock().unwrap().iter().any(is_suppression)).await;
+    let events = capture.0.lock().unwrap();
+    let suppression = events.iter().find(|ev| is_suppression(ev)).unwrap();
+    assert_eq!(suppression.fields["source"], "\"runtime\"");
+    let suppressed = suppression.fields["suppressed"].parse::<usize>().unwrap();
+    let accepted = events
+        .iter()
+        .filter(|ev| ev.fields.contains_key("guest_confirmation"))
+        .count();
+    assert!((1..=32).contains(&accepted));
+    assert_eq!(accepted + suppressed, reports);
 }

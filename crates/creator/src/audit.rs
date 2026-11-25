@@ -5,8 +5,8 @@ mod diff;
 mod query;
 mod recorder;
 pub use query::{
-    AuditAttempt, AuditCommit, AuditQuery, AuditQueryResult, AuditStatus, CommitObserver, query,
-    query_attempt_metadata, query_internal, query_internal_selected,
+    AuditAttempt, AuditCommit, AuditQuery, AuditQueryResult, AuditStatus, CommitObserver,
+    LegacyUnlinkedAttempt, query, query_attempt_metadata, query_internal, query_internal_selected,
     query_internal_selected_with_ancestry, query_selected, query_selected_attempt_metadata,
     query_selected_turn_metadata, query_selected_turn_metadata_with_heads,
     query_selected_with_ancestry,

@@ -143,6 +143,7 @@ impl SessionInner {
             if idle.is_some() {
                 self.explicit_activation.store(true, Ordering::Release);
                 inbox.paused = false;
+                inbox.model_admission_paused = false;
             }
         }
         drop(idle);
@@ -215,12 +216,45 @@ impl SessionInner {
                 if inner.replacing.load(Ordering::Acquire) {
                     continue;
                 }
+                // A prior notification may have parked behind a foreground
+                // owner that consumed/paused work before this reservation won.
+                if !inbox
+                    .state
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .has_next_turn()
+                {
+                    continue;
+                }
                 let explicit = inner.explicit_activation.swap(false, Ordering::AcqRel);
                 if inner.has_continuation() && !explicit {
                     inbox.state.lock().unwrap_or_else(|e| e.into_inner()).paused = true;
                     inner.publish_activity();
                     continue;
                 }
+                let mut reservation = super::execution::OperationReservation::from_guards(
+                    operation_guard,
+                    foreground_guard,
+                );
+                match tokio::select! { biased;
+                    _ = cancel.cancelled() => break,
+                    result = inner.prepare_model_reservation(&mut reservation) => result,
+                } {
+                    Ok(()) => (),
+                    Err(Error::Cancelled | Error::Closed) => continue,
+                    Err(error) => {
+                        // Keep work unclaimed and wait for explicit resume or a
+                        // successful catalog reconciliation; never spin on a fence.
+                        inbox
+                            .state
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .model_admission_paused = true;
+                        inner.publish_inbox_failure(&error, None);
+                        inner.publish_activity();
+                        continue;
+                    }
+                };
                 // Recheck after both reservations; selection remains unconsumed
                 // until execute's successful Context append acknowledges its id.
                 let entry = inbox
@@ -231,16 +265,22 @@ impl SessionInner {
                 let Some(entry) = entry else {
                     continue;
                 };
-                let reservation = super::execution::OperationReservation::from_guards(
-                    operation_guard,
-                    foreground_guard,
-                );
                 // The id stays in the inbox throughout preparation and budget
                 // validation; execute acknowledges it only after Context append.
                 let _ = inner.execute_queued(entry, reservation).await;
             }
         });
     }
+    pub(super) fn resume_model_admission_inbox(&self) {
+        self.inbox
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .model_admission_paused = false;
+        self.publish_activity();
+        self.inbox.changed.notify_one();
+    }
+
     pub(super) async fn admit_inbox_step(
         &self,
         context: &mut Context,

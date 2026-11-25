@@ -99,6 +99,7 @@ struct CapturedRow {
 pub struct ExecutionRegistry {
     state: Mutex<RegistryState>,
     limits: Limits,
+    private_allocations: Arc<tokio::sync::Semaphore>,
     changed: watch::Sender<u64>,
     self_ref: Weak<ExecutionRegistry>,
     quiesce_gate: tokio::sync::Mutex<()>,
@@ -365,6 +366,11 @@ impl ExecutionRegistry {
                 closed: false,
                 entries: BTreeMap::new(),
             }),
+            private_allocations: Arc::new(tokio::sync::Semaphore::new(
+                limits
+                    .max_execution_buffers
+                    .min(tokio::sync::Semaphore::MAX_PERMITS),
+            )),
             limits,
             changed,
             self_ref: weak.clone(),
@@ -634,7 +640,16 @@ impl ExecutionRegistry {
                         released: e.released,
                     });
                     if let Some(buffer) = &e.buffer {
-                        row.result = Some(buffer.persisted());
+                        if buffer.is_private() {
+                            row.output = Some(buffer.recovery_metadata());
+                            row.result = None;
+                            if let Some(delivery) = &mut row.delivery {
+                                delivery.released = true;
+                            }
+                            row.output_availability = Some(super::OutputAvailability::Released);
+                        } else {
+                            row.result = Some(buffer.persisted());
+                        }
                     }
                 }
                 CapturedRow {
@@ -1053,6 +1068,7 @@ impl ExecutionRegistry {
                 .max(row.execution_id.0.checked_add(1).ok_or_else(|| {
                     crate::budget::reject(crate::LimitKind::Arithmetic, "execution id overflow")
                 })?);
+            let private = buffer.as_ref().is_some_and(Buffer::is_private);
             state.entries.insert(
                 row.execution_id,
                 Entry {
@@ -1069,7 +1085,7 @@ impl ExecutionRegistry {
                     nonce: 0,
                     adopted: true,
                     exposed: delivery.exposed || was_pending,
-                    released: delivery.released && !was_pending,
+                    released: private || (delivery.released && !was_pending),
                     worker: None,
                     cleanup: None,
                     revision: 0,
@@ -1391,6 +1407,23 @@ impl ExecutionRegistry {
         options: OutputOptions,
         controller: Arc<dyn ExecutionController>,
     ) -> Result<(OutputWriter, BufferedOutput), Error> {
+        self.open_output_with_kind(id, options, controller, None)
+    }
+    pub(crate) fn open_private_output(
+        self: &Arc<Self>,
+        id: ExecutionId,
+        media_type: String,
+        controller: Arc<dyn ExecutionController>,
+    ) -> Result<(OutputWriter, BufferedOutput), Error> {
+        self.open_output_with_kind(id, OutputOptions::default(), controller, Some(media_type))
+    }
+    fn open_output_with_kind(
+        self: &Arc<Self>,
+        id: ExecutionId,
+        options: OutputOptions,
+        controller: Arc<dyn ExecutionController>,
+        private_mime: Option<String>,
+    ) -> Result<(OutputWriter, BufferedOutput), Error> {
         let redaction = self.redaction(id)?;
         if options
             .channels
@@ -1401,6 +1434,19 @@ impl ExecutionRegistry {
         }
         let mut buffer = Buffer::new(options, self.limits.output_buffer_bytes)?;
         buffer.install_redaction(redaction);
+        if let Some(media_type) = private_mime {
+            let permit = self
+                .private_allocations
+                .clone()
+                .try_acquire_owned()
+                .map_err(|_| {
+                    crate::budget::reject(
+                        crate::LimitKind::ToolOutput,
+                        "private capture allocation limit reached",
+                    )
+                })?;
+            buffer.install_private(media_type, permit)?;
+        }
         let capabilities = controller.capabilities();
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.closed {
@@ -1441,6 +1487,7 @@ impl ExecutionRegistry {
                 nonce,
                 adopted: false,
                 include_output: false,
+                on_adopt: None,
             },
         ))
     }
@@ -1499,6 +1546,53 @@ impl ExecutionRegistry {
         self.notify();
         Ok(())
     }
+    pub(super) fn append_private(
+        &self,
+        id: ExecutionId,
+        nonce: u64,
+        bytes: &[u8],
+    ) -> Result<(), Error> {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state
+            .entries
+            .get_mut(&id)
+            .filter(|entry| entry.nonce == nonce)
+            .and_then(|entry| entry.buffer.as_mut())
+            .ok_or_else(|| Error::tool("stale private output writer"))?
+            .append_private(bytes)?;
+        drop(state);
+        self.notify();
+        Ok(())
+    }
+    /// Take a shared immutable backing while proving the exact execution and
+    /// channel are still owned. The caller receives no borrow of the registry.
+    pub(crate) fn private_output(
+        &self,
+        id: ExecutionId,
+        session_id: &str,
+        channel: &str,
+        expected_mime: &str,
+    ) -> Result<super::PrivateOutputLease, Error> {
+        let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if state.closed {
+            return Err(Error::Closed);
+        }
+        let entry = state
+            .entries
+            .get(&id)
+            .filter(|entry| entry.row.session_id == session_id && entry.exposed)
+            .ok_or_else(|| Error::tool("private output execution is not owned or exposed"))?;
+        if entry.released || entry.row.status_projection().status != ExecutionStatus::Succeeded {
+            return Err(Error::tool(
+                "job redirect requires a successful terminal, unreleased execution",
+            ));
+        }
+        entry
+            .buffer
+            .as_ref()
+            .ok_or_else(|| Error::tool("execution has no retained private output"))?
+            .private_output(channel, expected_mime)
+    }
     pub(super) fn mark_truncated(&self, id: ExecutionId, nonce: u64) -> Result<(), Error> {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let entry = state
@@ -1543,6 +1637,7 @@ impl ExecutionRegistry {
         id: ExecutionId,
         nonce: u64,
         _message: String,
+        diagnostic: Option<crate::observation::diagnostics::ToolDiagnostic>,
     ) -> Result<(), Error> {
         use crate::observation::diagnostics::{
             DiagnosticCode, DiagnosticLayer, DiagnosticPhase, ToolDiagnostic,
@@ -1564,10 +1659,13 @@ impl ExecutionRegistry {
         buffer.closed = true;
         entry.row.status = ExecutionStatus::Interrupted;
         entry.row.failure = None;
-        entry.row.diagnostic = Some(ToolDiagnostic::new(
-            DiagnosticCode::ToolFailed,
-            DiagnosticLayer::Runtime,
-            DiagnosticPhase::Unknown,
+        entry.row.diagnostic = Some(diagnostic.map_or_else(
+            || ToolDiagnostic::new(
+                DiagnosticCode::ToolFailed,
+                DiagnosticLayer::Runtime,
+                DiagnosticPhase::Unknown,
+            ),
+            |diagnostic| entry.redaction.redact_diagnostic(diagnostic),
         ));
         entry.row.elapsed_ms = entry
             .started
@@ -1665,6 +1763,9 @@ impl ExecutionRegistry {
                     receipt?
                 };
                 output.adopted = true;
+                if let Some(start) = output.on_adopt.take() {
+                    start();
+                }
                 self.notify();
                 Ok(super::ResolvedOutput::text(receipt))
             }
@@ -1736,7 +1837,11 @@ impl ExecutionRegistry {
                     if let Some(buffer) = &mut entry.buffer {
                         buffer.closed = true;
                     }
-                    entry.buffer = None;
+                    // A private producer may have launched before a guest returned
+                    // an incompatible Final result. Keep its backing until cleanup ACK.
+                    if !entry.buffer.as_ref().is_some_and(Buffer::is_private) {
+                        entry.buffer = None;
+                    }
                     entry.row.result = Some(display.clone());
                     if !entry.controlled_receipt {
                         entry.row.invocation_result = Some(observation.clone());
@@ -1760,6 +1865,7 @@ impl ExecutionRegistry {
                     };
                     entry.row.failure = final_output.failure;
                     entry.row.result = Some(display);
+                    entry.buffer = None;
                     entry.released = true;
                     entry.redaction = super::InvocationRedaction::default();
                 }
@@ -1859,7 +1965,7 @@ impl ExecutionRegistry {
         if let Some(child) = &entry.row.delegate_child {
             receipt["delegate_child"] = serde_json::to_value(child)?;
         }
-        if include_output {
+        if include_output && !entry.buffer.as_ref().is_some_and(Buffer::is_private) {
             let overhead = serde_json::to_vec(&receipt)?.len();
             let budget = self
                 .limits
@@ -2089,11 +2195,13 @@ impl ExecutionRegistry {
         }
         let mut first = None;
         for id in ids {
-            if let Err(error) = self.cleanup_controller(id).await
-                && first.is_none()
-            {
-                first = Some(error);
-            }
+            let cleaned = match self.cleanup_controller(id).await {
+                Ok(()) => true,
+                Err(error) => {
+                    first.get_or_insert(error);
+                    false
+                }
+            };
             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(entry) = state.entries.get_mut(&id) {
                 if entry.row.status_projection().is_pending() {
@@ -2101,6 +2209,10 @@ impl ExecutionRegistry {
                 }
                 if let Some(buffer) = &mut entry.buffer {
                     buffer.closed = true;
+                    if cleaned && buffer.is_private() {
+                        buffer.clear_private();
+                        entry.released = true;
+                    }
                 } else {
                     entry.released = entry.controller.is_none()
                         && entry.subordinate_cleanups.is_empty()

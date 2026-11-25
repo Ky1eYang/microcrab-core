@@ -1,8 +1,169 @@
 //! HTTP-only remote-image fallback fixtures. No provider credentials or uploads.
 use super::*;
 use microcrab_session::protocol::{ImageSource, InputPart};
-use microcrab_transport::{ContentItem, ImageUrlResolver, MediaProjection};
+use microcrab_transport::{
+    ContentItem, HostedImageHint, ImageHintRevocation, ImageUpload, ImageUploadError,
+};
 use serde_json::{Value, json};
+use std::{
+    sync::atomic::{AtomicUsize, Ordering},
+    time::SystemTime,
+};
+
+const FRESH: ToolImagePosition = ToolImagePosition { item: 0, part: 0 };
+const INLINE: &str = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAAAAAAAA";
+const HINT: &str = "https://loopback-media.invalid/image?private=0";
+fn scope() -> ImageHostingScope {
+    ImageHostingScope {
+        route: "loopback/model".into(),
+        authority: "owner".into(),
+    }
+}
+fn config() -> ImageHostingConfig {
+    ImageHostingConfig {
+        scope: scope(),
+        allowed_hosts: vec!["loopback-media.invalid".into()],
+        max_hint_ttl: Duration::from_secs(60),
+    }
+}
+fn enable(client: RetryingClient) -> (RetryingClient, Arc<UrlHint>) {
+    let uploader = Arc::new(UrlHint::default());
+    (
+        client
+            .with_image_hosting(config(), uploader.clone())
+            .unwrap(),
+        uploader,
+    )
+}
+fn grant<'a>(client: &'a RetryingClient, canonical: &'a Content) -> ImageHostingGrant<'a> {
+    client
+        .authorize_image_hosting(&scope(), canonical, &[FRESH])
+        .unwrap()
+}
+
+const SUCCESS: &str =
+    r#"{"choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}"#;
+const REJECTION: &str =
+    r#"{"error":{"code":"failed_to_download_image","message":"private upstream body"}}"#;
+
+#[tokio::test]
+async fn configured_route_without_grant_never_uploads_historical_data() {
+    let (endpoint, server) =
+        serve(vec![http(200, SUCCESS, false), http(200, SUCCESS, false)]).await;
+    let (client, uploader) = enable(client(endpoint, 0, 1000));
+    let canonical = media_content();
+    let mut invalid = media_content();
+    let ContentItem::Tool { parts, .. } = &mut invalid.items[0] else {
+        unreachable!()
+    };
+    parts[0] = InputPart::Image {
+        source: ImageSource::Data {
+            media_type: "image/png".into(),
+            data: vec![1, 2, 3],
+        },
+    };
+    assert!(
+        client
+            .authorize_image_hosting(&scope(), &invalid, &[FRESH])
+            .is_err()
+    );
+    client
+        .complete(
+            &canonical,
+            &NoopAuditor,
+            &EmptyVariableView,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    client
+        .stream(
+            &canonical,
+            &NoopAuditor,
+            &EmptyVariableView,
+            CancellationToken::new(),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(uploader.0.load(Ordering::SeqCst), 0);
+    for request in server.await.unwrap() {
+        assert_eq!(
+            request["messages"][2]["content"][1]["image_url"]["url"],
+            INLINE
+        );
+    }
+}
+
+#[tokio::test]
+async fn media_rejection_without_remaining_attempt_still_invalidates_the_hint() {
+    let (endpoint, server) =
+        serve(vec![http(400, REJECTION, false), http(200, SUCCESS, false)]).await;
+    let (mut client, uploader) = enable(client(endpoint, 0, 1000));
+    client.policy.attempts = 1;
+    let canonical = media_content();
+    for expected_success in [false, true] {
+        let result = client
+            .complete_with_image_hosting(
+                grant(&client, &canonical),
+                &NoopAuditor,
+                &EmptyVariableView,
+                CancellationToken::new(),
+            )
+            .await;
+        assert_eq!(result.is_ok(), expected_success);
+    }
+    let requests = server.await.unwrap();
+    assert_eq!(
+        requests[0]["messages"][2]["content"][1]["image_url"]["url"],
+        HINT
+    );
+    assert_eq!(
+        requests[1]["messages"][2]["content"][1]["image_url"]["url"],
+        "https://loopback-media.invalid/image?private=1"
+    );
+    assert_eq!(uploader.0.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn media_in_band_rejection_before_first_event_retries_inline() {
+    let error_event = format!("data: {REJECTION}\n\n");
+    let (endpoint, server) = serve(vec![
+        http(200, &error_event, true),
+        http(200, SUCCESS, false),
+    ])
+    .await;
+    let (client, uploader) = enable(client(endpoint, 0, 1000));
+    let canonical = media_content();
+    let (sender, mut received) = mpsc::channel(4);
+    let response = client
+        .stream_with_image_hosting(
+            grant(&client, &canonical),
+            &NoopAuditor,
+            &EmptyVariableView,
+            CancellationToken::new(),
+            Some(sender),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.content, "ok");
+    assert!(matches!(received.try_recv(), Ok(ModelEvent::TextDelta { text }) if text == "ok"));
+    assert!(matches!(
+        received.try_recv(),
+        Ok(ModelEvent::Finished { .. })
+    ));
+    assert!(received.try_recv().is_err());
+    let requests = server.await.unwrap();
+    assert_eq!(
+        requests[0]["messages"][2]["content"][1]["image_url"]["url"],
+        HINT
+    );
+    assert_eq!(
+        requests[1]["messages"][2]["content"][1]["image_url"]["url"],
+        INLINE
+    );
+    assert_eq!(uploader.0.load(Ordering::SeqCst), 1);
+}
 
 #[tokio::test]
 async fn media_fallback_consumes_the_configured_total_attempt_budget() {
@@ -11,14 +172,13 @@ async fn media_fallback_consumes_the_configured_total_attempt_budget() {
             let rejection = r#"{"error":{"code":"failed_to_download_image"}}"#;
             let (endpoint, server) =
                 serve((0..attempts).map(|_| http(400, rejection, false)).collect()).await;
-            let mut client = client(endpoint, 0, 1000)
-                .with_media_projection(Arc::new(MediaProjection::new(Arc::new(UrlHint), true)));
+            let (mut client, _) = enable(client(endpoint, 0, 1000));
             client.policy.attempts = attempts;
             let canonical = media_content();
             let result = if streaming {
                 client
-                    .stream(
-                        &canonical,
+                    .stream_with_image_hosting(
+                        grant(&client, &canonical),
                         &NoopAuditor,
                         &EmptyVariableView,
                         CancellationToken::new(),
@@ -27,8 +187,8 @@ async fn media_fallback_consumes_the_configured_total_attempt_budget() {
                     .await
             } else {
                 client
-                    .complete(
-                        &canonical,
+                    .complete_with_image_hosting(
+                        grant(&client, &canonical),
                         &NoopAuditor,
                         &EmptyVariableView,
                         CancellationToken::new(),
@@ -41,24 +201,40 @@ async fn media_fallback_consumes_the_configured_total_attempt_budget() {
             if attempts == 2 {
                 assert_eq!(
                     requests[1]["messages"][2]["content"][1]["image_url"]["url"],
-                    "data:image/png;base64,AQID"
+                    INLINE
                 );
             }
         }
     }
 }
 
-struct UrlHint;
+#[derive(Default)]
+struct UrlHint(AtomicUsize);
 #[async_trait::async_trait]
 impl ImageUrlResolver for UrlHint {
     async fn upload(
         &self,
-        _: &str,
-        _: &[u8],
+        upload_scope: &ImageHostingScope,
+        image: ImageUpload,
         _: CancellationToken,
-    ) -> Result<Option<String>, Error> {
-        Ok(Some("https://example.invalid/image?private=secret".into()))
+    ) -> Result<Option<HostedImageHint>, ImageUploadError> {
+        assert!(upload_scope == &scope());
+        assert_eq!(image.media_type, "image/png");
+        assert_eq!(image.data, png());
+        let generation = self.0.fetch_add(1, Ordering::SeqCst);
+        Ok(Some(HostedImageHint {
+            url: format!("https://loopback-media.invalid/image?private={generation}"),
+            expires_at: SystemTime::now() + Duration::from_secs(30),
+            revocation: ImageHintRevocation::ExpiresOnly,
+        }))
     }
+}
+fn png() -> Vec<u8> {
+    let mut bytes = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
+    bytes.extend_from_slice(&1u32.to_be_bytes());
+    bytes.extend_from_slice(&1u32.to_be_bytes());
+    bytes.extend_from_slice(&[8, 2, 0, 0, 0, 0, 0, 0, 0]);
+    bytes
 }
 fn media_content() -> Content {
     let mut content = content();
@@ -69,7 +245,7 @@ fn media_content() -> Content {
         parts: vec![InputPart::Image {
             source: ImageSource::Data {
                 media_type: "image/png".into(),
-                data: vec![1, 2, 3],
+                data: png(),
             },
         }],
     });
@@ -130,59 +306,90 @@ async fn serve(responses: Vec<String>) -> (String, tokio::task::JoinHandle<Vec<V
     (endpoint, server)
 }
 #[tokio::test]
-async fn typed_http_rejection_retries_once_with_canonical_data_and_actual_sent_audits() {
-    use microcrab_auditor::ChannelAuditor;
+async fn typed_http_rejection_retries_once_with_canonical_data_and_metadata_only_audits() {
+    use microcrab_auditor::{AuditRecord, ChannelAuditor};
+    struct MetadataOnly(ChannelAuditor);
+    impl Auditor for MetadataOnly {
+        fn is_enabled(&self) -> bool {
+            self.0.is_enabled()
+        }
+        fn publish(&self, moment: Moment, body: AuditBody) {
+            self.0.publish(moment, body);
+        }
+        fn intervene<'a>(
+            &'a self,
+            _: Moment,
+            _: HookContext<'a>,
+        ) -> BoxFuture<'a, Result<Injection, microcrab_auditor::AuditorError>> {
+            panic!("hosted attempts must bypass the wire-body hook");
+        }
+    }
     for streaming in [false, true] {
-        let rejection =
-            r#"{"error":{"code":"failed_to_download_image","message":"private upstream body"}}"#;
-        let success = r#"{"choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}"#;
         let (endpoint, server) =
-            serve(vec![http(400, rejection, false), http(200, success, false)]).await;
-        let client = client(endpoint, 0, 1000)
-            .with_media_projection(Arc::new(MediaProjection::new(Arc::new(UrlHint), true)));
-        let (sender, mut records) = mpsc::unbounded_channel();
-        let auditor = ChannelAuditor::from_sender(sender);
+            serve(vec![http(400, REJECTION, false), http(200, SUCCESS, false)]).await;
+        let (client, _) = enable(client(endpoint, 0, 1000));
+        let (sender, mut records) = mpsc::unbounded_channel::<AuditRecord>();
+        let auditor = MetadataOnly(ChannelAuditor::from_sender(sender));
         let canonical = media_content();
-        let response = if streaming {
-            client
-                .stream(
-                    &canonical,
+        let attempt = if streaming {
+            let outcome = client
+                .stream_with_image_hosting_outcome(
+                    grant(&client, &canonical),
                     &auditor,
                     &EmptyVariableView,
                     CancellationToken::new(),
                     None,
                 )
                 .await
+                .unwrap();
+            assert_eq!(outcome.response.content, "ok");
+            Some(outcome.attempt.unwrap())
         } else {
-            client
-                .complete(
-                    &canonical,
+            let response = client
+                .complete_with_image_hosting(
+                    grant(&client, &canonical),
                     &auditor,
                     &EmptyVariableView,
                     CancellationToken::new(),
                 )
                 .await
+                .unwrap();
+            assert_eq!(response.content, "ok");
+            None
         };
-        assert_eq!(response.unwrap().content, "ok");
         let requests = server.await.unwrap();
         assert_eq!(requests.len(), 2);
         assert_eq!(
             requests[0]["messages"][2]["content"][1]["image_url"]["url"],
-            "https://example.invalid/image?private=secret"
+            HINT
         );
         assert_eq!(
             requests[1]["messages"][2]["content"][1]["image_url"]["url"],
-            "data:image/png;base64,AQID"
+            INLINE
         );
         assert_eq!(requests[0]["messages"][0], requests[1]["messages"][0]);
-        for request in &requests {
+        for number in 0..requests.len() {
             let prepared = records.try_recv().unwrap();
             let terminal = records.try_recv().unwrap();
             assert_eq!(prepared.call_id, terminal.call_id);
-            assert_eq!(
-                serde_json::from_str::<Value>(prepared.sent_request.as_deref().unwrap()).unwrap(),
-                *request
-            );
+            assert!(prepared.sent_request.is_none());
+            assert!(terminal.response.is_none() && terminal.response_bytes.is_none());
+            assert!(matches!(
+                terminal.payload,
+                microcrab_auditor::HookPayload::None
+            ));
+            assert!(terminal.response_status.is_some());
+            assert!(terminal.outcome.is_some());
+            if number == 0 {
+                assert!(terminal.response_completed_at_ms.is_none());
+                if let Some(attempt) = &attempt {
+                    assert_ne!(terminal.call_id.as_deref(), Some(attempt.call_id.as_str()));
+                }
+            } else if let Some(attempt) = &attempt {
+                let completed = attempt.response_completed_at_ms.unwrap().get();
+                assert_eq!(terminal.call_id.as_deref(), Some(attempt.call_id.as_str()));
+                assert_eq!(terminal.response_completed_at_ms, Some(completed));
+            }
         }
         assert!(records.try_recv().is_err());
         assert!(
@@ -211,11 +418,10 @@ async fn generic_errors_and_repeated_typed_rejection_never_trigger_more_media_re
     ] {
         let (endpoint, server) =
             serve((0..count).map(|_| http(status, &body, false)).collect()).await;
-        let client = client(endpoint, 0, 1000)
-            .with_media_projection(Arc::new(MediaProjection::new(Arc::new(UrlHint), true)));
+        let (client, _) = enable(client(endpoint, 0, 1000));
         let result = client
-            .stream(
-                &media_content(),
+            .stream_with_image_hosting(
+                grant(&client, &media_content()),
                 &NoopAuditor,
                 &EmptyVariableView,
                 CancellationToken::new(),
@@ -254,12 +460,11 @@ async fn in_band_fetch_error_after_a_published_delta_is_not_replayed() {
                 .is_err()
         );
     });
-    let client = client(endpoint, 0, 1000)
-        .with_media_projection(Arc::new(MediaProjection::new(Arc::new(UrlHint), true)));
+    let (client, _) = enable(client(endpoint, 0, 1000));
     let (sender, mut receiver) = mpsc::channel(16);
     let canonical = media_content();
-    let request = client.stream(
-        &canonical,
+    let request = client.stream_with_image_hosting(
+        grant(&client, &canonical),
         &NoopAuditor,
         &EmptyVariableView,
         CancellationToken::new(),
@@ -274,6 +479,6 @@ async fn in_band_fetch_error_after_a_published_delta_is_not_replayed() {
     })
     .await
     .unwrap();
-    assert!(result.is_err());
+    assert!(result.unwrap_err().is_remote_image_fetch_rejection());
     server.await.unwrap();
 }

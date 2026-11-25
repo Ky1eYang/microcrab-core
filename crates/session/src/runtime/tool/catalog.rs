@@ -3,12 +3,42 @@
 mod media_tests;
 #[cfg(test)]
 mod schema_tests;
+mod text_arguments;
 use super::*;
 use microcrab_protocol::ToolCall;
 use std::collections::BTreeMap;
+enum Implementation {
+    Builtin(BuiltinTool, Arc<dyn Tool>),
+    Wasm(Arc<dyn Tool>),
+    External(Arc<dyn Tool>),
+    DialogueReply(DialogueReplyRegistration),
+}
+impl Implementation {
+    fn registration(&self) -> ToolRegistration {
+        match self {
+            Self::Builtin(kind, _) => ToolRegistration::Builtin(*kind),
+            Self::Wasm(tool) => ToolRegistration::Wasm(tool.clone()),
+            Self::External(tool) => ToolRegistration::External(tool.clone()),
+            Self::DialogueReply(effect) => ToolRegistration::DialogueReply(effect.clone()),
+        }
+    }
+    fn origin(&self) -> ToolOrigin {
+        match self {
+            Self::Builtin(..) => ToolOrigin::Builtin,
+            Self::Wasm(_) => ToolOrigin::Wasm,
+            Self::External(_) => ToolOrigin::External,
+            Self::DialogueReply(_) => ToolOrigin::DialogueReply,
+        }
+    }
+    fn tool(&self) -> Option<&dyn Tool> {
+        match self {
+            Self::Builtin(_, tool) | Self::Wasm(tool) | Self::External(tool) => Some(tool.as_ref()),
+            Self::DialogueReply(_) => None,
+        }
+    }
+}
 struct Entry {
-    origin: ToolOrigin,
-    tool: Arc<dyn Tool>,
+    implementation: Implementation,
     definition: ToolDefinition,
     schema: jsonschema::Validator,
     media_output_bytes: usize,
@@ -21,22 +51,48 @@ impl ToolRegistry {
     pub(crate) fn new(tools: Vec<ToolRegistration>) -> Result<Self, Error> {
         let mut entries = BTreeMap::new();
         for registration in tools {
-            let origin = registration.origin();
-            let tool = registration.tool();
-            let definition = tool.definition();
-            let media_output_bytes = tool.media_output_bytes();
-            let secret_delivery = match &registration {
-                ToolRegistration::Builtin(BuiltinTool::Job) => SecretDelivery::Resolve,
-                ToolRegistration::Builtin(_) => SecretDelivery::ForwardPlaceholders,
-                ToolRegistration::Wasm(_) => SecretDelivery::Resolve,
-                ToolRegistration::External(_) => tool.secret_delivery(),
+            let implementation = match registration {
+                ToolRegistration::Builtin(kind) => {
+                    Implementation::Builtin(kind, kind.implementation())
+                }
+                ToolRegistration::Wasm(tool) => Implementation::Wasm(tool),
+                ToolRegistration::External(tool) => Implementation::External(tool),
+                ToolRegistration::DialogueReply(effect) => Implementation::DialogueReply(effect),
+            };
+            let (definition, media_output_bytes, secret_delivery) = match &implementation {
+                Implementation::DialogueReply(effect) => (
+                    effect.definition.clone(),
+                    0,
+                    SecretDelivery::ForwardPlaceholders,
+                ),
+                Implementation::Builtin(kind, tool) => (
+                    tool.definition(),
+                    tool.media_output_bytes(),
+                    if *kind == BuiltinTool::Job {
+                        SecretDelivery::Resolve
+                    } else {
+                        SecretDelivery::ForwardPlaceholders
+                    },
+                ),
+                Implementation::Wasm(tool) => (
+                    tool.definition(),
+                    tool.media_output_bytes(),
+                    SecretDelivery::Resolve,
+                ),
+                Implementation::External(tool) => (
+                    tool.definition(),
+                    tool.media_output_bytes(),
+                    tool.secret_delivery(),
+                ),
             };
             crate::budget::check(
                 crate::LimitKind::AttachmentBytes,
                 media_output_bytes,
                 crate::admission::image::MAX_IMAGE_BYTES,
             )?;
-            if origin != ToolOrigin::Builtin && BuiltinTool::from_name(&definition.name).is_some() {
+            if implementation.origin() != ToolOrigin::Builtin
+                && BuiltinTool::from_name(&definition.name).is_some()
+            {
                 return Err(Error::config_with_private(
                     "builtin tool name is reserved",
                     format!("builtin tool name is reserved: {}", definition.name),
@@ -63,8 +119,7 @@ impl ToolRegistry {
                 .insert(
                     name.clone(),
                     Entry {
-                        origin,
-                        tool,
+                        implementation,
                         definition,
                         schema,
                         media_output_bytes,
@@ -84,35 +139,32 @@ impl ToolRegistry {
     pub(crate) fn for_conversation(
         &self,
         identity: Option<&crate::state::communication::ConversationIdentity>,
-        external_dialogue_replies: bool,
+        interactive_root: bool,
     ) -> Result<Self, Error> {
+        use crate::state::communication::SessionInteraction;
+        let persistent =
+            identity.filter(|identity| identity.interaction == SessionInteraction::Persistent);
+        let reply_eligible =
+            interactive_root && persistent.is_some_and(|identity| identity.depth == 0);
         let mut registrations = self
             .entries
-            .iter()
-            .filter_map(|(name, entry)| {
-                if matches!(
-                    name.as_str(),
-                    "send_message" | "escalate" | super::external_dialogue::NAME
-                ) {
-                    return None;
+            .values()
+            .filter_map(|entry| match &entry.implementation {
+                Implementation::Builtin(BuiltinTool::SendMessage | BuiltinTool::Escalate, _) => {
+                    None
                 }
-                if name == "delegate" && identity.is_some_and(|identity| identity.depth != 0) {
-                    return None;
+                Implementation::Builtin(BuiltinTool::Delegate, _)
+                    if identity.is_some_and(|id| id.depth != 0) =>
+                {
+                    None
                 }
-                Some(match entry.origin {
-                    ToolOrigin::Builtin => ToolRegistration::Builtin(BuiltinTool::from_name(name)?),
-                    ToolOrigin::Wasm => ToolRegistration::Wasm(entry.tool.clone()),
-                    ToolOrigin::External => ToolRegistration::External(entry.tool.clone()),
-                })
+                Implementation::Builtin(BuiltinTool::ViewImage, _) if !interactive_root => None,
+                Implementation::DialogueReply(_) if !reply_eligible => None,
+                implementation => Some(implementation.registration()),
             })
             .collect::<Vec<_>>();
-        if let Some(identity) = identity.filter(|identity| {
-            identity.interaction == crate::state::communication::SessionInteraction::Persistent
-        }) {
+        if let Some(identity) = persistent {
             registrations.push(ToolRegistration::Builtin(BuiltinTool::SendMessage));
-            if identity.depth == 0 && external_dialogue_replies {
-                registrations.push(ToolRegistration::Builtin(BuiltinTool::ReplyExternalSpeaker));
-            }
             if identity.depth == 1 {
                 registrations.push(ToolRegistration::Builtin(BuiltinTool::Escalate));
             }
@@ -122,23 +174,74 @@ impl ToolRegistry {
     pub(crate) fn replacing_external(&self, external: Vec<Arc<dyn Tool>>) -> Result<Self, Error> {
         let mut registrations = self
             .entries
-            .iter()
-            .filter_map(|(name, entry)| match entry.origin {
-                ToolOrigin::Builtin => BuiltinTool::from_name(name).map(ToolRegistration::Builtin),
-                ToolOrigin::Wasm => Some(ToolRegistration::Wasm(entry.tool.clone())),
-                ToolOrigin::External => None,
+            .values()
+            .filter_map(|entry| match &entry.implementation {
+                Implementation::External(_) => None,
+                implementation => Some(implementation.registration()),
             })
             .collect::<Vec<_>>();
         registrations.extend(external.into_iter().map(ToolRegistration::External));
         Self::new(registrations)
     }
+    pub(crate) fn validate_model_owner(
+        &self,
+        owner: &dyn crate::ModelAdmission,
+    ) -> Result<(), Error> {
+        let canonical = owner.dialogue_reply();
+        if owner
+            .retired_tool_names()
+            .contains(&canonical.definition.name.as_str())
+            || self.entries.iter().any(|(name, entry)| {
+                owner.retired_tool_names().contains(&name.as_str())
+                    || match &entry.implementation {
+                        Implementation::DialogueReply(effect) => {
+                            effect.admission_identity() != canonical.admission_identity()
+                        }
+                        _ => *name == canonical.definition.name,
+                    }
+            })
+        {
+            return Err(Error::IncompatibleModelCatalog);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn replacing_dialogue_reply(
+        &self,
+        owner: &dyn crate::ModelAdmission,
+        effect: Option<&DialogueReplyRegistration>,
+    ) -> Result<Self, Error> {
+        self.validate_model_owner(owner)?;
+        if effect.is_some_and(|effect| {
+            effect.admission_identity() != owner.dialogue_reply().admission_identity()
+        }) {
+            return Err(Error::IncompatibleModelCatalog);
+        }
+        let mut registrations = self
+            .entries
+            .values()
+            .filter_map(|entry| match &entry.implementation {
+                Implementation::DialogueReply(_) => None,
+                implementation => Some(implementation.registration()),
+            })
+            .collect::<Vec<_>>();
+        registrations.extend(effect.cloned().map(ToolRegistration::DialogueReply));
+        Self::new(registrations)
+    }
+
     pub(crate) fn provider_defaults(&self) -> Result<Vec<crate::policy::Permission>, Error> {
         let mut rules = Vec::new();
         for (name, entry) in &self.entries {
-            if entry.origin == ToolOrigin::Builtin {
+            if entry.implementation.origin() == ToolOrigin::Builtin {
                 continue;
             }
-            for mut rule in entry.tool.permission_defaults() {
+            let defaults = match &entry.implementation {
+                Implementation::DialogueReply(effect) => effect.defaults.clone(),
+                implementation => implementation
+                    .tool()
+                    .map_or_else(Vec::new, Tool::permission_defaults),
+            };
+            for mut rule in defaults {
                 if rule
                     .tool
                     .as_ref()
@@ -157,15 +260,54 @@ impl ToolRegistry {
     pub(crate) fn origins(&self) -> Vec<(String, ToolOrigin)> {
         self.entries
             .iter()
-            .map(|(name, entry)| (name.clone(), entry.origin))
+            .map(|(name, entry)| (name.clone(), entry.implementation.origin()))
             .collect()
     }
-    pub(crate) fn component(&self, name: &str) -> Option<String> {
-        self.entries
-            .get(name)?
-            .tool
-            .component_identity()
-            .map(str::to_owned)
+    pub(crate) fn interaction_presentation(
+        &self,
+        name: &str,
+    ) -> Option<microcrab_auditor::ToolPresentation> {
+        use microcrab_auditor::ToolPresentation;
+        let entry = self.entries.get(name)?;
+        match &entry.implementation {
+            Implementation::Builtin(BuiltinTool::ViewImage, _) => Some(ToolPresentation::ViewImage),
+            Implementation::Builtin(BuiltinTool::SendMessage | BuiltinTool::Escalate, _) => {
+                Some(ToolPresentation::MessageReceipt)
+            }
+            #[cfg(feature = "wasm")]
+            Implementation::Wasm(tool) if tool.file_version_host().is_some() => {
+                const FILE_VERSION_PATTERN: &str =
+                    "^(fv_([a-f0-9]{16}|[a-f0-9]{20}|[a-f0-9]{24})|[a-fA-F0-9]{64})$";
+                let schema = &entry.definition.parameters;
+                let known = match name {
+                    "read" => super::short_model_refs(std::slice::from_ref(&entry.definition)),
+                    "write" | "edit" | "patch" => schema
+                        .pointer("/properties/expected_version/pattern")
+                        .and_then(Value::as_str) == Some(FILE_VERSION_PATTERN),
+                    "apply_patch" => schema
+                        .pointer("/properties/preconditions/items/properties/expected/oneOf/1/properties/version/pattern")
+                        .and_then(Value::as_str) == Some(FILE_VERSION_PATTERN),
+                    _ => false,
+                };
+                known.then_some(ToolPresentation::CodingFile)
+            }
+            _ => None,
+        }
+    }
+
+    pub(crate) fn admission_identity(&self, name: &str) -> Option<String> {
+        match &self.entries.get(name)?.implementation {
+            Implementation::DialogueReply(effect) => Some(effect.admission_identity().to_owned()),
+            implementation => implementation
+                .tool()?
+                .component_identity()
+                .map(str::to_owned),
+        }
+    }
+    pub(crate) fn dialogue_reply_is_registered(&self, name: &str, identity: &str) -> bool {
+        self.entries.get(name).is_some_and(|entry| {
+            matches!(&entry.implementation, Implementation::DialogueReply(effect) if effect.admission_identity() == identity)
+        })
     }
     /// Snapshot captured at registration, never derived from tool names or arguments.
     pub(crate) fn media_output_bytes(&self, name: &str) -> usize {
@@ -175,26 +317,59 @@ impl ToolRegistry {
     }
 
     pub(crate) fn origin(&self, name: &str) -> Option<ToolOrigin> {
-        self.entries.get(name).map(|entry| entry.origin)
+        self.entries
+            .get(name)
+            .map(|entry| entry.implementation.origin())
     }
     #[cfg(feature = "wasm")]
     pub(crate) fn wasm_lifecycles(&self) -> Vec<super::super::wasm::AgentLifecycle> {
         let mut seen = std::collections::HashSet::new();
         self.entries
             .values()
-            .filter_map(|entry| {
-                (entry.origin == ToolOrigin::Wasm)
-                    .then(|| entry.tool.wasm_lifecycle())
-                    .flatten()
+            .filter_map(|entry| match &entry.implementation {
+                Implementation::Wasm(tool) => tool.wasm_lifecycle(),
+                _ => None,
             })
             .filter(|lifecycle| seen.insert(lifecycle.identity()))
             .collect()
     }
+    pub(crate) fn tool_names(&self) -> impl ExactSizeIterator<Item = &str> {
+        self.entries.keys().map(String::as_str)
+    }
+
+    pub(crate) fn tool_descriptions(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.entries.values().map(|entry| {
+            (
+                entry.definition.name.as_str(),
+                entry.definition.description.as_str(),
+            )
+        })
+    }
+
     pub(crate) fn definitions(&self) -> Vec<ToolDefinition> {
         self.entries
             .values()
             .map(|e| e.definition.clone())
             .collect()
+    }
+    #[cfg(feature = "wasm")]
+    pub(crate) async fn bind_file_versions(
+        &self,
+        call: &ToolCall,
+        invocation: &mut ToolContext,
+    ) -> Result<(), Error> {
+        if let Some(Entry {
+            implementation: Implementation::Wasm(tool),
+            ..
+        }) = self.entries.get(&call.name)
+            && let Some(host) = tool.file_version_host()
+        {
+            invocation.file_version_policy_arguments =
+                super::super::wasm::bind_file_version_arguments(host, invocation, &call.arguments)
+                    .await?
+                    .map(Arc::new);
+        }
+        Ok(())
     }
     pub(crate) fn resolve_call(
         &self,
@@ -205,10 +380,63 @@ impl ToolRegistry {
             .entries
             .get(&call.name)
             .ok_or_else(|| Error::tool("unknown tool"))?;
-        secret::resolve(call, invocation, entry.secret_delivery, |resolved| {
-            self.validate_inner(resolved, false)
+        let delivery = if self.uses_literal_sources(call) {
+            SecretDelivery::ForwardPlaceholders
+        } else {
+            entry.secret_delivery
+        };
+        let image_witness = invocation
+            .image_source
+            .as_ref()
+            .map(|source| source.policy_arguments());
+        secret::resolve(call, invocation, delivery, |resolved| {
+            if let Some(expected) = image_witness {
+                if !matches!(
+                    &entry.implementation,
+                    Implementation::Builtin(BuiltinTool::ViewImage, _)
+                ) || expected != resolved.arguments
+                {
+                    return Err(Error::denied("approved image source differs from dispatch"));
+                }
+                Ok(())
+            } else {
+                self.validate_inner(resolved, false)
+            }
         })
     }
+    #[cfg(feature = "wasm")]
+    pub(crate) fn apply_glob_path_default(&self, call: &mut ToolCall) {
+        let Some(entry) = self.entries.get(&call.name) else {
+            return;
+        };
+        if let Implementation::Wasm(tool) = &entry.implementation
+            && tool.uses_glob_path_default()
+            && let Some(args) = call.arguments.as_object_mut()
+        {
+            args.entry("ignored_list")
+                .or_insert_with(|| Value::String(GLOB_PATH_DEFAULT.into()));
+        }
+    }
+
+    pub(crate) fn uses_literal_sources(&self, call: &ToolCall) -> bool {
+        #[cfg(feature = "wasm")]
+        if let Some(entry) = self.entries.get(&call.name)
+            && let Implementation::Wasm(tool) = &entry.implementation
+            && tool.uses_literal_sources()
+        {
+            return true;
+        }
+        self.origin(&call.name) == Some(ToolOrigin::Builtin)
+            && (call.name == super::view_image::NAME
+                || (call.name == "job"
+                    && crate::runtime::execution::job::is_redirect(&call.arguments)))
+    }
+    pub(crate) fn convert_text_arguments(&self, call: &mut ToolCall) -> usize {
+        self.entries.get(&call.name).map_or(0, |entry| {
+            text_arguments::convert(&entry.definition.parameters, &mut call.arguments)
+        })
+    }
+
     pub(crate) fn validate(&self, call: &ToolCall) -> Result<(), Error> {
         self.validate_inner(call, true)
     }
@@ -217,7 +445,9 @@ impl ToolRegistry {
             .entries
             .get(&call.name)
             .ok_or_else(|| Error::tool("unknown tool"))?;
-        let defer = permit_placeholders && entry.secret_delivery == SecretDelivery::Resolve;
+        let defer = permit_placeholders
+            && entry.secret_delivery == SecretDelivery::Resolve
+            && !self.uses_literal_sources(call);
         if let Some(error) = entry
             .schema
             .iter_errors(&call.arguments)
@@ -234,8 +464,14 @@ impl ToolRegistry {
             diagnostic.effects = crate::observation::diagnostics::EffectKnowledge::NotStarted;
             return Err(Error::Diagnostic(diagnostic));
         }
-        if entry.origin == ToolOrigin::Builtin && call.name == "expand" {
-            super::expand::validate_selectors(&call.arguments)?;
+        match &entry.implementation {
+            Implementation::Builtin(BuiltinTool::Expand, _) => {
+                super::expand::validate_selectors(&call.arguments)?
+            }
+            Implementation::DialogueReply(_) => {
+                DialogueReplyRequest::decode(&call.arguments)?;
+            }
+            _ => {}
         }
         Ok(())
     }
@@ -243,24 +479,30 @@ impl ToolRegistry {
         &self,
         call: &ToolCall,
         invocation: ToolContext,
+        reply_owner: Option<Arc<dyn DialogueReplyOwner>>,
     ) -> Result<ToolOutput, Error> {
         let entry = self
             .entries
             .get(&call.name)
             .ok_or_else(|| Error::tool("unknown tool"))?;
+        let tool = match &entry.implementation {
+            Implementation::DialogueReply(effect) => {
+                return effect.dispatch(call, invocation, reply_owner).await;
+            }
+            implementation => implementation
+                .tool()
+                .ok_or_else(|| Error::config("missing tool implementation"))?,
+        };
         invocation
-            .ensure_admitted(entry.tool.component_identity())
+            .ensure_admitted(tool.component_identity())
             .and_then(|()| invocation.ensure_admitted_arguments(&call.arguments))
             .map_err(|error| error.into_runtime_error())?;
-        // Reply owns its one-shot dispatch at the Session mutation boundary.
-        if entry.origin != ToolOrigin::Wasm
-            && !matches!(call.name.as_str(), "job" | super::external_dialogue::NAME)
-        {
+        if entry.implementation.origin() != ToolOrigin::Wasm && call.name != "job" {
             invocation
-                .begin_dispatch(entry.tool.component_identity())
+                .begin_dispatch(tool.component_identity())
                 .map_err(|error| error.into_runtime_error())?;
         }
-        entry.tool.execute(call.arguments.clone(), invocation).await
+        tool.execute(call.arguments.clone(), invocation).await
     }
 }
 fn deferred_string_constraint(error: &jsonschema::error::ValidationError<'_>) -> bool {
@@ -305,7 +547,23 @@ fn schema_reason(error: &jsonschema::error::ValidationError<'_>) -> String {
     use microcrab_protocol::diagnostic::{describe, sanitize};
     let cause = match &error.kind {
         K::Type { kind } => {
-            let mut cause = format!("expected type {kind:?}");
+            let received = match error.instance.as_ref() {
+                Value::Null => "null",
+                Value::Bool(_) => "boolean",
+                Value::Number(_) => "number",
+                Value::String(_) => "string",
+                Value::Array(_) => "array",
+                Value::Object(_) => "object",
+            };
+            let mut cause = format!("expected type {kind:?}, received JSON {received}");
+            if matches!(error.instance.as_ref(), Value::Number(_))
+                && matches!(
+                    kind,
+                    jsonschema::error::TypeKind::Single(jsonschema::JsonType::String)
+                )
+            {
+                cause.push_str("; pass a JSON string, not a number. Copy any opaque reference exactly from its source; do not convert numeric notation or guess a value");
+            }
             if error.instance.is_null() {
                 cause.push_str(
                     "; explicit null is invalid here; provide the required non-null value, or omit an unused optional field",

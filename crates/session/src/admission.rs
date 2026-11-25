@@ -5,6 +5,7 @@ pub mod image;
 pub(crate) mod inbox;
 pub(crate) mod input;
 mod measurement;
+pub(crate) mod model;
 pub(crate) mod variables;
 
 use crate::{Error, LimitKind};

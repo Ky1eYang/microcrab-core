@@ -112,9 +112,7 @@ fn injected_strings_are_literal_and_nonempty_valid_templates_are_required() {
         render(DEFAULT_SYSTEM, None).unwrap()
     );
     let rendered = render(DEFAULT_SYSTEM, None).unwrap();
-    assert!(rendered.contains("**variable-injection**"));
-    assert!(rendered.contains("{{var:KEY}}"));
-    assert!(rendered.contains("{{secret:KEY}}"));
+    assert_variable_injection_hint_is_rendered(&rendered);
     assert!(!rendered.contains("{{ \""));
     for template in [
         " \n\t",
@@ -170,6 +168,16 @@ fn arbitrary_structured_agent_values_render_exactly_without_stringification_or_a
 
 fn assert_variable_injection_hint_is_rendered(rendered: &str) {
     assert_eq!(rendered.matches("**variable-injection**").count(), 1);
+    assert_eq!(rendered.matches("**private-bytes**").count(), 1);
+    for guidance in [
+        "If the producer advertises private byte capture",
+        "Never use job read for private bytes",
+        "Release the source Job after redirect is confirmed",
+        r#"{"image_url":"{{var:base64:preview}}"}"#,
+        "Do not repeat the same invalid arguments",
+    ] {
+        assert!(rendered.contains(guidance), "{guidance}");
+    }
     let mut without_grammar = rendered.to_owned();
     for placeholder in [
         "{{var:KEY}}",
@@ -178,6 +186,9 @@ fn assert_variable_injection_hint_is_rendered(rendered: &str) {
         "{{var:number:KEY:/a/b}}",
         "{{var:boolean:KEY}}",
         "{{secret:KEY}}",
+        "{{var:base64:KEY}}",
+        "{{var:base64:@<selector>}}",
+        "{{var:base64:preview}}",
     ] {
         assert_eq!(rendered.matches(placeholder).count(), 1, "{placeholder}");
         without_grammar = without_grammar.replace(placeholder, "");

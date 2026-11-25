@@ -524,8 +524,11 @@ impl Writer {
                 }
                 Command::Close(reply) => {
                     let result = self.flush();
+                    // Close acknowledges release of the writer lease as well as
+                    // the flush. A caller may open the same archive immediately.
+                    drop(self);
                     let _ = reply.send(result);
-                    break;
+                    return;
                 }
             }
             if receiver.is_empty() {

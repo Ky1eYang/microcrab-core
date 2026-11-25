@@ -207,6 +207,29 @@ pub struct OutputMetadata {
     pub start_cursor: u64,
     pub end_cursor: u64,
     pub closed: bool,
+    /// Present only for private byte capture. Cursors in this record address
+    /// private stdout; the enclosing cursors continue to address public text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub private_stdout: Option<PrivateOutputMetadata>,
+}
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrivateOutputKind {
+    #[default]
+    Bytes,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PrivateOutputMetadata {
+    #[serde(default)]
+    pub kind: PrivateOutputKind,
+    pub channel: String,
+    pub media_type: String,
+    pub start_cursor: u64,
+    pub end_cursor: u64,
+    pub closed: bool,
+    pub truncated: bool,
+    pub available: bool,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -227,6 +250,9 @@ pub struct OutputPage {
     pub start_cursor: u64,
     pub closed: bool,
     pub revision: u64,
+    /// Metadata only: `chunks` always contains public UTF-8 text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub private_stdout: Option<PrivateOutputMetadata>,
 }
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -317,6 +343,79 @@ pub struct ExecutionSnapshot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result_available: Option<bool>,
 }
+/// Current model metadata, not an owner snapshot or an admission subject.
+/// Keep actionable metadata and opaque tool-call IDs; lifecycle attribution
+/// carries no internal component, generation, attempt or composite call ID.
+#[derive(Serialize)]
+pub(crate) struct ModelExecutionMetadata {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    subject: Option<ModelExecutionSubject>,
+    execution_id: ExecutionId,
+    session_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    call_id: Option<String>,
+    tool: String,
+    agent: String,
+    mode: Option<String>,
+    status: ExecutionStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    delegate_child: Option<DelegateChild>,
+    capabilities: ExecutionCapabilities,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    failure: Option<ToolFailure>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    diagnostic: Option<crate::observation::diagnostics::ToolDiagnostic>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output: Option<OutputMetadata>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    started_at_unix_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    elapsed_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_availability: Option<OutputAvailability>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    arguments_available: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    result_available: Option<bool>,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum ModelExecutionSubject {
+    AgentInit,
+}
+
+impl From<ExecutionSnapshot> for ModelExecutionMetadata {
+    fn from(row: ExecutionSnapshot) -> Self {
+        let (subject, call_id) = match row.subject {
+            crate::policy::InvocationSubject::Tool => (None, Some(row.call_id)),
+            crate::policy::InvocationSubject::AgentInit { .. } => {
+                (Some(ModelExecutionSubject::AgentInit), None)
+            }
+        };
+        Self {
+            subject,
+            execution_id: row.execution_id,
+            session_id: row.session_id,
+            call_id,
+            tool: row.tool,
+            agent: row.agent,
+            mode: row.mode,
+            status: row.status,
+            delegate_child: row.delegate_child,
+            capabilities: row.capabilities,
+            failure: row.failure,
+            diagnostic: row.diagnostic,
+            output: row.output,
+            started_at_unix_ms: row.started_at_unix_ms,
+            elapsed_ms: row.elapsed_ms,
+            output_availability: row.output_availability,
+            arguments_available: row.arguments_available,
+            result_available: row.result_available,
+        }
+    }
+}
+
 /// Bounded semantic observations. The Session sink must not reenter State or
 /// the registry: delivery runs under the registry observation fence.
 #[derive(Debug, Clone)]

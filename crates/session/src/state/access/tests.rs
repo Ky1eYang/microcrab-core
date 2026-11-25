@@ -403,7 +403,7 @@ fn policy_observed_state() -> (State, Arc<crate::policy::PermissionController>) 
 fn mode_transition_after_state_capture_retries_instead_of_mixing_old_prompt_and_new_policy() {
     let (state, controller) = policy_observed_state();
     let mut captures = 0;
-    let value = current_view(|| {
+    let value = current_view(true, || {
         captures += 1;
         let captured = state.inner.lock().unwrap().clone();
         if captures == 1 {
@@ -426,6 +426,12 @@ fn mode_transition_after_state_capture_retries_instead_of_mixing_old_prompt_and_
     assert_eq!(value["mode"], "build");
     assert_eq!(value["mode_prompt"], "Implement changes");
     assert_eq!(value["permission"][0]["action"], "allow");
+    assert!(state.view().unwrap().get("permission").is_none());
+    assert!(state.view_all().unwrap().get("permission").is_none());
+    let inspection = state.inspection().unwrap();
+    assert!(inspection.values.get("permission").is_none());
+    assert!(!inspection.descriptors.contains_key("permission"));
+    assert!(crate::admission::variables::is_reserved_key("permission"));
 }
 
 #[test]
@@ -433,7 +439,7 @@ fn incomplete_mode_transition_exhausts_only_bounded_observations_with_explicit_c
     let (state, controller) = policy_observed_state();
     controller.configure_mode("fixture", "build", &[]).unwrap();
     let mut captures = 0;
-    let error = current_view(|| {
+    let error = current_view(false, || {
         captures += 1;
         state.inner.lock().unwrap().clone()
     })
@@ -456,7 +462,7 @@ fn unavailable_policy_owner_is_not_retried_or_masked_as_transient_churn() {
     let (state, controller) = policy_observed_state();
     drop(controller);
     let mut captures = 0;
-    let error = current_view(|| {
+    let error = current_view(false, || {
         captures += 1;
         state.inner.lock().unwrap().clone()
     })

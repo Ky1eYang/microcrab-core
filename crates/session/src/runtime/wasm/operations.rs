@@ -6,16 +6,20 @@ mod review_tests;
 mod tests;
 
 pub(super) mod mutations;
+pub(super) mod versioned;
 mod abi {
-    pub(super) use super::super::microcrab::host::glob::{
+    pub(super) use super::super::microcrab::host0_1_0::glob::{
         GlobEntry, GlobEntryKind, GlobOutput, GlobRequest,
     };
-    pub(super) use super::super::microcrab::host::grep::{GrepMatch, GrepOutput, GrepRequest};
-    pub(super) use super::super::microcrab::host::text_read::{ReadOutput, ReadRequest};
-    pub(super) use super::super::microcrab::host::text_write::{
+    pub(super) use super::super::microcrab::host0_1_0::glob_ignore::{
+        GlobScanIncomplete, GlobScanReason, ResolvedGlobOutput,
+    };
+    pub(super) use super::super::microcrab::host0_1_0::grep::{GrepMatch, GrepOutput, GrepRequest};
+    pub(super) use super::super::microcrab::host0_1_0::text_read::{ReadOutput, ReadRequest};
+    pub(super) use super::super::microcrab::host0_1_0::text_write::{
         WriteOutput, WritePrecondition, WriteRequest,
     };
-    pub(super) use super::super::microcrab::host::tool_types::{
+    pub(super) use super::super::microcrab::host0_1_0::tool_types::{
         OperationError, OperationErrorCode,
     };
 }
@@ -480,11 +484,168 @@ pub(super) fn write(
     }
     finish(state, result)
 }
+const GLOB_IGNORED: &str = "glob_ignored";
+
+pub(super) fn glob_ignore_snapshot(
+    mut caller: StoreContextMut<'_, RuntimeState>,
+    (): (),
+) -> wasmtime::Result<(Result<String, abi::OperationError>,)> {
+    let state = caller.data_mut();
+    let result = (|| {
+        if !state
+            .tool_context
+            .as_ref()
+            .is_some_and(|context| !context.subject.is_tool())
+        {
+            return Err(failure(
+                abi::OperationErrorCode::Denied,
+                "ignore discovery requires Agent initialization",
+            ));
+        }
+        bridge(state, vec![], json!({}), |host, op, _| {
+            Box::pin(async move {
+                let result = host.glob_ignore_snapshot(&op).await.map_err(host_error)?;
+                if result.truncated {
+                    return Err(failure(
+                        abi::OperationErrorCode::Limit,
+                        "initial ignore rule collection was incomplete; glob_ignored is unavailable until replaced",
+                    ));
+                }
+                let value = serde_json::to_string(&result.rules)
+                    .map_err(|_| invalid("workspace ignore rules could not be serialized"))?;
+                let bytes = value.len();
+                Ok((value, bytes))
+            })
+        })
+    })();
+    finish(state, result)
+}
+
+pub(super) fn glob_ignored_paths(
+    mut caller: StoreContextMut<'_, RuntimeState>,
+    (): (),
+) -> wasmtime::Result<(Result<Vec<String>, abi::OperationError>,)> {
+    let state = caller.data_mut();
+    let result = (|| {
+        if !state
+            .tool_context
+            .as_ref()
+            .is_some_and(|context| !context.subject.is_tool())
+        {
+            return Err(failure(
+                abi::OperationErrorCode::Denied,
+                "ignore path resolution requires Agent initialization",
+            ));
+        }
+        bridge(state, vec![], json!({}), |host, op, _| {
+            Box::pin(async move {
+                let paths = host.glob_ignored_paths(&op).await.map_err(host_error)?;
+                host::validate_glob_ignored_paths(&paths).map_err(host_error)?;
+                let size = paths.iter().map(|path| path.len() + 8).sum();
+                Ok((paths, size))
+            })
+        })
+    })();
+    finish(state, result)
+}
+
+pub(super) fn glob_with_ignored_paths(
+    mut caller: StoreContextMut<'_, RuntimeState>,
+    (request, paths): (abi::GlobRequest, Vec<String>),
+) -> wasmtime::Result<(Result<abi::ResolvedGlobOutput, abi::OperationError>,)> {
+    let state = caller.data_mut();
+    let result = (|| {
+        if request.include_ignored {
+            return Err(invalid(
+                "resolved path glob does not accept the legacy include_ignored flag",
+            ));
+        }
+        host::validate_glob_ignored_paths(&paths).map_err(host_error)?;
+        let root = resource(&request.root)?;
+        let request = host::GlobRequest {
+            root: PathBuf::from(&root),
+            pattern: request.pattern,
+            include_hidden: request.include_hidden,
+            include_ignored: false,
+            include_directories: request.include_directories,
+            max_results: number(
+                request.max_results,
+                4096,
+                "Host max_results must be in 1..=4096",
+            )?,
+        };
+        let args = json!({"request": request, "ignored_list": paths});
+        bridge(state, vec![root], args, move |host, token, _| {
+            Box::pin(async move {
+                let out = host
+                    .glob_with_ignored_paths(&token, request, paths)
+                    .await
+                    .map_err(host_error)?;
+                let entries: Vec<_> = out.entries.into_iter().map(glob_entry).collect();
+                let scan_incomplete = out
+                    .scan_incomplete
+                    .map(|scan| -> Result<_, ImportFailure<abi::OperationError>> {
+                        Ok(abi::GlobScanIncomplete {
+                            reason: match scan.reason {
+                                host::GlobScanReason::Entries => abi::GlobScanReason::Entries,
+                                host::GlobScanReason::Depth => abi::GlobScanReason::Depth,
+                            },
+                            limit: u32::try_from(scan.limit)
+                                .map_err(|_| invalid("invalid Host glob scan limit"))?,
+                            observed: u32::try_from(scan.observed)
+                                .map_err(|_| invalid("invalid Host glob scan observation"))?,
+                        })
+                    })
+                    .transpose()?;
+                let size = entries
+                    .iter()
+                    .map(|entry| entry.path.len() + 16)
+                    .sum::<usize>()
+                    + 16;
+                Ok((
+                    abi::ResolvedGlobOutput {
+                        entries,
+                        truncated: out.truncated,
+                        scan_incomplete,
+                    },
+                    size,
+                ))
+            })
+        })
+    })();
+    finish(state, result)
+}
+
+fn glob_entry(entry: host::GlobEntry) -> abi::GlobEntry {
+    abi::GlobEntry {
+        path: entry.path.to_string_lossy().into_owned(),
+        kind: match entry.kind {
+            host::GlobEntryKind::File => abi::GlobEntryKind::File,
+            host::GlobEntryKind::Directory => abi::GlobEntryKind::Directory,
+            host::GlobEntryKind::Symlink => abi::GlobEntryKind::Symlink,
+        },
+    }
+}
+
 pub(super) fn glob(
     mut caller: StoreContextMut<'_, RuntimeState>,
     (request,): (abi::GlobRequest,),
 ) -> wasmtime::Result<(Result<abi::GlobOutput, abi::OperationError>,)> {
-    let state = caller.data_mut();
+    glob_impl(caller.data_mut(), request, false)
+}
+
+pub(super) fn glob_from_state(
+    mut caller: StoreContextMut<'_, RuntimeState>,
+    (request,): (abi::GlobRequest,),
+) -> wasmtime::Result<(Result<abi::GlobOutput, abi::OperationError>,)> {
+    glob_impl(caller.data_mut(), request, true)
+}
+
+fn glob_impl(
+    state: &mut RuntimeState,
+    request: abi::GlobRequest,
+    state_owned: bool,
+) -> wasmtime::Result<(Result<abi::GlobOutput, abi::OperationError>,)> {
     let result = (|| {
         let root = resource(&request.root)?;
         let req = host::GlobRequest {
@@ -501,23 +662,27 @@ pub(super) fn glob(
         };
         let args = serde_json::to_value(&req)
             .map_err(|_| invalid("Host request arguments could not be serialized"))?;
-        bridge(state, vec![root], args, move |host, token, _| {
+        bridge(state, vec![root], args, move |host, token, invocation| {
             Box::pin(async move {
-                let out = host::tool_api::GlobApi::glob(host.as_ref(), &token, req)
-                    .await
-                    .map_err(host_error)?;
-                let entries: Vec<abi::GlobEntry> = out
-                    .entries
-                    .into_iter()
-                    .map(|entry| abi::GlobEntry {
-                        path: entry.path.to_string_lossy().into_owned(),
-                        kind: match entry.kind {
-                            host::GlobEntryKind::File => abi::GlobEntryKind::File,
-                            host::GlobEntryKind::Directory => abi::GlobEntryKind::Directory,
-                            host::GlobEntryKind::Symlink => abi::GlobEntryKind::Symlink,
-                        },
-                    })
-                    .collect();
+                let out = if state_owned && !req.include_ignored {
+                    let invocation = invocation.ok_or_else(|| {
+                        failure(
+                            abi::OperationErrorCode::Denied,
+                            "glob requires an authorized Session invocation",
+                        )
+                    })?;
+                    let binding = super::SessionBinding::from_state(invocation.state);
+                    let value = binding
+                        .get(GLOB_IGNORED)
+                        .map_err(|_| invalid("glob_ignored could not be read from SessionState"))?;
+                    let rules = current_glob_rules(value)?;
+                    host.glob_with_ignore_rules(&token, req, rules).await
+                } else {
+                    host::tool_api::GlobApi::glob(host.as_ref(), &token, req).await
+                }
+                .map_err(host_error)?;
+                let entries: Vec<abi::GlobEntry> =
+                    out.entries.into_iter().map(glob_entry).collect();
                 let size = entries.iter().map(|entry| entry.path.len() + 16).sum();
                 Ok((
                     abi::GlobOutput {
@@ -531,6 +696,25 @@ pub(super) fn glob(
     })();
     finish(state, result)
 }
+fn current_glob_rules(
+    value: Option<Value>,
+) -> Result<Vec<host::GlobIgnoreRuleFile>, ImportFailure<abi::OperationError>> {
+    let Some(value) = value else {
+        return Err(invalid(
+            "glob_ignored is missing from SessionState; set a rule list or pass include_ignored: true",
+        ));
+    };
+    if !value.is_array() {
+        return Err(invalid(
+            "glob_ignored is unavailable or invalid; set a rule list or pass include_ignored: true",
+        ));
+    }
+    let rules: Vec<host::GlobIgnoreRuleFile> = serde_json::from_value(value)
+        .map_err(|_| invalid("glob_ignored must be a list of {path, content} ignore files"))?;
+    host::validate_glob_ignore_rules(&rules).map_err(host_error)?;
+    Ok(rules)
+}
+
 pub(super) fn grep(
     mut caller: StoreContextMut<'_, RuntimeState>,
     (request,): (abi::GrepRequest,),

@@ -67,6 +67,7 @@ fn session(
 ) -> Arc<SessionInner> {
     SessionInner::new(SessionParts {
         dialogue_reply_store: None,
+        model_admission: None,
         kind: crate::SessionKind::Interactive,
         communication: None,
         client,

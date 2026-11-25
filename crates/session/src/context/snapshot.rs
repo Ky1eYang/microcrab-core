@@ -123,6 +123,8 @@ impl Context {
             .extend(snapshot.retired_call_ids.iter().cloned());
         let mut projected: Option<Value> = None;
         let mut leading_state = false;
+        let mut view_image_calls = HashSet::new();
+        let mut archive_ready = HashSet::new();
         for item in &snapshot.items {
             match item {
                 ContentItem::State(frame) => {
@@ -161,6 +163,23 @@ impl Context {
                     source,
                     envelope,
                 } => {
+                    if let Some(CarrierEnvelopeVersion::RetainedToolImage { call_id }) = envelope {
+                        if !archive_ready.remove(call_id)
+                            || !matches!(source, Some(UserSource::Framework))
+                            || !matches!(
+                                parts.as_slice(),
+                                [
+                                    InputPart::Text { .. },
+                                    InputPart::Image {
+                                        source: microcrab_protocol::ImageSource::Data { .. }
+                                    }
+                                ]
+                            )
+                        {
+                            return Err(Error::protocol("invalid restored retained tool image"));
+                        }
+                        crate::admission::image::validate_tool_parts(&parts[1..])?;
+                    }
                     if matches!(envelope, Some(CarrierEnvelopeVersion::Important { .. }))
                         && (!leading_state || source.is_some())
                     {
@@ -185,6 +204,8 @@ impl Context {
                 } => {
                     context.require_settled()?;
                     leading_state = false;
+                    view_image_calls.clear();
+                    archive_ready.clear();
                     let response = Response {
                         provider_metadata: provider_metadata.clone(),
                         content: content.clone(),
@@ -206,11 +227,30 @@ impl Context {
                             return Err(Error::protocol("reused restored tool call id"));
                         }
                         context.pending_calls.insert(call.id.clone());
+                        if call.name == "view_image"
+                            && call
+                                .arguments
+                                .get("image_url")
+                                .and_then(Value::as_str)
+                                .is_some_and(
+                                    crate::runtime::tool::view_image::is_https_replay_reference,
+                                )
+                        {
+                            view_image_calls.insert(call.id.clone());
+                        }
                     }
                 }
-                ContentItem::Tool { call_id, parts, .. } => {
+                ContentItem::Tool {
+                    call_id,
+                    parts,
+                    content,
+                } => {
                     leading_state = false;
                     crate::admission::image::validate_tool_parts(parts)?;
+                    if view_image_calls.contains(call_id) && super::is_pending_https_image(content)
+                    {
+                        archive_ready.insert(call_id.clone());
+                    }
                     if !context.pending_calls.remove(call_id) {
                         return Err(Error::protocol("orphan restored tool result"));
                     }

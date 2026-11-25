@@ -3,6 +3,36 @@ use super::{Tool, ToolContext, ToolOutput};
 use crate::Error;
 use microcrab_protocol::ToolDefinition;
 use serde_json::{Value, json};
+
+fn result(
+    context: &ToolContext,
+    receipt: &crate::state::communication::inbox::QueuedReceipt,
+) -> Result<ToolOutput, Error> {
+    #[derive(serde::Serialize)]
+    struct ModelReceipt<'a> {
+        operation_ref: &'a str,
+        ordinal: u64,
+        status: &'a crate::state::communication::inbox::DeliveryStatus,
+    }
+    let content = if context.state.short_model_refs() {
+        let raw = &receipt.operation_id;
+        let operation_ref = raw
+            .strip_prefix("msg_")
+            .filter(|hex| hex.len() == 64 && hex.bytes().all(|byte| byte.is_ascii_hexdigit()))
+            .and_then(|_| raw.get(..20))
+            .ok_or_else(|| {
+                Error::protocol("messaging producer returned an invalid operation receipt")
+            })?;
+        serde_json::to_string(&ModelReceipt {
+            operation_ref,
+            ordinal: receipt.ordinal,
+            status: &receipt.status,
+        })?
+    } else {
+        serde_json::to_string(receipt)?
+    };
+    Ok(ToolOutput::text(content))
+}
 #[derive(Clone, Copy)]
 pub struct SendMessage;
 #[derive(Clone, Copy)]
@@ -22,7 +52,7 @@ impl Tool for SendMessage {
             .messaging_peer()?
             .send_message(arguments, context.clone())
             .await?;
-        Ok(ToolOutput::text(serde_json::to_string(&receipt)?))
+        result(&context, &receipt)
     }
 }
 #[async_trait::async_trait]
@@ -40,6 +70,6 @@ impl Tool for Escalate {
             .messaging_peer()?
             .escalate(arguments, context.clone())
             .await?;
-        Ok(ToolOutput::text(serde_json::to_string(&receipt)?))
+        result(&context, &receipt)
     }
 }

@@ -1,6 +1,21 @@
 use super::*;
 
 #[test]
+fn state_glob_rules_have_explicit_empty_and_unavailable_semantics() {
+    assert!(current_glob_rules(None).is_err());
+    assert!(current_glob_rules(Some(json!({"status":"incomplete"}))).is_err());
+    assert!(current_glob_rules(Some(json!(["target/"]))).is_err());
+    assert!(current_glob_rules(Some(json!([]))).unwrap().is_empty());
+    let rules = current_glob_rules(Some(json!([
+        {"path":".gitignore","content":"target/\n"},
+        {"path":"sub/.ignore","content":"*.tmp\n"}
+    ])))
+    .unwrap();
+    assert_eq!(rules[1].path, PathBuf::from("sub/.ignore"));
+    assert_eq!(rules[0].content, "target/\n");
+}
+
+#[test]
 fn resource_categories_and_actionable_details_survive_the_authorized_result_path() {
     let detail = "read: access denied to the requested file by the Host policy";
     let rejected = host_error(host::ToolError::Host(host::HostError::new(

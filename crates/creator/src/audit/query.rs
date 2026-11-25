@@ -60,9 +60,22 @@ pub struct AuditAttempt {
     pub delta: Option<String>,
     /// Historical provider-shaped advertised definitions, never a current catalog.
     pub tools: Option<Value>,
+    /// Canonical frozen definitions, not provider-shaped wire evidence.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frozen_tools: Option<Value>,
+    /// Identity-only normalized output from a protected model invocation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub protected_tool_call_ids: Option<Value>,
     pub outcome: Option<Value>,
     /// Persisted normalized model response, not inferred from sent evidence.
     pub response: Option<Value>,
+    /// Exact retained UTF-8 HTTP response body in ordinary request detail only.
+    /// May be a partial prefix; missing or non-UTF-8 bodies are not reconstructed.
+    pub response_raw: Option<String>,
+    /// Persisted transport facts, independent of normalization or Session outcome.
+    pub response_complete: Option<bool>,
+    pub response_status: Option<u16>,
+    pub response_content_type: Option<String>,
     pub response_omitted: bool,
     pub completion: String,
     /// Generic transport cancellation only; concrete Session causes belong to receipts.
@@ -72,6 +85,10 @@ pub struct AuditAttempt {
     pub started_at_ms: Option<u64>,
     /// Terminal start plus measured elapsed milliseconds, checked for overflow.
     pub ended_at_ms: Option<u64>,
+    /// Validated normalized-success sample (or checked legacy terminal duration).
+    /// Not proof that this attempt produced a particular selected Assistant row.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_completed_at_ms: Option<u64>,
     /// Request start to first actual provider stream content (not a token count).
     pub first_token_ms: Option<u64>,
     /// First actual content to stream EOF; historical/nonstreamed values stay absent.
@@ -130,6 +147,23 @@ pub struct AuditQueryResult {
     pub timeline: Vec<AuditTimeline>,
     /// Actual correlated foreground tool invocations, never inferred from model gaps.
     pub stages: Vec<AuditStage>,
+    /// Exact selected ToolCall's safe authored image arguments, never provider text.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub authored_tool_arguments: Option<Value>,
+    /// Legacy exact-call lifecycle facts without a linked request or branch proof.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub legacy_unlinked_attempt: Option<LegacyUnlinkedAttempt>,
+}
+#[derive(Clone, Debug, Serialize)]
+pub struct LegacyUnlinkedAttempt {
+    pub call_id: String,
+    pub epoch: u64,
+    pub turn: u64,
+    pub round: u64,
+    pub subagent: Option<String>,
+    pub started_at_ms: Option<u64>,
+    pub ended_at_ms: Option<u64>,
+    pub completion: &'static str,
 }
 /// Metadata emitted after append and sync. No bodies cross this boundary.
 #[derive(Clone, Debug, Serialize)]
@@ -291,14 +325,18 @@ fn request_contains_result(
 ) -> bool {
     // An actual retained sent request takes precedence over prepared membership.
     // Prepared content is association metadata only; evidence fields stay absent.
-    sent.get(id)
-        .map(String::as_str)
-        .or_else(|| {
-            effective
-                .get(id)
-                .and_then(|data| data["request_body"].as_str())
-        })
-        .is_some_and(|wire| contains_result(wire, call))
+    if let Some(wire) = sent.get(id) {
+        return contains_result(wire, call);
+    }
+    effective.get(id).is_some_and(|data| {
+        if let Some(ids) = data["protected"]["tool_result_ids"].as_array() {
+            ids.iter().any(|id| id.as_str() == Some(call))
+        } else {
+            data["request_body"]
+                .as_str()
+                .is_some_and(|wire| contains_result(wire, call))
+        }
+    })
 }
 /// Read a stable byte-length prefix; never opens a writer or derives views.
 /// Incomplete concurrent final appends are excluded explicitly.
@@ -522,6 +560,18 @@ fn query_mode(
     selected_branch: Option<SelectedBranch<'_>>,
 ) -> Result<AuditQueryResult, AuditorError> {
     let display_metadata = metadata_only && selected_branch.is_some();
+    let authored_selector = selector
+        .turn
+        .zip(selector.round)
+        .zip(selector.tool_call_id.as_deref())
+        .filter(|_| {
+            !internal
+                && !metadata_only
+                && selector.subagent.is_none()
+                && selector.call_id.is_none()
+                && selector.request_hash.is_none()
+        })
+        .filter(|_| selected_branch.is_some_and(|branch| branch.history_ancestry.is_some()));
     for id in [&selector.request_hash, &selector.history_head]
         .into_iter()
         .flatten()
@@ -550,6 +600,14 @@ fn query_mode(
             "audit query requires a position or immutable call/request selector",
         ));
     }
+    let legacy_call = selector.call_id.as_deref().filter(|call| {
+        !call.is_empty()
+            && !internal
+            && !metadata_only
+            && selector.request_hash.is_none()
+            && selector.history_head.is_none()
+            && selector.tool_call_id.is_none()
+    });
     let file = directory.reader().map_err(|err| error(err.to_string()))?;
     let Some(file) = file else {
         return Ok(AuditQueryResult {
@@ -562,6 +620,8 @@ fn query_mode(
             selected_request_hash: None,
             timeline: vec![],
             stages: vec![],
+            authored_tool_arguments: None,
+            legacy_unlinked_attempt: None,
         });
     };
     let mut reader = BufReader::new(file);
@@ -575,9 +635,15 @@ fn query_mode(
     let mut outcomes: HashMap<String, Value> = HashMap::new();
     let mut completed: HashMap<String, Value> = HashMap::new();
     let mut ambiguous_completed = HashSet::new();
+    // Keep completion evidence separate from the existing trajectory clocks and
+    // usage projection. Once timing disagrees, no later replay may restore it.
+    let mut response_completion = HashMap::new();
+    let mut unbound_terminals = HashMap::new();
     let mut timing: HashMap<String, (Option<u64>, Option<u64>)> = HashMap::new();
     let mut stages = Vec::new();
     let mut stage_index = HashMap::new();
+    let mut authored_candidates = Vec::new();
+    let mut legacy = LegacyLifecycle::default();
     loop {
         let mut bytes = vec![];
         reader
@@ -617,6 +683,11 @@ fn query_mode(
         previous = Some(digest.clone());
         match data["kind"].as_str() {
             Some("effective") => {
+                if let Some(call) = legacy_call
+                    && data["call_id"].as_str() == Some(call)
+                {
+                    legacy.different_authority = true;
+                }
                 let mut effective_data = data.clone();
                 if display_metadata && let Some(data) = effective_data.as_object_mut() {
                     let _ = data.remove("request_body");
@@ -633,8 +704,48 @@ fn query_mode(
                         &mut stage_index,
                     )?;
                 }
+                let record = body(&data["record"]);
+                if let Some(call) = legacy_call
+                    && record["call_id"].as_str() == Some(call)
+                {
+                    legacy.observe(sequence, data, record, selector);
+                }
+                if let Some(((turn, round), tool_call_id)) = authored_selector
+                    && record["event"] == "tool_call"
+                    && record["subagent"].is_null()
+                    && record["epoch"].as_u64() == Some(selector.epoch)
+                    && record["turn_id"].as_u64() == Some(turn)
+                    && record["round"].as_u64() == Some(round)
+                    && record["tool_call_id"].as_str() == Some(tool_call_id)
+                    && let Some(head) = text(record, "history_head")
+                    && selector
+                        .history_head
+                        .as_ref()
+                        .is_none_or(|selected| *selected == head)
+                {
+                    let arguments = if record["authored_image_arguments"] == true
+                        && record["payload"]["type"] == "tool_call"
+                        && record["payload"]["name"] == "view_image"
+                        && record["tool_execution_id"]
+                            .as_u64()
+                            .is_some_and(|id| id > 0)
+                    {
+                        record["payload"]["arguments"]
+                            .as_object()
+                            .map(|_| record["payload"]["arguments"].clone())
+                    } else {
+                        None
+                    };
+                    if authored_candidates.len() >= 256 {
+                        return Err(error("authored arguments occurrence budget exceeded"));
+                    }
+                    authored_candidates.push((
+                        head,
+                        text(record, "producer_request_head"),
+                        arguments,
+                    ));
+                }
                 if let Some(id) = text(data, "request_hash") {
-                    let record = body(&data["record"]);
                     if record["event"] == "request_prepared" || record["sent_request"].is_string() {
                         transmitted.insert(id.clone());
                         transmitted_sequences.entry(id.clone()).or_insert(sequence);
@@ -655,6 +766,8 @@ fn query_mode(
                             .0
                             .zip(record["elapsed_ms"].as_u64())
                             .and_then(|(started, elapsed)| started.checked_add(elapsed));
+                        let sample = persisted_response_completion(record);
+                        retain_response_completion(&mut response_completion, id.clone(), sample);
                         let terminal = if display_metadata {
                             // Completion and usage remain canonical; provider text
                             // is never needed for this projection.
@@ -676,6 +789,14 @@ fn query_mode(
                     if !record["outcome"].is_null() {
                         outcomes.insert(id, record["outcome"].clone());
                     }
+                } else if (record["event"] == "round_completed" || !record["outcome"].is_null())
+                    && let Some(call) = text(record, "call_id")
+                {
+                    // The recorder forgets the in-flight association after a
+                    // terminal. Detect late conflicting terminal publications
+                    // without using them as evidence or moving them to a branch.
+                    let sample = persisted_response_completion(record);
+                    retain_response_completion(&mut unbound_terminals, call, sample);
                 }
             }
             _ => {}
@@ -769,6 +890,14 @@ fn query_mode(
                 .is_some_and(|head| branch_histories.contains(head))
         });
     }
+    let response_completion_conflicts = |id: &str, data: &Value| {
+        let bound = response_completion.get(id);
+        bound.is_some_and(Result::is_err)
+            || data["call_id"]
+                .as_str()
+                .and_then(|call| unbound_terminals.get(call))
+                .is_some_and(|late| late.is_err() || bound != Some(late))
+    };
     // Statistics retain the selected pending attempt plus its closest measured
     // causal ancestor, not an unrelated latest append or a whole timeline.
     let mut metadata_requests = HashSet::new();
@@ -828,8 +957,18 @@ fn query_mode(
                 continue;
             }
             *requests.entry(id.as_str()).or_insert(0usize) += 1;
-            if let Some(call) = data["call_id"].as_str() {
+            if let Some(call) = data["call_id"].as_str().filter(|call| !call.is_empty()) {
                 *calls.entry(call).or_insert(0usize) += 1;
+            } else {
+                selected_identities_complete = false;
+            }
+            if scope(data).is_none()
+                || ambiguous_completed.contains(id)
+                || response_completion_conflicts(id, data)
+                || (outcomes.get(id).and_then(Value::as_str) == Some("accepted")
+                    && !transmitted.contains(id))
+            {
+                selected_identities_complete = false;
             }
             if outcomes.get(id).and_then(Value::as_str) == Some("accepted")
                 && completion(completed.get(id)) == "succeeded"
@@ -837,6 +976,13 @@ fn query_mode(
             {
                 *accepted_positions.entry(position).or_insert(0usize) += 1;
             }
+        }
+        if requests
+            .values()
+            .chain(calls.values())
+            .any(|count| *count != 1)
+        {
+            selected_identities_complete = false;
         }
         for (id, _, data) in &effective {
             let Some(position) = scope(data) else {
@@ -1033,11 +1179,25 @@ fn query_mode(
             .as_ref()
             .and_then(|wire| serde_json::from_str::<Value>(wire).ok())
             .and_then(|value| value.get("tools").cloned());
+        let frozen_tools = (!internal && !metadata_only)
+            .then(|| data["protected"].get("frozen_tools"))
+            .flatten()
+            .filter(|tools| tools.is_array())
+            .cloned();
+        let protected_tool_call_ids = (!metadata_only && data["protected"].is_object())
+            .then(|| completed.get(id)?.get("protected_tool_call_ids"))
+            .flatten()
+            .filter(|ids| ids.is_array())
+            .cloned();
         response_bytes += wire.as_ref().map_or(0, String::len)
             + current.as_ref().map_or(0, String::len)
             + baseline.as_ref().map_or(0, String::len)
             + delta.as_ref().map_or(0, String::len)
-            + tools.as_ref().map_or(0, |v| v.to_string().len());
+            + tools.as_ref().map_or(0, |v| v.to_string().len())
+            + frozen_tools.as_ref().map_or(0, |v| v.to_string().len())
+            + protected_tool_call_ids
+                .as_ref()
+                .map_or(0, |v| v.to_string().len());
         if response_bytes > 32 * 1024 * 1024
             || attempts.len()
                 >= if selected_branch.is_some_and(|branch| branch.display_turns.is_some()) {
@@ -1051,6 +1211,19 @@ fn query_mode(
             ));
         }
         let terminal = completed.get(id);
+        // Detail uses the terminal already bound to this attempt and filtered by
+        // the same selectors and ancestry as the sent request. No summaries or
+        // protected invocations expose provider wire evidence.
+        let wire_terminal =
+            terminal.filter(|_| !internal && !metadata_only && !data["protected"].is_object());
+        let response_raw = wire_terminal.and_then(|record| record["response"].as_str());
+        let response_complete =
+            wire_terminal.and_then(|record| record["response_complete"].as_bool());
+        let response_status = wire_terminal
+            .and_then(|record| record["response_status"].as_u64())
+            .and_then(|status| u16::try_from(status).ok());
+        let response_content_type =
+            wire_terminal.and_then(|record| record["response_content_type"].as_str());
         let mut response = if metadata_only {
             None
         } else {
@@ -1069,9 +1242,19 @@ fn query_mode(
         let baseline_usage = base.and_then(|id| completed.get(id)).and_then(persisted_usage)
             .or_else(|| if parent.is_none() { Some(serde_json::json!({"input_tokens":0,"cache_read_tokens":0,"cache_write_tokens":0,"output_tokens":0,"total_tokens":0})) } else { None });
         let token_delta = token_delta(usage.as_ref(), baseline_usage.as_ref());
-        response_bytes += serde_json::to_vec(&(&response, &usage, &baseline_usage, &token_delta))
-            .map_err(|_| error("audit response evidence serialization failed"))?
-            .len();
+        // Charge the JSON-escaped response evidence to the existing detail cap.
+        response_bytes += serde_json::to_vec(&(
+            &response,
+            response_raw,
+            response_complete,
+            response_status,
+            response_content_type,
+            &usage,
+            &baseline_usage,
+            &token_delta,
+        ))
+        .map_err(|_| error("audit response evidence serialization failed"))?
+        .len();
         if response_bytes > 32 * 1024 * 1024 {
             return Err(error("audit response budget exceeded"));
         }
@@ -1098,13 +1281,23 @@ fn query_mode(
             baseline,
             delta,
             tools,
+            frozen_tools,
+            protected_tool_call_ids,
             outcome: outcomes.get(id).cloned(),
             response,
+            response_raw: response_raw.map(str::to_owned),
+            response_complete,
+            response_status,
+            response_content_type: response_content_type.map(str::to_owned),
             response_omitted,
             completion: completion.into(),
             cancel_reason: (completion == "cancelled").then_some("cancelled"),
             started_at_ms: timing.get(id).and_then(|entry| entry.0),
             ended_at_ms: timing.get(id).and_then(|entry| entry.1),
+            response_completed_at_ms: response_completion
+                .get(id)
+                .and_then(|evidence| evidence.as_ref().ok().copied().flatten())
+                .filter(|_| !response_completion_conflicts(id, data)),
             first_token_ms,
             generation_ms,
             timing_source,
@@ -1135,6 +1328,37 @@ fn query_mode(
         .into_iter()
         .find_map(|state| candidates.iter().rev().find(|a| a.completion == state))
         .map(|a| a.request_hash.clone());
+    // A reused ID or duplicate publication on the same selected position
+    // cannot prove which authored call the visible tool represents.
+    let mut selected_authored = authored_candidates
+        .into_iter()
+        .filter(|(head, producer, _)| {
+            let Some(producer) = producer else {
+                return branch_histories.contains(head);
+            };
+            selected_branch
+                .and_then(|branch| branch.history_ancestry)
+                .is_some_and(|ancestry| ancestry.contains(head))
+                && branch_requests.contains(producer)
+        });
+    let authored_tool_arguments = selected_authored
+        .next()
+        .and_then(|(_, producer, arguments)| {
+            let producer = producer?;
+            let ((turn, round), call) = authored_selector?;
+            let effective = index.get(producer.as_str())?;
+            let terminal = completed.get(&producer)?;
+            (transmitted.contains(&producer)
+                && effective["epoch"].as_u64() == Some(selector.epoch)
+                && effective["turn"].as_u64() == Some(turn)
+                && effective["round"].as_u64() == Some(round)
+                && effective["subagent"].is_null()
+                && terminal["outcome"] == "accepted"
+                && terminal_contains_authored_image_call(effective, terminal, call))
+            .then_some(arguments)
+            .flatten()
+        })
+        .filter(|_| selected_authored.next().is_none());
     Ok(AuditQueryResult {
         status,
         committed_sequence: sequence,
@@ -1145,7 +1369,112 @@ fn query_mode(
         selected_request_hash,
         timeline,
         stages,
+        authored_tool_arguments,
+        legacy_unlinked_attempt: legacy.project(legacy_call, selector),
     })
+}
+
+#[derive(Default)]
+struct LegacyLifecycle {
+    different_authority: bool,
+    prepared: Option<(u64, u64, u64, Option<u64>)>,
+    terminal: Option<(u64, u64, u64, Option<u64>, Option<u64>, &'static str)>,
+}
+impl LegacyLifecycle {
+    fn observe(&mut self, sequence: u64, data: &Value, record: &Value, selector: &AuditQuery) {
+        let event = record["event"].as_str().unwrap_or_default();
+        if !matches!(event, "request_prepared" | "round_completed") {
+            return;
+        }
+        let scope = record["turn_id"].as_u64().zip(record["round"].as_u64());
+        let Some((turn, round)) = scope.filter(|(turn, round)| {
+            record["epoch"].as_u64() == Some(selector.epoch)
+                && text(record, "subagent") == selector.subagent
+                && selector.turn.is_none_or(|expected| expected == *turn)
+                && selector.round.is_none_or(|expected| expected == *round)
+                && data["request_hash"].is_null()
+                && record["sent_request"].is_null()
+                && record["response"].is_null()
+                && record["response_bytes"].is_null()
+                && record["payload"]["response"].is_null()
+        }) else {
+            self.different_authority = true;
+            return;
+        };
+        let start = record["started_at_unix_ms"].as_u64();
+        if event == "request_prepared" {
+            self.different_authority |= self
+                .prepared
+                .replace((sequence, turn, round, start))
+                .is_some();
+        } else {
+            let state = completion(Some(record));
+            if !record["outcome"].is_string() {
+                self.different_authority = true;
+                return;
+            }
+            self.different_authority |= self
+                .terminal
+                .replace((
+                    sequence,
+                    turn,
+                    round,
+                    start,
+                    record["elapsed_ms"].as_u64(),
+                    state,
+                ))
+                .is_some();
+        }
+    }
+    fn project(self, call: Option<&str>, selector: &AuditQuery) -> Option<LegacyUnlinkedAttempt> {
+        let (start_sequence, turn, round, start) = self.prepared?;
+        let (terminal_sequence, end_turn, end_round, terminal_start, elapsed, completion) =
+            self.terminal?;
+        if self.different_authority
+            || start_sequence >= terminal_sequence
+            || (turn, round) != (end_turn, end_round)
+            || start
+                .zip(terminal_start)
+                .is_some_and(|(start, other)| start != other)
+        {
+            return None;
+        }
+        let started_at_ms = start.or(terminal_start);
+        Some(LegacyUnlinkedAttempt {
+            call_id: call?.to_owned(),
+            epoch: selector.epoch,
+            turn,
+            round,
+            subagent: selector.subagent.clone(),
+            started_at_ms,
+            ended_at_ms: started_at_ms
+                .zip(elapsed)
+                .and_then(|(start, elapsed)| start.checked_add(elapsed)),
+            completion,
+        })
+    }
+}
+
+fn terminal_contains_authored_image_call(effective: &Value, terminal: &Value, call: &str) -> bool {
+    if effective["protected"].is_object() {
+        return terminal["protected_tool_call_ids"]
+            .as_array()
+            .is_some_and(|ids| ids.iter().filter(|id| id.as_str() == Some(call)).count() == 1);
+    }
+    // Raw audit also retains the transport's normalized response. Reuse its
+    // exact IDs (which may be synthesized by an adapter) rather than trying to
+    // decode provider JSON/SSE again or treating strings in that body as IDs.
+    terminal["payload"]["response"]["tool_calls"]
+        .as_array()
+        .is_some_and(|calls| {
+            let mut matching = calls
+                .iter()
+                .filter(|item| item["id"].as_str() == Some(call));
+            matching
+                .next()
+                .is_some_and(|item| item["name"] == "view_image")
+                && matching.next().is_none()
+        })
 }
 
 fn model_response(record: &Value) -> Option<Value> {
@@ -1154,7 +1483,9 @@ fn model_response(record: &Value) -> Option<Value> {
         .and_then(|p| p.get("response"))
         .filter(|v| !v.is_null())
         .cloned()
-        .or_else(|| record.get("response").filter(|v| !v.is_null()).cloned())?;
+        // Legacy normalized objects lived at the top level. A transport body
+        // string at the same key is not normalized output (notably on errors).
+        .or_else(|| record.get("response").filter(|v| v.is_object()).cloned())?;
     if let Some(calls) = response.get_mut("tool_calls").and_then(Value::as_array_mut) {
         for call in calls {
             if let Some(call) = call.as_object_mut() {
@@ -1163,6 +1494,46 @@ fn model_response(record: &Value) -> Option<Value> {
         }
     }
     Some(response)
+}
+
+fn retain_response_completion(
+    index: &mut HashMap<String, Result<Option<u64>, ()>>,
+    key: String,
+    sample: Option<u64>,
+) {
+    index
+        .entry(key)
+        .and_modify(|previous| {
+            if *previous != Ok(sample) {
+                *previous = Err(());
+            }
+        })
+        .or_insert(Ok(sample));
+}
+
+fn persisted_response_completion(record: &Value) -> Option<u64> {
+    if record["event"] != "round_completed" || record["outcome"] != "accepted" {
+        return None;
+    }
+    // A legacy terminal record must itself contain both clock witnesses.
+    let clocks = record["started_at_unix_ms"]
+        .as_u64()
+        .zip(record["elapsed_ms"].as_u64());
+    let unix_ms = match record.get("response_completed_at_ms") {
+        Some(value) => {
+            let explicit = value.as_u64()?;
+            if clocks.is_some_and(|(start, elapsed)| start.checked_add(elapsed) != Some(explicit)) {
+                return None;
+            }
+            explicit
+        }
+        None => {
+            let (start, elapsed) = clocks?;
+            start.checked_add(elapsed)?
+        }
+    };
+    microcrab_transport::ResponseCompletedAt::new(unix_ms)
+        .map(microcrab_transport::ResponseCompletedAt::get)
 }
 
 fn completion(record: Option<&Value>) -> &'static str {

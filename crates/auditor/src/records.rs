@@ -32,6 +32,9 @@ pub struct AuditRecord {
     /// Wall-clock call start; elapsed time uses a monotonic clock.
     pub started_at_unix_ms: Option<u64>,
     pub elapsed_ms: Option<u64>,
+    /// Exact normalized-success terminal sample; not a Session admission certificate.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_completed_at_ms: Option<u64>,
     /// Request start to first actual nonempty provider stream content delta.
     pub first_token_ms: Option<u64>,
     /// First stream content delta to successful stream EOF, excluding validation.
@@ -40,6 +43,9 @@ pub struct AuditRecord {
     pub timing_source: Option<String>,
     pub outcome: Option<AuditOutcome>,
     pub usage: Option<Usage>,
+    /// Normalized tool-call identities for a protected terminal, never arguments.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub protected_tool_call_ids: Option<Vec<String>>,
 }
 
 /// Provider-call result names aligned with the existing model-audit outcomes.
@@ -52,6 +58,16 @@ pub enum AuditOutcome {
     LimitExceeded,
     Cancelled,
     TimedOut,
+}
+
+/// Closed, advisory field semantics certified by the tool producer. This does
+/// not authorize effects or classify opaque historical content by spelling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ToolPresentation {
+    CodingFile,
+    MessageReceipt,
+    ViewImage,
 }
 
 /// Content supplied by the producer. The auditor adds sequence and the request diff.
@@ -70,6 +86,10 @@ pub struct AuditBody {
     pub tool_call_id: Option<String>,
     /// Exact runtime reservation for this tool observation, not the provider call ID.
     pub tool_execution_id: Option<u64>,
+    /// The producer supplied an explicitly sanitized authored image argument projection.
+    pub authored_image_arguments: bool,
+    /// Live presentation metadata; not part of the canonical provider record.
+    pub tool_presentation: Option<ToolPresentation>,
     pub payload: HookPayload,
     pub sent_request: Option<String>,
     pub response: Option<String>,
@@ -79,6 +99,7 @@ pub struct AuditBody {
     pub response_content_type: Option<String>,
     pub started_at_unix_ms: Option<u64>,
     pub elapsed_ms: Option<u64>,
+    pub response_completed_at_ms: Option<u64>,
     /// Request start to first actual nonempty provider stream content delta.
     pub first_token_ms: Option<u64>,
     /// First stream content delta to successful stream EOF, excluding validation.
@@ -87,4 +108,5 @@ pub struct AuditBody {
     pub timing_source: Option<String>,
     pub outcome: Option<AuditOutcome>,
     pub usage: Option<Usage>,
+    pub protected_tool_call_ids: Option<Vec<String>>,
 }

@@ -1,7 +1,7 @@
 //! Runtime-owned output. Guest/native handles never borrow producer memory.
 use super::{
     ExecutionId, ExecutionRegistry, OutputChunk, OutputMetadata, OutputOptions, OutputPage,
-    ToolFailure,
+    PrivateOutputKind, PrivateOutputMetadata, ToolFailure,
 };
 use crate::Error;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -51,6 +51,7 @@ pub struct BufferedOutput {
     pub(super) nonce: u64,
     pub(super) adopted: bool,
     pub(super) include_output: bool,
+    pub(super) on_adopt: Option<Box<dyn FnOnce() + Send + Sync>>,
 }
 impl std::fmt::Debug for BufferedOutput {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -66,6 +67,10 @@ impl BufferedOutput {
     pub fn with_initial_output(mut self, include: bool) -> Self {
         self.include_output = include;
         self
+    }
+    pub(crate) fn start_on_adoption(&mut self, start: impl FnOnce() + Send + Sync + 'static) {
+        debug_assert!(self.on_adopt.is_none());
+        self.on_adopt = Some(Box::new(start));
     }
     pub fn snapshot(&self, max_bytes: usize) -> Result<OutputPage, Error> {
         self.registry.read(self.id, 0, max_bytes)
@@ -101,6 +106,7 @@ impl Drop for WriterLease {
                 self.id,
                 self.nonce,
                 "Output producer ended without reporting its outcome".into(),
+                None,
             );
         }
     }
@@ -138,6 +144,13 @@ impl OutputWriter {
             content,
         )
     }
+    pub(super) fn append_private(&self, bytes: &[u8]) -> Result<(), Error> {
+        self.lease
+            .registry
+            .upgrade()
+            .ok_or(Error::Closed)?
+            .append_private(self.lease.id, self.lease.nonce, bytes)
+    }
     pub fn mark_truncated(&self) -> Result<(), Error> {
         self.lease
             .registry
@@ -157,7 +170,13 @@ impl OutputWriter {
             .registry
             .upgrade()
             .ok_or(Error::Closed)?
-            .interrupt_producer(self.lease.id, self.lease.nonce, message.into())
+            .interrupt_producer(self.lease.id, self.lease.nonce, message.into(), None)
+    }
+    #[cfg(feature = "wasm")]
+    pub(crate) fn interrupt_wasm(&self, error: &Error) -> Result<(), Error> {
+        self.lease.registry.upgrade().ok_or(Error::Closed)?.interrupt_producer(
+            self.lease.id, self.lease.nonce, String::new(), Some(error.tool_diagnostic()),
+        )
     }
     pub fn finish(&self, outcome: Result<(), ToolFailure>) -> Result<(), Error> {
         self.lease
@@ -166,6 +185,39 @@ impl OutputWriter {
             .ok_or(Error::Closed)?
             .finish_producer(self.lease.id, self.lease.nonce, outcome)
     }
+}
+
+/// An exact, completed private source. This is trusted Core memory, not a wire
+/// value. Clones share the original raster and retain its allocation permit.
+#[derive(Clone)]
+pub struct PrivateOutputLease {
+    media_type: String,
+    backing: Arc<PrivateOutputBacking>,
+}
+impl std::fmt::Debug for PrivateOutputLease {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PrivateOutputLease").finish_non_exhaustive()
+    }
+}
+impl PrivateOutputLease {
+    pub fn media_type(&self) -> &str {
+        &self.media_type
+    }
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.backing.bytes
+    }
+}
+struct PrivateOutputBacking {
+    bytes: Vec<u8>,
+    // One slot reserves the full per-source byte budget even after release while
+    // an admitted reader/variable still holds the shared backing.
+    _allocation: tokio::sync::OwnedSemaphorePermit,
+}
+struct PrivateOutput {
+    media_type: String,
+    end: u64,
+    truncated: bool,
+    backing: Option<Arc<PrivateOutputBacking>>,
 }
 
 // Parallel byte/tag rings bound storage even for one-byte alternating channels.
@@ -182,6 +234,7 @@ pub(super) struct Buffer {
     content: VecDeque<u8>,
     tags: VecDeque<u8>,
     loss_marked_at_tail: bool,
+    private: Option<PrivateOutput>,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -219,6 +272,103 @@ impl Buffer {
             content: VecDeque::new(),
             tags: VecDeque::new(),
             loss_marked_at_tail: false,
+            private: None,
+        })
+    }
+    pub(super) fn install_private(
+        &mut self,
+        media_type: String,
+        permit: tokio::sync::OwnedSemaphorePermit,
+    ) -> Result<(), Error> {
+        if !microcrab_agent_types::is_capture_mime(&media_type)
+            || self.redaction.redact_text(&media_type) != media_type
+        {
+            return Err(Error::tool("invalid private capture MIME"));
+        }
+        self.private = Some(PrivateOutput {
+            media_type,
+            end: 0,
+            truncated: false,
+            backing: Some(Arc::new(PrivateOutputBacking {
+                bytes: Vec::new(),
+                _allocation: permit,
+            })),
+        });
+        Ok(())
+    }
+    pub(super) fn is_private(&self) -> bool {
+        self.private.is_some()
+    }
+    pub(super) fn clear_private(&mut self) {
+        if let Some(private) = &mut self.private {
+            private.backing = None;
+        }
+    }
+    pub(super) fn append_private(&mut self, bytes: &[u8]) -> Result<(), Error> {
+        if self.closed {
+            return Err(Error::tool("output producer already completed"));
+        }
+        let private = self
+            .private
+            .as_mut()
+            .ok_or_else(|| Error::tool("output is not private"))?;
+        private.end = private.end.checked_add(bytes.len() as u64).ok_or_else(|| {
+            crate::budget::reject(
+                crate::LimitKind::Arithmetic,
+                "private output cursor overflow",
+            )
+        })?;
+        if private.end > self.limit as u64 {
+            // The incomplete raster cannot be redirected. Keep its retained
+            // allocation until cleanup ACK, while continuing to drain and count.
+            private.truncated = true;
+        } else if !private.truncated {
+            let backing = private
+                .backing
+                .as_mut()
+                .and_then(Arc::get_mut)
+                .ok_or_else(|| Error::tool("private output is unavailable"))?;
+            let wanted = private.end as usize;
+            if wanted > backing.bytes.capacity() {
+                let target = wanted
+                    .max(backing.bytes.capacity().saturating_mul(2))
+                    .min(self.limit);
+                backing
+                    .bytes
+                    .try_reserve_exact(target - backing.bytes.len())
+                    .map_err(|_| Error::tool("private output allocation refused"))?;
+            }
+            backing.bytes.extend_from_slice(bytes);
+        }
+        Ok(())
+    }
+    pub(super) fn private_output(
+        &self,
+        channel: &str,
+        expected_mime: &str,
+    ) -> Result<PrivateOutputLease, Error> {
+        let private = self
+            .private
+            .as_ref()
+            .ok_or_else(|| Error::tool("execution has no private byte channel"))?;
+        if channel != "stdout" {
+            return Err(Error::tool("private output channel does not match"));
+        }
+        if private.media_type != expected_mime {
+            return Err(Error::tool("private output MIME does not match"));
+        }
+        if !self.closed || private.truncated {
+            return Err(Error::tool(
+                "private output capture is incomplete or truncated",
+            ));
+        }
+        let backing = private
+            .backing
+            .as_ref()
+            .ok_or_else(|| Error::tool("private output is unavailable"))?;
+        Ok(PrivateOutputLease {
+            media_type: private.media_type.clone(),
+            backing: backing.clone(),
         })
     }
     pub fn metadata(&self) -> OutputMetadata {
@@ -228,15 +378,43 @@ impl Buffer {
             start_cursor: self.start,
             end_cursor: self.end,
             closed: self.closed,
+            private_stdout: self.private_metadata(),
         }
     }
+    fn private_metadata(&self) -> Option<PrivateOutputMetadata> {
+        self.private.as_ref().map(|private| {
+            let available = private.backing.is_some() && !private.truncated;
+            PrivateOutputMetadata {
+                kind: PrivateOutputKind::Bytes,
+                channel: "stdout".into(),
+                media_type: private.media_type.clone(),
+                start_cursor: if available { 0 } else { private.end },
+                end_cursor: private.end,
+                closed: self.closed,
+                truncated: private.truncated,
+                available,
+            }
+        })
+    }
+    pub(super) fn recovery_metadata(&self) -> OutputMetadata {
+        let mut metadata = self.metadata();
+        if let Some(private) = &mut metadata.private_stdout {
+            private.available = false;
+            private.start_cursor = private.end_cursor;
+        }
+        metadata
+    }
     pub fn clear(&mut self) {
+        self.clear_private();
         self.content = VecDeque::new();
         self.tags = VecDeque::new();
         self.start = self.end;
         self.loss_marked_at_tail = false;
     }
     pub fn append(&mut self, channel: Option<&str>, content: &str) -> Result<(), Error> {
+        if self.is_private() {
+            return Err(Error::tool("private capture does not accept public output"));
+        }
         if self.closed {
             return Err(Error::tool("output producer already completed"));
         }
@@ -339,6 +517,10 @@ impl Buffer {
         if self.closed {
             return Err(Error::tool("output producer already completed"));
         }
+        if let Some(private) = &mut self.private {
+            private.truncated = true;
+            return Ok(());
+        }
         if self.loss_marked_at_tail {
             return Ok(());
         }
@@ -352,6 +534,7 @@ impl Buffer {
         Ok(())
     }
     pub fn persisted(&self) -> String {
+        debug_assert!(!self.is_private());
         // Checkpoints may make bounded temporary copies; pages never expand all runs.
         let content: Vec<u8> = self.content.iter().copied().collect();
         let tags: Vec<u8> = self.tags.iter().copied().collect();
@@ -390,6 +573,26 @@ impl Buffer {
         ring.start = output.start_cursor;
         ring.end = output.end_cursor;
         ring.closed = output.closed;
+        if let Some(private) = &output.private_stdout {
+            if private.channel != "stdout"
+                || !microcrab_agent_types::is_capture_mime(&private.media_type)
+                || private.start_cursor != private.end_cursor
+                || private.available
+                || private.closed != output.closed
+                || !output.channels.is_empty()
+                || output.end_cursor != 0
+                || result.is_some()
+            {
+                return Err(Error::tool("invalid persisted private output metadata"));
+            }
+            // Private captures are always ephemerally lost at a history boundary.
+            ring.private = Some(PrivateOutput {
+                media_type: private.media_type.clone(),
+                end: private.end_cursor,
+                truncated: private.truncated,
+                backing: None,
+            });
+        }
         let Some(result) = result else {
             if retained != 0 {
                 return Err(Error::tool("persisted output is missing retained data"));
@@ -489,6 +692,7 @@ impl Buffer {
             end_cursor: self.end,
             closed: self.closed,
             revision,
+            private_stdout: self.private_metadata(),
         };
         let envelope_size = serialized_size(&page)?;
         crate::budget::check(crate::LimitKind::ToolOutput, envelope_size, maximum)?;

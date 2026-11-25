@@ -207,11 +207,11 @@ mod maintained_guests {
         .await;
         let messages = session.messages();
         let receipt = messages.iter().find_map(|item| match item {
-            ContentItem::Tool { call_id, content, .. } if call_id == "guest-retained-terminal" => {
-                serde_json::from_str::<Value>(content)
-                    .ok()
-                    .map(|value| (content.len(), value))
-            }
+            ContentItem::Tool {
+                call_id, content, ..
+            } if call_id == "guest-retained-terminal" => serde_json::from_str::<Value>(content)
+                .ok()
+                .map(|value| (content.len(), value)),
             _ => None,
         });
         let inspection = receipt
@@ -258,6 +258,112 @@ mod maintained_guests {
         assert_eq!(channel(&read, "stdout"), expected);
         assert_eq!(channel(&read, "stderr"), "tail");
         assert!(read.start_cursor == 0 && read.closed);
+    }
+
+    #[tokio::test]
+    #[ignore = "parent gate sets current MICROCRAB_UNIVERSAL_WASM component path"]
+    async fn maintained_universal_private_shell_retains_binary_without_initial_or_public_page() {
+        let artifact =
+            std::fs::read(std::env::var_os("MICROCRAB_UNIVERSAL_WASM").unwrap()).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let host = Arc::new(LocalHost::new(root.path(), ShellLimits::default()).unwrap());
+        let agent = WasmAgent::load(&artifact, WasmLimits::default(), host.clone()).unwrap();
+        let shell = if cfg!(windows) { "pwsh" } else { "bash" };
+        let command = if cfg!(windows) {
+            "[Console]::OpenStandardOutput().Write([byte[]](255,0,254,128),0,4); [Console]::Error.Write('PRIVATE_STDERR_SENTINEL')"
+        } else {
+            "printf '\\377\\000\\376\\200'; printf 'PRIVATE_STDERR_SENTINEL' >&2"
+        };
+        assert!(agent.agents()[0].tools[0].parameters["properties"]["capture"].is_object());
+        let runtime = Runtime::new(
+            agent
+                .tools()
+                .into_iter()
+                .map(ToolRegistration::Wasm)
+                .collect(),
+            Arc::new(AllowTools::new([shell])),
+        )
+        .unwrap();
+        let session = Session::builder(Model(Mutex::new(Some(ToolCall {
+            provider_metadata: None,
+            id: "private-shell".into(),
+            name: shell.into(),
+            arguments: json!({"command":command,"capture":"private","media_type":"application/octet-stream"}),
+        }))), runtime)
+            .host(host)
+            .agent(agent.agents()[0].clone())
+            .permissions(PermissionConfig {
+                initialization: Action::Allow,
+                overrides: vec![Permission { tool: Some(Matcher::Exact(shell.into())), agent: None, mode: None, args: vec![], action: Action::Allow }],
+                ..PermissionConfig::default()
+            })
+            .build().unwrap();
+        session.select_mode("execute").await.unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(15),
+            session.submit("capture bytes privately"),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let receipt = session
+            .messages()
+            .iter()
+            .find_map(|item| match item {
+                ContentItem::Tool {
+                    call_id, content, ..
+                } if call_id == "private-shell" => {
+                    Some(serde_json::from_str::<Value>(content).unwrap())
+                }
+                _ => None,
+            })
+            .expect("private shell returned a receipt");
+        assert!(receipt.get("initial").is_none());
+        assert!(receipt.get("pid").is_none());
+        assert!(!receipt.to_string().contains("PRIVATE_STDERR_SENTINEL"));
+        let id = ExecutionId(receipt["execution_id"].as_u64().unwrap());
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                let row = session.executions().get(id).unwrap();
+                if !row.status.is_pending() {
+                    assert_eq!(row.status, ExecutionStatus::Succeeded);
+                    assert!(!row.capabilities.input);
+                    let capture = row.output.unwrap().private_stdout.unwrap();
+                    assert_eq!(capture.channel, "stdout");
+                    assert_eq!(capture.media_type, "application/octet-stream");
+                    assert_eq!(capture.end_cursor, 4);
+                    assert!(capture.available && capture.closed && !capture.truncated);
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            session
+                .read_execution_output(id, 0, 1024)
+                .unwrap()
+                .chunks
+                .is_empty()
+        );
+        session
+            .executions()
+            .release(id, CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(
+            !session
+                .executions()
+                .get(id)
+                .unwrap()
+                .output
+                .unwrap()
+                .private_stdout
+                .unwrap()
+                .available
+        );
+        session.close().await.unwrap();
     }
 
     #[tokio::test]

@@ -1,5 +1,8 @@
 //! Runtime persistence; creators own storage, identity, and history selection.
+mod file_versions;
 mod memory;
+pub use file_versions::{FileVersions, MAX_FILE_VERSION_BYTES};
+pub(crate) use file_versions::{REREAD, exact as exact_file_version};
 mod types;
 
 use crate::Error;
@@ -149,6 +152,34 @@ impl AdmissionCheckpoint {
 /// and legacy workspace bytes never authorize filesystem restoration.
 #[async_trait]
 pub trait Journal: Send + Sync + 'static {
+    async fn load_file_versions(&self, _session: &str) -> Result<Option<FileVersions>, Error> {
+        Err(Error::config(
+            "Journal does not support durable file versions",
+        ))
+    }
+    async fn commit_file_versions(
+        &self,
+        _session: &str,
+        _versions: FileVersions,
+    ) -> Result<(), Error> {
+        Err(Error::config(
+            "Journal does not support durable file versions",
+        ))
+    }
+    fn supports_file_versions(&self) -> bool {
+        false
+    }
+    async fn retire_file_versions(&self, session: &str) -> Result<(), Error> {
+        if self.supports_file_versions()
+            && let Some(mut ledger) = self.load_file_versions(session).await?
+            && ledger.authority_bound()
+        {
+            ledger.retire()?;
+            ledger.advance()?;
+            self.commit_file_versions(session, ledger).await?;
+        }
+        Ok(())
+    }
     fn supports_communication(&self) -> bool {
         false
     }

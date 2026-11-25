@@ -12,6 +12,40 @@ service HostBridge {
   rpc Execute(HostFrame) returns (stream HostFrame);
 }
 
+// Separate authenticated gRPC-only service. These messages cannot appear in
+// HostFrame, a generic success body, or a WebSocket relay frame.
+service PrivateFiles {
+  rpc Read(PrivateFileRequest) returns (stream PrivateFileFrame);
+}
+
+message PrivateFileRequest {
+  string operation_id = 1;
+  string lease_generation = 2;
+  PrivateFileScope scope = 3;
+  uint32 remaining_budget_ms = 4;
+  string path = 5;
+  uint32 max_bytes = 6;
+}
+
+message PrivateFileScope {
+  string backend_id = 1;
+  string binding_id = 2;
+  string project_id = 3;
+}
+
+message PrivateFileFrame {
+  oneof body {
+    PrivateFileTransfer transfer = 1;
+    TransferChunk chunk = 2;
+  }
+}
+
+message PrivateFileTransfer {
+  string operation_id = 1;
+  uint32 byte_length = 2;
+  bytes sha256 = 3;
+}
+
 message HostFrame {
   oneof body {
     Pair pair = 1;
@@ -43,6 +77,10 @@ message Pair {
   optional string expected_workspace_id = 5;
   optional string expected_descriptor_digest = 6;
   optional string expected_workspace_root = 7;
+  // Native Control only: offer; absent or unrecognized means unavailable.
+  optional uint32 web_transport_version = 8;
+  // Additive method offer; never sufficient to authorize web transport.
+  optional bool web_transport_ws_pull = 9;
 }
 
 message Resume {
@@ -53,6 +91,10 @@ message Resume {
   optional string expected_workspace_id = 5;
   optional string expected_descriptor_digest = 6;
   optional string expected_workspace_root = 7;
+  // Native Control only: offer; absent or unrecognized means unavailable.
+  optional uint32 web_transport_version = 8;
+  // Additive method offer; never sufficient to authorize web transport.
+  optional bool web_transport_ws_pull = 9;
 }
 
 message WorkspaceBound {
@@ -65,6 +107,9 @@ message Hello {
   bytes descriptor_json = 1;
   string credential = 2;
   string lease_generation = 3;
+  // Acknowledge only after exact authenticated admission on the offered route.
+  optional uint32 web_transport_version = 4;
+  optional bool web_transport_ws_pull = 5;
 }
 
 message Request {

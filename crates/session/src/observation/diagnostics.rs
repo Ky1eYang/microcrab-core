@@ -154,6 +154,32 @@ pub enum LimitOwner {
     ExecutionBuffers,
 }
 
+/// Allowlisted engine failures and typed runtime stops. A limit is the configured
+/// allowance for the failed operation, not measured fuel used or elapsed time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "cause", rename_all = "snake_case", deny_unknown_fields)]
+pub enum WasmFailure {
+    Unreachable,
+    OutOfFuel {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fuel_limit: Option<u64>,
+    },
+    StackOverflow,
+    MemoryOutOfBounds,
+    TableOutOfBounds,
+    IntegerDivisionByZero,
+    IntegerOverflow,
+    BadConversionToInteger,
+    IndirectCallToNull,
+    BadSignature,
+    Interrupt,
+    Cancelled,
+    WallDeadline {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        wall_timeout_ms: Option<u64>,
+    },
+}
+
 /// Only producer-authored static text enters live diagnostics. Deserialization
 /// accepts bounded historical/ABI facts without granting native strings this port.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -216,7 +242,24 @@ pub struct ToolDiagnostic {
     /// This is descriptive metadata, never authorization to replay an operation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retryable: Option<bool>,
+    /// Safe, allowlisted Wasmtime/Session cause; raw native error text is never retained.
+    /// On WasmPoisoned this describes the earlier failure, not the skipped call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wasm_failure: Option<WasmFailure>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision_source: Option<PermissionDecisionSource>,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionDecisionSource {
+    ActionReview,
+    User,
+    Timeout,
+    Unavailable,
+    Interaction,
+}
+
 impl ToolDiagnostic {
     /// Common classification is a projection, not another serialized DTO field.
     pub fn failure_class(&self) -> FailureClass {
@@ -253,6 +296,8 @@ impl ToolDiagnostic {
             limit_owner: None,
             evidence_id: None,
             retryable: None,
+            wasm_failure: None,
+            decision_source: None,
         }
     }
     pub fn summary(&self) -> &str {
@@ -287,11 +332,14 @@ impl ToolDiagnostic {
             }
             DiagnosticCode::NotFound => "requested resource was not found",
             DiagnosticCode::Io => "Host I/O operation failed",
+            DiagnosticCode::WasmTrap if self.wasm_failure.is_some() => {
+                "WASM execution stopped for the cause in wasm_failure. After a recoverable failure, a new admitted call can use a fresh instance once old resource cleanup is confirmed. The failed call is not replayed; inspect existing jobs and external state before repeating it."
+            }
             DiagnosticCode::WasmTrap => {
-                "WASM guest execution trapped or failed; the original cause is unavailable in this safe diagnostic and effects are unknown. Inspect existing jobs and external state before repeating the operation. If the instance is poisoned, retrying in this epoch cannot recover it; request explicit Session compaction (effective on the next admitted input) or start a new Session"
+                "WASM guest execution trapped or failed; the original cause is unavailable in this diagnostic. After a recoverable failure, a new admitted call can use a fresh instance once cleanup is confirmed. The failed call is not replayed; its effects may be unknown."
             }
             DiagnosticCode::WasmPoisoned => {
-                "WASM component instance is unavailable after an earlier trap or worker failure; this invocation did not enter the guest. Retrying in the same epoch cannot recover it. Inspect existing jobs and external state from the earlier failure, then request explicit Session compaction (effective on the next admitted input) or start a new Session; do not automatically replay the failed operation"
+                "The previous WASM instance is unavailable and this call did not enter the guest. Any wasm_failure describes the earlier call, whose effects may be unknown. If recovery is waiting for cleanup, inspect the existing jobs and external state. Do not replay the earlier operation automatically."
             }
             DiagnosticCode::ToolFailed => {
                 "tool failed; the producer supplied no safe structured cause"
@@ -344,7 +392,14 @@ impl ToolDiagnostic {
                 "operation":widest(&[O::Shell,O::Read,O::Write,O::Glob,O::Grep,O::CacheCapture,O::Resource,O::Job]),
                 "requested_timeout_ms":u64::MAX, "effective_timeout_ms":u64::MAX,
                 "limit_owner":widest(&owners), "evidence_id":u64::MAX, "retryable":false,
-                "reason":reason, "json_line":u64::MAX, "json_column":u64::MAX
+                "reason":reason, "json_line":u64::MAX, "json_column":u64::MAX,
+                "decision_source":widest(&[PermissionDecisionSource::ActionReview, PermissionDecisionSource::User,
+                    PermissionDecisionSource::Timeout, PermissionDecisionSource::Unavailable, PermissionDecisionSource::Interaction]),
+                // Reserve the widest cause name and widest budget field independently.
+                "wasm_failure":{
+                    "cause":serde_json::json!(WasmFailure::BadConversionToInteger)["cause"],
+                    "wall_timeout_ms":u64::MAX
+                }
             }}).to_string();
             let context_bytes = serde_json::json!(&envelope).to_string().len() - 2;
             (envelope.len(), context_bytes)
@@ -461,14 +516,24 @@ mod tests {
                 diagnostic.retryable = Some(false);
                 for operation in [DiagnosticOperation::CacheCapture, DiagnosticOperation::Job] {
                     diagnostic.operation = Some(operation);
-                    assert!(diagnostic.result_json().len() <= ToolDiagnostic::max_result_bytes());
-                    assert!(
-                        serde_json::json!(diagnostic.result_json())
-                            .to_string()
-                            .len()
-                            - 2
-                            <= ToolDiagnostic::max_context_result_bytes()
-                    );
+                    for wasm_failure in [
+                        None,
+                        Some(WasmFailure::BadConversionToInteger),
+                        Some(WasmFailure::OutOfFuel {
+                            fuel_limit: Some(u64::MAX),
+                        }),
+                        Some(WasmFailure::WallDeadline {
+                            wall_timeout_ms: Some(u64::MAX),
+                        }),
+                    ] {
+                        diagnostic.wasm_failure = wasm_failure;
+                        let result = diagnostic.result_json();
+                        assert!(result.len() <= ToolDiagnostic::max_result_bytes());
+                        assert!(
+                            serde_json::json!(result).to_string().len() - 2
+                                <= ToolDiagnostic::max_context_result_bytes()
+                        );
+                    }
                 }
             }
         }
@@ -618,7 +683,9 @@ mod tests {
                 .summary()
                 .contains("original cause is unavailable")
         );
-        assert!(diagnostic.summary().contains("effects are unknown"));
+        assert!(diagnostic.summary().contains("effects may be unknown"));
+        assert!(diagnostic.summary().contains("once cleanup is confirmed"));
+        assert!(diagnostic.summary().contains("not replayed"));
     }
     #[test]
     fn buffer_capacity_has_safe_recovery_guidance_without_changing_old_diagnostics() {

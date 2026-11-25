@@ -6,7 +6,7 @@ use crate::sse::SseFrameReader;
 use crate::{Client, Content, ModelEvent, render_ast};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use futures_util::StreamExt;
-use microcrab_auditor::{Auditor, HookContext, HookPayload, Moment, VariableView};
+use microcrab_auditor::{Auditor, VariableView};
 use microcrab_protocol::{ImageSource, InputPart, Message, Request, Response, ToolCall, Usage};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -35,10 +35,49 @@ impl std::fmt::Debug for OpenAiResponseConfig {
     }
 }
 
+/// Callers authorize capability support; transport validates only the token shape.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct OpenAiResponseRequestOptions {
+    pub reasoning_effort: Option<String>,
+    pub prompt_cache_key: Option<String>,
+}
+
+impl OpenAiResponseRequestOptions {
+    pub fn validate(&self) -> Result<(), Error> {
+        crate::openai_compatible::validate_reasoning_effort(self.reasoning_effort.as_deref())?;
+        if self.prompt_cache_key.as_ref().is_some_and(|key| {
+            key.is_empty()
+                || key.len() > 128
+                || key.bytes().any(|byte| byte < 0x20 || byte == 0x7f)
+        }) {
+            return Err(Error::config("invalid prompt cache key"));
+        }
+        Ok(())
+    }
+}
+
+fn derive_prompt_cache_key(model: &str, system: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(b"microcrab-responses-cache-v1\0");
+    hasher.update(model.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(system.as_bytes());
+    let digest = hasher.finalize();
+    let mut hex = String::with_capacity(6 + 32);
+    hex.push_str("mc_v1_");
+    for byte in &digest[..16] {
+        use std::fmt::Write;
+        let _ = write!(hex, "{byte:02x}");
+    }
+    hex
+}
+
 #[derive(Clone)]
 pub struct OpenAiResponse {
     auth: crate::AuthMode,
     config: OpenAiResponseConfig,
+    options: OpenAiResponseRequestOptions,
     resolved_endpoint: String,
     http: reqwest::Client,
     observer: Option<std::sync::Arc<dyn crate::ModelObserver>>,
@@ -103,11 +142,21 @@ impl OpenAiResponse {
         Ok(Self {
             auth: crate::AuthMode::default(),
             config,
+            options: OpenAiResponseRequestOptions::default(),
             resolved_endpoint: endpoint,
             http,
             observer: None,
             recording: None,
         })
+    }
+
+    pub fn with_request_options(
+        mut self,
+        options: OpenAiResponseRequestOptions,
+    ) -> Result<Self, Error> {
+        options.validate()?;
+        self.options = options;
+        Ok(self)
     }
 
     pub fn with_auth_mode(mut self, auth: crate::AuthMode) -> Self {
@@ -126,16 +175,16 @@ impl OpenAiResponse {
     }
 
     pub fn adapt(&self, request: &Request) -> Result<Value, Error> {
-        let mut instructions = String::new();
-        let mut input: Vec<Value> = Vec::new();
+        let mut system_prompt = String::new();
+        let mut rest_input: Vec<Value> = Vec::new();
 
         for msg in &request.messages {
             match msg {
                 Message::System { content } => {
-                    if !instructions.is_empty() {
-                        instructions.push('\n');
+                    if !system_prompt.is_empty() {
+                        system_prompt.push('\n');
                     }
-                    instructions.push_str(content);
+                    system_prompt.push_str(content);
                 }
                 Message::User { parts } => {
                     let mut content_parts = Vec::new();
@@ -178,7 +227,7 @@ impl OpenAiResponse {
                             },
                         }
                     }
-                    input.push(json!({
+                    rest_input.push(json!({
                         "role": "user",
                         "content": content_parts,
                     }));
@@ -188,7 +237,7 @@ impl OpenAiResponse {
                     tool_calls,
                     provider_metadata,
                 } => {
-                    input.extend(crate::replay::native_parts(
+                    rest_input.extend(crate::replay::native_parts(
                         content,
                         tool_calls,
                         provider_metadata,
@@ -219,7 +268,7 @@ impl OpenAiResponse {
                         }
                         Value::Array(blocks)
                     };
-                    input.push(json!({
+                    rest_input.push(json!({
                         "type": "function_call_output",
                         "call_id": call_id,
                         "output": output,
@@ -227,6 +276,15 @@ impl OpenAiResponse {
                 }
             }
         }
+
+        let mut input = Vec::with_capacity(rest_input.len() + usize::from(!system_prompt.is_empty()));
+        if !system_prompt.is_empty() {
+            input.push(json!({
+                "role": "developer",
+                "content": system_prompt,
+            }));
+        }
+        input.extend(rest_input);
 
         let mut body = json!({
             "model": self.config.model,
@@ -237,8 +295,14 @@ impl OpenAiResponse {
             "max_output_tokens": request.max_output_tokens,
         });
 
-        if !instructions.is_empty() {
-            body["instructions"] = json!(instructions);
+        if let Some(effort) = &self.options.reasoning_effort {
+            body["reasoning"] = json!({ "effort": effort });
+        }
+
+        if let Some(key) = &self.options.prompt_cache_key {
+            body["prompt_cache_key"] = json!(key);
+        } else if !system_prompt.is_empty() {
+            body["prompt_cache_key"] = json!(derive_prompt_cache_key(&self.config.model, &system_prompt));
         }
 
         if !request.tools.is_empty() {
@@ -389,7 +453,9 @@ impl OpenAiResponse {
                 }
             }
             audit.stream_complete();
-            sse_decoder.finish(request)?
+            let response = sse_decoder.finish(request)?;
+            audit.normalized();
+            response
         } else if is_json {
             let value: Value = serde_json::from_slice(&audit.received).map_err(Error::decode)?;
             // Only explicit plaintext is display evidence. Never expose signatures,
@@ -414,6 +480,7 @@ impl OpenAiResponse {
                 })
                 .collect::<Vec<_>>();
             let response = decode_json_response(value, request)?;
+            audit.normalized();
             for text in reasoning {
                 emit(&events, observation, ModelEvent::ReasoningDelta { text }).await?;
             }
@@ -482,6 +549,19 @@ impl Client for OpenAiResponse {
         cancellation: CancellationToken,
         events: Option<tokio::sync::mpsc::Sender<ModelEvent>>,
     ) -> Result<Response, Error> {
+        self.stream_admitted_outcome(content, auditor, variables, cancellation, events)
+            .await
+            .map(|outcome| outcome.response)
+    }
+
+    async fn stream_admitted_outcome(
+        &self,
+        content: &Content,
+        auditor: &dyn Auditor,
+        variables: &dyn VariableView,
+        cancellation: CancellationToken,
+        events: Option<tokio::sync::mpsc::Sender<ModelEvent>>,
+    ) -> Result<crate::ResponseOutcome, Error> {
         let ast = render_ast(content)?;
         let request = serde_json::to_string(&self.adapt(&ast)?)?;
         if request.len() > content.max_bytes {
@@ -489,32 +569,15 @@ impl Client for OpenAiResponse {
         }
         let call_id = uuid::Uuid::new_v4().to_string();
 
-        let injection = tokio::select! {
-            biased;
-            _ = cancellation.cancelled() => return Err(Error::Cancelled),
-            result = auditor.intervene(
-                Moment::RequestPrepared,
-                HookContext {
-                    epoch: content.epoch,
-                    subagent: content.subagent.clone(),
-                    turn: content.turn_id,
-                    round: content.round,
-                    call_id: Some(call_id.clone()),
-                    request_body: Some(&request),
-                    max_request_bytes: Some(content.max_bytes),
-                    variables,
-                    payload: HookPayload::None,
-                },
-            ) => result?,
-        };
-
-        let request = match injection.request_body {
-            Some(replacement) => {
-                crate::validate_request_rewrite(&request, &replacement, content.max_bytes)?;
-                replacement
-            }
-            None => request,
-        };
+        let request = crate::call::intervene_request(
+            auditor,
+            content,
+            variables,
+            &cancellation,
+            &call_id,
+            request,
+        )
+        .await?;
 
         if cancellation.is_cancelled() {
             return Err(Error::Cancelled);
@@ -540,7 +603,7 @@ impl Client for OpenAiResponse {
             },
         };
         let result = result.map_err(|error| audit.measured_error(error));
-        audit.finish(&result);
+        let attempt = audit.finish(&result);
         let finishing = observation.finish(&result);
         tokio::select! {
             biased;
@@ -548,7 +611,7 @@ impl Client for OpenAiResponse {
             _ = cancellation.cancelled() => {},
         }
 
-        result
+        result.map(|response| crate::ResponseOutcome { response, attempt })
     }
 }
 
@@ -1072,9 +1135,11 @@ impl OpenAiResponsesSseDecoder {
                 }
                 self.completed = true;
             }
-            "response.failed" | "response.incomplete" | "error" => {
-                return Err(crate::failure::provider_failure(&value));
+            "response.failed" | "error" => {
+                return Err(crate::media::in_band_fetch_rejection(&value)
+                    .unwrap_or_else(|| crate::failure::provider_failure(&value)));
             }
+            "response.incomplete" => return Err(crate::failure::provider_failure(&value)),
             "response.created"
             | "response.in_progress"
             | "response.content_part.added"
@@ -1572,6 +1637,87 @@ mod tests {
         .unwrap();
         let body = client.adapt(&request).unwrap();
         assert_eq!(body["tools"][0]["parameters"], schema);
+    }
+
+    #[test]
+    fn adapt_uses_developer_prefix_auto_prompt_cache_key_and_reasoning_effort() {
+        let base_config = || OpenAiResponseConfig {
+            endpoint: "http://127.0.0.1:1/responses".into(),
+            model: "gpt-6.2-sol".into(),
+            api_key: None,
+            timeout_ms: 1000,
+            max_response_bytes: 65536,
+        };
+        let req = |system: &str| Request {
+            epoch: 1,
+            messages: vec![
+                Message::System {
+                    content: system.into(),
+                },
+                Message::User {
+                    parts: vec![InputPart::Text {
+                        text: "hello".into(),
+                    }],
+                },
+            ],
+            tools: vec![],
+            max_output_tokens: 128,
+        };
+
+        let client = OpenAiResponse::new(base_config())
+            .unwrap()
+            .with_request_options(OpenAiResponseRequestOptions {
+                reasoning_effort: Some("medium".into()),
+                prompt_cache_key: None,
+            })
+            .unwrap();
+        let body_a = client.adapt(&req("agent A system")).unwrap();
+        let body_a_repeat = client.adapt(&req("agent A system")).unwrap();
+        let body_b = client.adapt(&req("agent B system")).unwrap();
+
+        assert!(body_a.get("instructions").is_none());
+        assert_eq!(body_a["input"][0]["role"], "developer");
+        assert_eq!(body_a["input"][0]["content"], "agent A system");
+        assert_eq!(body_a["reasoning"], json!({ "effort": "medium" }));
+        assert_eq!(body_a["prompt_cache_key"], body_a_repeat["prompt_cache_key"]);
+        assert_ne!(body_a["prompt_cache_key"], body_b["prompt_cache_key"]);
+
+        let empty_system = client.adapt(&req("")).unwrap();
+        assert_eq!(empty_system["input"].as_array().unwrap().len(), 1);
+        assert_eq!(empty_system["input"][0]["role"], "user");
+        assert!(empty_system.get("prompt_cache_key").is_none());
+
+        let override_client = OpenAiResponse::new(base_config())
+            .unwrap()
+            .with_request_options(OpenAiResponseRequestOptions {
+                reasoning_effort: None,
+                prompt_cache_key: Some("explicit-key".into()),
+            })
+            .unwrap();
+        let override_body = override_client.adapt(&req("agent A system")).unwrap();
+        assert_eq!(override_body["prompt_cache_key"], "explicit-key");
+        assert!(override_body.get("reasoning").is_none());
+
+        for bad in [
+            OpenAiResponseRequestOptions {
+                reasoning_effort: Some("default".into()),
+                prompt_cache_key: None,
+            },
+            OpenAiResponseRequestOptions {
+                reasoning_effort: Some("bad effort".into()),
+                prompt_cache_key: None,
+            },
+            OpenAiResponseRequestOptions {
+                reasoning_effort: None,
+                prompt_cache_key: Some("".into()),
+            },
+            OpenAiResponseRequestOptions {
+                reasoning_effort: None,
+                prompt_cache_key: Some("bad\nkey".into()),
+            },
+        ] {
+            assert!(OpenAiResponse::new(base_config()).unwrap().with_request_options(bad).is_err());
+        }
     }
 
     fn push(decoder: &mut OpenAiResponsesSseDecoder, value: Value) -> Result<(), Error> {

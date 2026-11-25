@@ -1,6 +1,6 @@
 //! General process/shell imports. Runtime supplies policy and Session ownership;
 //! Host interfaces contain only process resources, pipe bytes and capture facts.
-use super::super::microcrab::host::shell;
+use super::super::microcrab::host0_1_0::shell;
 #[cfg(test)]
 mod tests;
 
@@ -63,6 +63,7 @@ fn operation<T>(
     let mut authoritative = false;
     let mut normalization_diagnostic = None;
     let mut admitted_scope = None;
+    let mut attempted_spawn = false;
     let result = runtime.block_on(async {
         let _cancel_on_drop = context.cancel.clone().drop_guard();
         tokio::select! { biased;
@@ -76,12 +77,19 @@ fn operation<T>(
                     }
                     normalized
                 } else { resources };
-                if creating { admitted_scope=Some((resources,arguments)); }
+                if creating {
+                    admitted_scope = Some((resources, arguments));
+                    attempted_spawn = true;
+                }
                 work(backend.clone(), invocation, context.clone()).await.map_err(|failure| { authoritative = failure.authoritative; failure.wire })
             }) => result,
         }
     }).map_err(|source| { let mut failure = host_error(source); failure.authoritative = authoritative; failure });
     if creating {
+        // A native startup can outlive its waiter while the process registry
+        // contains it. No exact receipt was returned for this generation to
+        // join, so a later trap cannot authorize an in-epoch replacement.
+        state.process_launch_uncertain |= attempted_spawn && result.is_err();
         state.admitted_process_scope = if result.is_ok() { admitted_scope } else { None };
     }
     state.operation_diagnostic = normalization_diagnostic;
@@ -175,6 +183,94 @@ fn launch_scope(
     }
     Ok(())
 }
+pub(in crate::runtime::wasm) fn launch_private_shell(
+    state: &mut RuntimeState,
+    request: shell::ShellRequest,
+    media_type: &str,
+    writer: crate::runtime::execution::OutputWriter,
+) -> wasmtime::Result<(
+    Result<Arc<dyn crate::runtime::execution::ExecutionController>, types::HostError>,
+)> {
+    let result = (|| {
+        let cwd = request.cwd.as_deref().unwrap_or(".").to_owned();
+        launch_scope(state, &request.command, &cwd)?;
+        if !state
+            .host
+            .as_ref()
+            .is_some_and(|host| private_shell_supported(host.as_ref()))
+        {
+            return Err(error(
+                types::ErrorCategory::Unsupported,
+                "Private shell capture is unavailable on this Host",
+            ));
+        }
+        // Require the actual admitted selector. A text shell's blanket default
+        // cannot be used to reach the private launch import.
+        let invocation = state
+            .tool_context
+            .as_ref()
+            .ok_or_else(|| error(types::ErrorCategory::Permission, "Invocation absent"))?;
+        let admitted = invocation.admitted_arguments().map_err(|_| {
+            error(
+                types::ErrorCategory::Permission,
+                "Private capture requires admitted arguments",
+            )
+        })?;
+        if admitted.get("capture").and_then(Value::as_str) != Some("private")
+            || admitted.get("media_type").and_then(Value::as_str) != Some(media_type)
+        {
+            return Err(error(
+                types::ErrorCategory::Permission,
+                "Private capture was not admitted",
+            ));
+        }
+        let effective = state
+            .operation_scope
+            .as_ref()
+            .map(|(_, arguments)| arguments);
+        if !effective.is_some_and(|arguments| {
+            arguments.get("command").and_then(Value::as_str) == Some(request.command.as_str())
+                && arguments.get("cwd").and_then(Value::as_str) == request.cwd.as_deref()
+        }) {
+            return Err(error(
+                types::ErrorCategory::Permission,
+                "Private shell request differs from admitted arguments",
+            ));
+        }
+        let bytes = request
+            .command
+            .len()
+            .saturating_add(cwd.len())
+            .saturating_add(media_type.len());
+        let args = json!({"operation":"shell.launch-private","cwd":cwd});
+        let result = operation(
+            state,
+            bytes,
+            true,
+            vec![cwd],
+            args,
+            move |_backend, invocation, context| {
+                Box::pin(async move {
+                    invocation
+                        .launch_private_output(
+                            host::PrivateShellRequest {
+                                command: request.command,
+                                cwd: request.cwd.map(Into::into),
+                            },
+                            writer,
+                            context.cancel,
+                        )
+                        .await
+                        .map_err(session_error)
+                })
+            },
+        );
+        state.admitted_process_scope = None;
+        result
+    })();
+    finish(state, result)
+}
+
 pub(super) fn launch(
     mut caller: StoreContextMut<'_, RuntimeState>,
     (request,): (shell::ShellRequest,),
@@ -223,18 +319,19 @@ pub(super) fn launch(
                 })
             },
         )?;
-        let pid = state
-            .tool_context
-            .as_ref()
-            .and_then(|c| c.processes.process_pid(handle))
-            .ok_or_else(|| error(types::ErrorCategory::Io, "Process receipt absent"))?;
         let grant = state.admitted_process_scope.take().ok_or_else(|| {
+            state.process_launch_uncertain = true;
             error(
                 types::ErrorCategory::Permission,
                 "Canonical process creation authority absent",
             )
         })?;
         state.process_grants.insert(handle.0.0, grant);
+        let pid = state
+            .tool_context
+            .as_ref()
+            .and_then(|c| c.processes.process_pid(handle))
+            .ok_or_else(|| error(types::ErrorCategory::Io, "Process receipt absent"))?;
         Ok(process::ProcessHandle {
             id: handle.0.0,
             pid,
@@ -282,18 +379,19 @@ pub(super) fn spawn(
                 })
             },
         )?;
-        let pid = state
-            .tool_context
-            .as_ref()
-            .and_then(|c| c.processes.process_pid(handle))
-            .ok_or_else(|| error(types::ErrorCategory::Io, "Process receipt absent"))?;
         let grant = state.admitted_process_scope.take().ok_or_else(|| {
+            state.process_launch_uncertain = true;
             error(
                 types::ErrorCategory::Permission,
                 "Canonical process creation authority absent",
             )
         })?;
         state.process_grants.insert(handle.0.0, grant);
+        let pid = state
+            .tool_context
+            .as_ref()
+            .and_then(|c| c.processes.process_pid(handle))
+            .ok_or_else(|| error(types::ErrorCategory::Io, "Process receipt absent"))?;
         Ok(process::ProcessHandle {
             id: handle.0.0,
             pid,

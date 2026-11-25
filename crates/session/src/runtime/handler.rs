@@ -1,6 +1,12 @@
 //! Admitted-turn execution over live State. Permission gates every tool dispatch.
 use super::journal::RoundContinuation;
-use super::tool::{ToolContext, ToolRegistration, ToolRegistry};
+use super::tool::{
+    DialogueReplyOwner, DialogueReplyRegistration, ToolContext, ToolRegistration, ToolRegistry,
+    view_image,
+};
+
+mod image_media;
+pub(crate) mod permissions;
 use crate::ModelEvent;
 use crate::boundary::Boundary;
 use crate::context::Context;
@@ -23,24 +29,12 @@ use tokio_util::sync::CancellationToken;
 struct UsageRequestAuditor<'a> {
     inner: &'a dyn Auditor,
     rewritten: std::sync::atomic::AtomicBool,
-    accepted_producer: std::sync::Mutex<Option<String>>,
 }
 impl Auditor for UsageRequestAuditor<'_> {
     fn is_enabled(&self) -> bool {
         self.inner.is_enabled()
     }
     fn publish(&self, moment: Moment, body: AuditBody) {
-        if moment == Moment::RoundCompleted
-            && matches!(
-                body.outcome,
-                Some(microcrab_auditor::AuditOutcome::Accepted)
-            )
-        {
-            *self
-                .accepted_producer
-                .lock()
-                .unwrap_or_else(|e| e.into_inner()) = body.call_id.clone();
-        }
         self.inner.publish(moment, body);
     }
     fn intervene<'a>(
@@ -68,6 +62,7 @@ pub enum TurnStopReason {
     #[default]
     ModelCompleted,
     RoundLimit,
+    RepeatedInvalidToolArguments,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -92,9 +87,10 @@ pub trait RuntimeHandler: Send + Sync {
 }
 
 pub struct Runtime {
-    tools: std::sync::RwLock<Arc<ToolRegistry>>,
+    tools: Arc<std::sync::RwLock<permissions::AppliedCatalog>>,
     controls:
         std::sync::RwLock<Option<std::sync::Weak<dyn super::tool::switch_mode::SessionControl>>>,
+    reply_owner: std::sync::OnceLock<std::sync::Weak<dyn DialogueReplyOwner>>,
     permission: Arc<crate::policy::PermissionController>,
     delegate: Option<Arc<dyn super::tool::delegate::DelegateExecutor>>,
 }
@@ -125,8 +121,11 @@ impl Runtime {
                 })?;
         }
         Ok(Self {
-            tools: std::sync::RwLock::new(Arc::new(tools)),
+            tools: Arc::new(std::sync::RwLock::new(permissions::AppliedCatalog::new(
+                tools,
+            ))),
             controls: std::sync::RwLock::new(None),
+            reply_owner: std::sync::OnceLock::new(),
             permission: controller,
             delegate: None,
         })
@@ -148,6 +147,12 @@ impl Runtime {
         if registry.origin(&call.name) == Some(super::tool::ToolOrigin::Builtin) {
             if call.name == "job" {
                 crate::runtime::execution::job::validate(&call.arguments)
+                    .and_then(|_| {
+                        crate::runtime::execution::job::bind_redirect_destination(
+                            &call.arguments,
+                            invocation,
+                        )
+                    })
                     .map_err(|e| PermissionError::InvalidConfiguration(e.to_string()))?;
                 if let Some(action) = call
                     .arguments
@@ -211,6 +216,11 @@ impl Runtime {
                 "direct admission execution identity mismatch".into(),
             ));
         }
+        #[cfg(feature = "wasm")]
+        registry
+            .bind_file_versions(call, invocation)
+            .await
+            .map_err(|e| PermissionError::InvalidConfiguration(e.diagnostic_reason()))?;
         let snapshot = self.permission.snapshot()?;
         let request = PermissionRequest {
             subject: invocation.subject.clone(),
@@ -224,7 +234,12 @@ impl Runtime {
         };
         let proof = self
             .permission
-            .admit(&request, invocation, issuer, registry.component(&call.name))
+            .admit(
+                &request,
+                invocation,
+                issuer,
+                registry.admission_identity(&call.name),
+            )
             .await?;
         if !Arc::ptr_eq(&registry, &self.registry()) {
             return Err(PermissionError::StalePolicy);
@@ -353,6 +368,13 @@ impl Runtime {
     ) {
         *self.controls.write().unwrap_or_else(|e| e.into_inner()) = Some(control);
     }
+    pub(crate) fn bind_dialogue_reply_owner(&self, owner: std::sync::Weak<dyn DialogueReplyOwner>) {
+        // Runtime is moved into a single Session; there is no public rebinding path.
+        let _ = self.reply_owner.set(owner);
+    }
+    pub(crate) fn dialogue_reply_is_registered(&self, name: &str, identity: &str) -> bool {
+        self.registry().dialogue_reply_is_registered(name, identity)
+    }
     fn controls(&self) -> Option<Arc<dyn super::tool::switch_mode::SessionControl>> {
         self.controls
             .read()
@@ -364,17 +386,18 @@ impl Runtime {
         self.tools
             .read()
             .unwrap_or_else(|error| error.into_inner())
+            .registry
             .clone()
     }
     /// Initial Session assembly only; never changes an already frozen epoch.
     pub(crate) fn configure_conversation_tools(
         &self,
         identity: Option<&crate::state::communication::ConversationIdentity>,
-        external_dialogue_replies: bool,
+        interactive_root: bool,
     ) -> Result<(), Error> {
         let registry = Arc::new(
             self.registry()
-                .for_conversation(identity, external_dialogue_replies)?,
+                .for_conversation(identity, interactive_root)?,
         );
         let provider = registry.provider_defaults()?;
         let snapshot = self
@@ -383,12 +406,10 @@ impl Runtime {
             .map_err(|error| {
                 Error::config_with_private(error.public_reason(), error.to_string())
             })?;
-        self.permission
-            .publish_tools(registry.origins(), provider, snapshot)
+        self.publish_catalog(registry, provider, snapshot)
             .map_err(|error| {
                 Error::config_with_private(error.public_reason(), error.to_string())
             })?;
-        self.publish_registry(registry);
         Ok(())
     }
     pub(crate) fn prepare_external_tools(
@@ -397,12 +418,22 @@ impl Runtime {
     ) -> Result<Arc<ToolRegistry>, Error> {
         Ok(Arc::new(self.registry().replacing_external(tools)?))
     }
-    pub(crate) fn publish_registry(&self, registry: Arc<ToolRegistry>) {
-        *self
-            .tools
-            .write()
-            .unwrap_or_else(|error| error.into_inner()) = registry;
+    pub(crate) fn prepare_model_catalog(
+        &self,
+        owner: &dyn crate::ModelAdmission,
+        effect: Option<&DialogueReplyRegistration>,
+        external: Option<Vec<Arc<dyn super::tool::Tool>>>,
+    ) -> Result<Arc<ToolRegistry>, Error> {
+        let current = self.registry();
+        let registry = current.replacing_dialogue_reply(owner, effect)?;
+        let registry = match external {
+            Some(external) => registry.replacing_external(external)?,
+            None => registry,
+        };
+        registry.validate_model_owner(owner)?;
+        Ok(Arc::new(registry))
     }
+
     pub(crate) fn delegate_available(&self) -> bool {
         self.delegate.is_some() && self.origin("delegate").is_some()
     }
@@ -434,6 +465,8 @@ impl Runtime {
     ) -> Result<TurnOutcome, Error> {
         let limits = state.snapshot().limits;
         limits.validate()?;
+        super::execution::job::require_current_definition(context.frozen_tools())?;
+        view_image::require_current_definition(context.frozen_tools())?;
         let turn = cancellation.child_token();
         let _cancel = CancelOnDrop(turn.clone());
         self.run_turn(
@@ -530,6 +563,8 @@ impl Runtime {
             .unwrap_or((1, 0, Usage::default()));
         let mut sending = true;
         let mut last_content = String::new();
+        let https = Arc::new(std::sync::Mutex::new(None));
+        let mut invalid_image = None;
         loop {
             if cancellation.is_cancelled() {
                 if prepared {
@@ -644,11 +679,16 @@ impl Runtime {
                     stop_reason,
                 });
             }
+            let pending_image = https
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .take();
+            let projecting_image = pending_image.is_some();
             if !prepared_request && let Err(error) = recorder.check_request(context) {
                 recorder
                     .record(
                         context,
-                        Some(RoundContinuation {
+                        (!projecting_image).then(|| RoundContinuation {
                             next_round: round,
                             unattended_rounds: unattended,
                             usage: usage.clone(),
@@ -671,28 +711,31 @@ impl Runtime {
             let mut content = context.content(limits.max_output_tokens)?;
             content.turn_id = state.snapshot().turn_id;
             content.round = Some(round as u64);
-            let usage_request = context.capture_usage_request(recorder.request_route(&content)?)?;
+            let usage_request = if projecting_image {
+                None
+            } else {
+                context.capture_usage_request(recorder.request_route(&content)?)?
+            };
             let usage_auditor = UsageRequestAuditor {
                 inner: auditor,
                 rewritten: std::sync::atomic::AtomicBool::new(false),
-                accepted_producer: std::sync::Mutex::new(None),
             };
             // Transport owns the renewable inactivity window. Session imposes no
             // elapsed-turn ceiling, but caller cancellation must interrupt a model
             // wait even when an embedding Client does not observe its token.
             // Only this model wait and pure response validation certify no admitted batch.
             let candidate: Result<_, Error> = async {
-                let response = tokio::select! { biased;
-                    _ = cancellation.cancelled() => Err(microcrab_transport::Error::Cancelled),
-                    result = client.stream_admitted(
-                        &content,
-                        &usage_auditor,
-                        state,
-                        cancellation.clone(),
-                        events.clone(),
-                    ) => result,
+                let outcome = if let Some(pending_image) = pending_image {
+                    image_media::run(context, &mut content, pending_image, state, client, &usage_auditor, recorder, &cancellation, events.clone(), RoundContinuation {
+                        next_round: round, unattended_rounds: unattended - 1, usage: usage.clone(), request_prepared: true, state_observation_pending: false,
+                    }).await?
+                } else {
+                    tokio::select! { biased;
+                        _ = cancellation.cancelled() => Err(microcrab_transport::Error::Cancelled),
+                        result = client.stream_admitted_outcome(&content, &usage_auditor, state, cancellation.clone(), events.clone()) => result,
+                    }.map_err(Error::from)?
                 };
-                let response = response.map_err(Error::from)?;
+                let response = outcome.response;
                 if cancellation.is_cancelled() {
                     return Err(Error::Cancelled);
                 }
@@ -786,24 +829,25 @@ impl Runtime {
                     state.update(|snapshot| snapshot.limits.max_context_bytes = next);
                     limits = state.snapshot().limits;
                 }
-                Ok(response)
+                Ok((response, outcome.attempt))
             }
             .await;
-            let response = match candidate {
-                Ok(response) => response,
+            let (response, attempt) = match candidate {
+                Ok(outcome) => outcome,
                 Err(error) => {
-                    if matches!(
-                        &error,
-                        Error::Cancelled
-                            | Error::ProviderStatus { .. }
-                            | Error::Transport
-                            | Error::TransportFailure(_)
-                            | Error::ProviderTimeout
-                            | Error::ProviderIdleTimeout(_)
-                            | Error::Provider(_)
-                            | Error::Protocol(_)
-                            | Error::Json(_)
-                    ) || matches!(&error, Error::Limit(limit) if limit.is_pre_effect())
+                    if !projecting_image
+                        && (matches!(
+                            &error,
+                            Error::Cancelled
+                                | Error::ProviderStatus { .. }
+                                | Error::Transport
+                                | Error::TransportFailure(_)
+                                | Error::ProviderTimeout
+                                | Error::ProviderIdleTimeout(_)
+                                | Error::Provider(_)
+                                | Error::Protocol(_)
+                                | Error::Json(_)
+                        ) || matches!(&error, Error::Limit(limit) if limit.is_pre_effect()))
                     {
                         recorder
                             .record(
@@ -823,6 +867,9 @@ impl Runtime {
                 }
             };
             if cancellation.is_cancelled() {
+                if projecting_image {
+                    return Err(Error::Cancelled);
+                }
                 recorder
                     .record(
                         context,
@@ -852,16 +899,15 @@ impl Runtime {
                 &cancellation,
             )
             .await?;
+            if cancellation.is_cancelled() {
+                return Err(Error::Cancelled);
+            }
+            let assistant_index = context.admitted_items().1.len();
             context.append_response(&response)?;
             recorder.set_model_retry_ready(false);
-            let producer = usage_auditor
-                .accepted_producer
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .clone();
             let (epoch, items) = context.admitted_items();
             client
-                .observe_admitted(epoch, items, producer.as_deref())
+                .observe_response_admitted(epoch, items, assistant_index, attempt.as_ref())
                 .await;
             let usage_request = if usage_auditor
                 .rewritten
@@ -905,16 +951,28 @@ impl Runtime {
                     &cancellation,
                 )
                 .await?;
-                self.execute_calls(
-                    state,
-                    context,
-                    &response,
-                    auditor,
-                    &cancellation,
-                    recorder,
-                    client,
-                )
-                .await?;
+                let malformed = self
+                    .execute_calls(
+                        state,
+                        context,
+                        &response,
+                        auditor,
+                        &cancellation,
+                        recorder,
+                        client,
+                        &https,
+                    )
+                    .await?;
+                invalid_image = match (invalid_image, malformed) {
+                    (Some((old, count)), Some(current)) if old == current => {
+                        Some((current, count + 1_u8))
+                    }
+                    (_, Some(current)) => Some((current, 1)),
+                    _ => None,
+                };
+                if invalid_image.as_ref().is_some_and(|(_, count)| *count >= 3) {
+                    stop_reason = TurnStopReason::RepeatedInvalidToolArguments;
+                }
                 crate::observation::hooks::boundary(
                     auditor,
                     state,
@@ -933,10 +991,28 @@ impl Runtime {
             if let Some(control) = self.controls() {
                 control.apply_pending_mode()?;
             }
+            if stop_reason == TurnStopReason::RepeatedInvalidToolArguments {
+                recorder.record(context, None).await?;
+                return Ok(TurnOutcome {
+                    content: last_content,
+                    rounds: round,
+                    usage,
+                    stop_reason,
+                });
+            }
             let next_round = round.checked_add(1).ok_or_else(|| {
                 crate::budget::reject(crate::LimitKind::Arithmetic, "round ordinal overflow")
             })?;
-            if sending {
+            let pending_archive = https
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .is_some();
+            if sending && pending_archive {
+                // Persist the settled receipt without certifying a provider retry:
+                // the fresh source is invocation-local and cannot be replayed.
+                recorder.record(context, None).await?;
+            }
+            if sending && !pending_archive {
                 recorder
                     .record(
                         context,
@@ -950,20 +1026,22 @@ impl Runtime {
                     )
                     .await?;
             }
-            recorder
-                .compact_boundary(
-                    context,
-                    sending.then(|| RoundContinuation {
-                        next_round,
-                        unattended_rounds: unattended,
-                        usage: usage.clone(),
-                        request_prepared: false,
-                        state_observation_pending: false,
-                    }),
-                    !sending,
-                    &cancellation,
-                )
-                .await?;
+            if !pending_archive {
+                recorder
+                    .compact_boundary(
+                        context,
+                        sending.then(|| RoundContinuation {
+                            next_round,
+                            unattended_rounds: unattended,
+                            usage: usage.clone(),
+                            request_prepared: false,
+                            state_observation_pending: false,
+                        }),
+                        !sending,
+                        &cancellation,
+                    )
+                    .await?;
+            }
             round = next_round;
         }
     }
@@ -981,7 +1059,9 @@ impl Runtime {
         cancellation: &CancellationToken,
         recorder: &impl RoundRecorder,
         client: &dyn Client,
-    ) -> Result<(), Error> {
+        https: &Arc<std::sync::Mutex<Option<view_image::PendingHttps>>>,
+    ) -> Result<Option<String>, Error> {
+        let mut malformed_image = None;
         let limits = state.snapshot().limits;
         let tool_registry = self.registry();
         // The assistant was appended before entering this batch; execution order
@@ -1002,11 +1082,17 @@ impl Runtime {
                     call,
                     None,
                     super::tool::injection::LiteralMask::default(),
+                    0usize,
                 )
             })
             .collect::<std::collections::VecDeque<_>>();
-        while let Some((call_index, mut normalized, prepared, mut literal_mask)) =
-            pending.pop_front()
+        while let Some((
+            call_index,
+            mut normalized,
+            prepared,
+            mut literal_mask,
+            mut text_conversions,
+        )) = pending.pop_front()
         {
             if cancellation.is_cancelled() {
                 return Err(Error::Cancelled);
@@ -1023,8 +1109,20 @@ impl Runtime {
                     Instant::now(),
                 )
             });
+            let authored_image_arguments = (normalized.name == view_image::NAME
+                && tool_registry.origin(&normalized.name)
+                    == Some(super::tool::ToolOrigin::Builtin))
+            .then(|| normalized.arguments.clone());
+            let image_source = authored_image_arguments.as_ref().map(|arguments| {
+                view_image::bind_dispatch(arguments, state, limits.max_context_bytes).map(Arc::new)
+            });
+            if response.tool_calls.len() == 1
+                && let Some(Err(error)) = &image_source
+            {
+                malformed_image = image_media::malformed_key(&normalized.arguments, error);
+            }
             let mut expansion_error = None;
-            if prepared.is_none() {
+            if prepared.is_none() && image_source.is_none() {
                 let injection = crate::observation::hooks::intervene_recorded(
                     auditor,
                     state,
@@ -1036,6 +1134,7 @@ impl Runtime {
                     cancellation,
                     AuditBody {
                         tool_call_id: Some(normalized.id.clone()),
+                        tool_presentation: tool_registry.interaction_presentation(&normalized.name),
                         started_at_unix_ms: clock.0,
                         ..Default::default()
                     },
@@ -1045,21 +1144,34 @@ impl Runtime {
                 if let Some(arguments) = injection.tool_arguments {
                     normalized.arguments = arguments;
                 }
+                text_conversions = tool_registry.convert_text_arguments(&mut normalized);
+                #[cfg(feature = "wasm")]
+                tool_registry.apply_glob_path_default(&mut normalized);
                 // Visible expansion is a derived copy. Context and the ToolCall audit
                 // retain the authored or hook-replaced placeholders.
-                match super::tool::injection::expand_visible(
-                    &normalized.arguments,
-                    &state.injection_view(),
-                    limits.max_context_bytes,
-                ) {
-                    Ok((arguments, mask)) => {
-                        normalized.arguments = arguments;
-                        literal_mask = mask;
+                if !tool_registry.uses_literal_sources(&normalized) {
+                    match super::tool::injection::expand_visible(
+                        &normalized.arguments,
+                        &state.injection_view(),
+                        limits.max_context_bytes,
+                    ) {
+                        Ok((arguments, mask)) => {
+                            if normalized.name == "job"
+                                && super::execution::job::is_redirect(&arguments)
+                            {
+                                expansion_error = Some(Error::tool(
+                                    "job redirect action and selectors must be authored literally",
+                                ));
+                            } else {
+                                normalized.arguments = arguments;
+                                literal_mask = mask;
+                            }
+                        }
+                        Err(error) => expansion_error = Some(error),
                     }
-                    Err(error) => expansion_error = Some(error),
                 }
                 if expansion_error.is_none() {
-                    if rewritten {
+                    if rewritten || text_conversions != 0 {
                         // A rewrite may turn a small status response into a destructive
                         // drain. Re-admit it together with remaining calls so it cannot
                         // spend capacity already reserved for their results.
@@ -1070,7 +1182,7 @@ impl Runtime {
                             &limits,
                             tool_registry.media_output_bytes(&normalized.name),
                         )?;
-                        for (_, remaining, _, _) in &pending {
+                        for (_, remaining, _, _, _) in &pending {
                             reserve_tool_result(
                                 &mut reserved,
                                 remaining,
@@ -1084,9 +1196,15 @@ impl Runtime {
                     if is_pending_work_wait(&normalized)
                         && pending
                             .iter()
-                            .any(|(_, call, _, _)| !is_pending_work_wait(call))
+                            .any(|(_, call, _, _, _)| !is_pending_work_wait(call))
                     {
-                        pending.push_back((call_index, normalized, Some(clock), literal_mask));
+                        pending.push_back((
+                            call_index,
+                            normalized,
+                            Some(clock),
+                            literal_mask,
+                            text_conversions,
+                        ));
                         continue;
                     }
                 }
@@ -1142,7 +1260,7 @@ impl Runtime {
                 &limits,
                 tool_registry.media_output_bytes(&call.name),
             )?;
-            for (_, remaining, _, _) in &pending {
+            for (_, remaining, _, _, _) in &pending {
                 reserve_tool_result(
                     &mut result_probe,
                     remaining,
@@ -1178,17 +1296,48 @@ impl Runtime {
                 agent,
                 mode,
             );
-            let action_error = expansion_error
-                .or_else(|| tool_registry.clone().validate(call).err())
+            let mut invocation = invocation;
+            let image_bound = image_source.is_some();
+            let image_error = match image_source {
+                Some(Ok(source)) => {
+                    if matches!(source.as_ref(), view_image::Source::Https(_))
+                        && client.public_https_image_attempts() > 0
+                    {
+                        invocation.image_model = client.pin_public_https_image_route();
+                        invocation.image_https = Some(https.clone());
+                    }
+                    if let Some(authored) = &authored_image_arguments {
+                        invocation.image_approval_preview =
+                            Some(view_image::approval_preview(authored, &source));
+                    }
+                    invocation.image_source = Some(source);
+                    None
+                }
+                Some(Err(error)) => Some(error),
+                None => None,
+            };
+            let action_error = image_error
+                .or(expansion_error)
+                .or_else(|| {
+                    (!image_bound)
+                        .then(|| tool_registry.clone().validate(call).err())
+                        .flatten()
+                })
                 .or_else(|| {
                     if call.name == "job" {
-                        crate::runtime::execution::job::validate(&call.arguments).err()
+                        crate::runtime::execution::job::validate(&call.arguments)
+                            .and_then(|_| {
+                                crate::runtime::execution::job::bind_redirect_destination(
+                                    &call.arguments,
+                                    &mut invocation,
+                                )
+                            })
+                            .err()
                     } else {
                         delegate_error
                     }
                 });
             use crate::policy::{PermissionError, PermissionRequest};
-            let mut invocation = invocation;
             invocation.literal_mask = literal_mask;
             let observation_interrupt = (tool_registry.clone().origin(&call.name)
                 == Some(super::tool::ToolOrigin::Builtin)
@@ -1215,9 +1364,51 @@ impl Runtime {
                 executions.admit_detached(descriptor, invocation.cancellation.clone())?;
             invocation.execution_id = Some(reserved);
             executions.mark(reserved, super::execution::ExecutionStatus::Waiting);
+            if let Some(arguments) = authored_image_arguments {
+                // A bound image is not a rewrite hook: publish only the safe
+                // authored evidence, correlated before permission or Host effects.
+                let snapshot = state.snapshot();
+                auditor.publish(
+                    Moment::ToolCall,
+                    AuditBody {
+                        epoch: snapshot.epoch_id,
+                        turn_id: snapshot.turn_id,
+                        round: snapshot.round_id,
+                        tool_call_id: Some(call.id.clone()),
+                        tool_execution_id: Some(reserved.0),
+                        started_at_unix_ms: clock.0,
+                        authored_image_arguments: true,
+                        tool_presentation: tool_registry.interaction_presentation(&call.name),
+                        payload: HookPayload::ToolCall {
+                            name: call.name.clone(),
+                            arguments,
+                        },
+                        ..Default::default()
+                    },
+                );
+            }
             recorder.record_task_admission(context).await?;
             let invocation_cancellation = invocation.cancellation.clone();
             let issuer = context.review_issuer(1024);
+            // The sealed policy/dispatch arguments preserve the exact bound
+            // source witness. They never replace Context, audit or descriptor data.
+            let image_policy_call =
+                invocation
+                    .image_source
+                    .as_ref()
+                    .map(|source| microcrab_protocol::ToolCall {
+                        arguments: source.policy_arguments(),
+                        ..call.clone()
+                    });
+            let dispatch_call = image_policy_call.as_ref().unwrap_or(call);
+            #[cfg(feature = "wasm")]
+            let action_error = match action_error {
+                Some(error) => Some(error),
+                None => tool_registry
+                    .bind_file_versions(dispatch_call, &mut invocation)
+                    .await
+                    .err(),
+            };
             let mut admission_error = None;
             let mut invocation_cancelled = false;
             if action_error.is_none() {
@@ -1232,10 +1423,10 @@ impl Runtime {
                     agent: snapshot.config.agent.clone(),
                     mode: snapshot.config.mode.clone(),
                     tool: call.name.clone(),
-                    arguments: call.arguments.clone(),
+                    arguments: dispatch_call.arguments.clone(),
                     revision: snapshot.revision,
                 };
-                let component = tool_registry.clone().component(&call.name);
+                let component = tool_registry.admission_identity(&call.name);
                 let result = tokio::select! { biased;
                     _ = cancellation.cancelled() => { executions.finish_error(reserved, &Error::Cancelled).await; return Err(Error::Cancelled); },
                     result = self.permission.admit(&request, &invocation, &issuer, component) => result,
@@ -1252,17 +1443,14 @@ impl Runtime {
             } else if let Some(error) = action_error {
                 Err(error)
             } else if allowed {
-                // Permission, public records and descriptors see Visible-expanded
-                // arguments. Secret placeholders remain until this sealed resolver.
-                // Context and the ToolCall audit retain the model-authored text.
-                let prepared =
-                    tool_registry
-                        .resolve_call(call, &mut invocation)
-                        .and_then(|resolved| {
-                            executions
-                                .install_redaction(reserved, invocation.redaction_handle())?;
-                            Ok(resolved)
-                        });
+                // Secret placeholders remain until the sealed resolver. Image
+                // dispatch additionally checks its exact bound policy witness.
+                let prepared = tool_registry
+                    .resolve_call(dispatch_call, &mut invocation)
+                    .and_then(|resolved| {
+                        executions.install_redaction(reserved, invocation.redaction_handle())?;
+                        Ok(resolved)
+                    });
                 match prepared {
                     Err(error) => Err(error),
                     Ok(owned_call) => {
@@ -1277,6 +1465,7 @@ impl Runtime {
                         let registry = tool_registry.clone();
                         let delegate = self.delegate.clone();
                         let controls = self.controls();
+                        let reply_owner = self.reply_owner.get().cloned();
                         let execution_cancellation = invocation.cancellation.clone();
                         match executions.start_with_media_output(
                             descriptor,
@@ -1306,7 +1495,13 @@ impl Runtime {
                                             invocation,
                                         )
                                     } else {
-                                        registry.execute(&owned_call, invocation).await
+                                        registry
+                                            .execute(
+                                                &owned_call,
+                                                invocation,
+                                                reply_owner.and_then(|owner| owner.upgrade()),
+                                            )
+                                            .await
                                     }
                                 }
                             },
@@ -1320,11 +1515,30 @@ impl Runtime {
                                     tokio::select! {
                                         biased;
                                         _ = cancellation.cancelled() => {
+                                            if call.name == "job" && super::execution::job::is_redirect(&call.arguments) {
+                                                // Preserve a returned commit receipt even if the Turn waiter is cancelled.
+                                                // A worker lost after dispatch is not evidence of no mutation.
+                                                let _ = executions.cancel(execution.id).await;
+                                                break match execution.wait_output().await {
+                                                    Err(Error::Closed | Error::ExecutionInterrupted) =>
+                                                        Err(super::execution::job::uncertain_redirect(reserved)),
+                                                    result => result,
+                                                };
+                                            }
                                             executions.cancel(execution.id).await?;
                                             let _ = execution.wait_output().await;
                                             break Err(Error::Cancelled);
                                         },
-                                        result = execution.wait_output() => break result,
+                                        result = execution.wait_output() => {
+                                            break match result {
+                                                Err(Error::Closed | Error::ExecutionInterrupted)
+                                                    if call.name == "job" && super::execution::job::is_redirect(&call.arguments) =>
+                                                {
+                                                    Err(super::execution::job::uncertain_redirect(reserved))
+                                                }
+                                                result => result,
+                                            };
+                                        },
                                         _ = recorder.wait_for_steer(), if observation_interrupt
                                             .as_ref().is_some_and(|signal| !signal.is_cancelled()) => {
                                             // Only the read-only observation is interrupted. Job
@@ -1375,20 +1589,45 @@ impl Runtime {
                 _ if result.is_err() => Some("failed"),
                 _ => None,
             };
+            // Use one canonical safe error projection for both the admitted
+            // model feedback and ToolResult audit (media retains metadata only).
+            let error_feedback = result.as_ref().err().map(|error| {
+                let content = match error {
+                    Error::ToolFailure(failure) => {
+                        serde_json::json!({"content":"","failure":failure}).to_string()
+                    }
+                    _ => executions.error_result_with_effects(reserved, error),
+                };
+                if content.len() > error_result_reservation_bytes()
+                    || serde_json::json!(&content).to_string().len() - 2
+                        > error_result_context_reservation_bytes()
+                {
+                    error.tool_diagnostic().result_json()
+                } else {
+                    content
+                }
+            });
+            let note = (text_conversions != 0).then_some(TEXT_ARGUMENT_CONVERSION_NOTE);
+            let with_note = |mut content: String| {
+                if let Some(note) = note {
+                    content.push_str(note);
+                }
+                content
+            };
             // Every returned outcome, including terminal errors, is observable.
             // ToolResult never enters the intervention lane.
             let snapshot = state.snapshot();
             let payload = match &result {
                 Ok(output) => HookPayload::ToolResult {
                     result: Some(super::execution::ResolvedOutput::observation_text(
-                        &output.content,
+                        &with_note(output.content.clone()),
                         &output.attachments,
                     )?),
                     error: None,
                 },
-                Err(error) => HookPayload::ToolResult {
+                Err(_) => HookPayload::ToolResult {
                     result: None,
-                    error: Some(executions.error_result_with_effects(reserved, error)),
+                    error: error_feedback.clone().map(with_note),
                 },
             };
             if let HookPayload::ToolResult { result, error } = &payload
@@ -1404,6 +1643,7 @@ impl Runtime {
                     round: snapshot.round_id,
                     tool_call_id: Some(call.id.clone()),
                     tool_execution_id: Some(reserved.0),
+                    tool_presentation: tool_registry.interaction_presentation(&call.name),
                     started_at_unix_ms: clock.0,
                     elapsed_ms: u64::try_from(clock.1.elapsed().as_millis()).ok(),
                     payload,
@@ -1416,28 +1656,21 @@ impl Runtime {
                     return Err(Error::Cancelled);
                 }
                 Err(Error::Cancelled) => super::execution::ResolvedOutput::text(
-                    executions.error_result_with_effects(reserved, &Error::Cancelled),
+                    error_feedback.unwrap_or_else(|| Error::Cancelled.tool_diagnostic().result_json()),
                 ),
                 Err(Error::Limit(message)) => return Err(Error::Limit(message)),
+                Err(error)
+                    if tool_registry.origin(&call.name) == Some(super::tool::ToolOrigin::DialogueReply)
+                        && error.tool_diagnostic().effects
+                            == crate::observation::diagnostics::EffectKnowledge::MayHaveOccurred =>
+                {
+                    // Do not continue this Turn under an unacknowledged append.
+                    return Err(error);
+                }
                 Err(error) => {
-                    let content = match &error {
-                        Error::ToolFailure(failure) => {
-                            serde_json::json!({"content":"","failure":failure}).to_string()
-                        }
-                        _ => executions.error_result_with_effects(reserved, &error),
-                    };
-                    let content = if content.len() > error_result_reservation_bytes()
-                        || serde_json::json!(&content).to_string().len() - 2
-                            > error_result_context_reservation_bytes()
-                    {
-                        // Direct embedding errors do not all
-                        // pass producer validation. Keep their model projection
-                        // within the pre-effect reservation, without native text.
-                        error.tool_diagnostic().result_json()
-                    } else {
-                        content
-                    };
-                    super::execution::ResolvedOutput::text(content)
+                    super::execution::ResolvedOutput::text(
+                        error_feedback.unwrap_or_else(|| error.tool_diagnostic().result_json()),
+                    )
                 }
             };
             let parts = output
@@ -1450,7 +1683,11 @@ impl Runtime {
                     },
                 })
                 .collect();
-            context.append_tool_result_with_parts(call.id.clone(), output.content, parts)?;
+            context.append_tool_result_with_parts(
+                call.id.clone(),
+                with_note(output.content),
+                parts,
+            )?;
             let (epoch, items) = context.admitted_items();
             if let Some(assistant_index) = assistant_index {
                 client
@@ -1469,7 +1706,7 @@ impl Runtime {
             executions.acknowledge_result_delivered(reserved);
             recorder.observe_context(context)?;
         }
-        Ok(())
+        Ok(malformed_image)
     }
 }
 
@@ -1481,6 +1718,8 @@ fn is_pending_work_wait(call: &microcrab_protocol::ToolCall) -> bool {
             .and_then(serde_json::Value::as_i64)
             == Some(-1)
 }
+const TEXT_ARGUMENT_CONVERSION_NOTE: &str = "\n[Runtime: schema-opted-in textual argument conversion applied on the execution copy. Original tool-call evidence is unchanged.]";
+
 fn error_result_reservation_bytes() -> usize {
     crate::observation::diagnostics::ToolDiagnostic::max_result_bytes()
         .max(super::execution::ToolFailure::max_result_bytes())
@@ -1512,6 +1751,7 @@ fn tool_result_reservation_bytes(
     output
         .saturating_mul(6)
         .max(error_result_context_reservation_bytes())
+        .saturating_add(TEXT_ARGUMENT_CONVERSION_NOTE.len() + 1)
         .saturating_add(crate::admission::image::tool_context_reservation(
             declared_media_bytes.min(limits.max_tool_image_bytes),
         ))

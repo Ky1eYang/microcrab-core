@@ -25,10 +25,6 @@ pub struct Content {
 
 /// One piece of session content. State is a judged frame, not rendered text.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[expect(
-    clippy::large_enum_variant,
-    reason = "Public content variants are constructed and matched by clients; boxing fields changes their ownership API"
-)]
 pub enum ContentItem {
     State(StateFrame),
     User {
@@ -67,6 +63,10 @@ pub enum CarrierEnvelopeVersion {
     /// V1 framing with a frozen display alias, never an authorization witness.
     ExternalDialogue {
         alias: String,
+    },
+    /// Append-only media settlement related to an already admitted tool result.
+    RetainedToolImage {
+        call_id: String,
     },
 }
 

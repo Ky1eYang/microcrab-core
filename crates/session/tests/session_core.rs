@@ -21,6 +21,8 @@ mod fork;
 mod journal;
 #[path = "lifecycle.rs"]
 mod lifecycle;
+#[path = "model_admission.rs"]
+mod model_admission;
 #[path = "permission.rs"]
 mod permission;
 #[path = "permission_state.rs"]

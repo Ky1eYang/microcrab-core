@@ -120,6 +120,44 @@ async fn cancellation_wins_before_filesystem_admission() {
     ));
 }
 
+#[tokio::test]
+async fn private_file_reads_are_binary_confined_and_cancellable_even_if_ordinary_fs_is_unrestricted()
+ {
+    use microcrab_host_api::{ErrorCategory, OpContext, PrivateFileBuffer};
+    let root = Root::new();
+    let outside = Root::new();
+    let host = LocalHost::new_filesystem_with_scope(&root.0, ShellLimits::default(), true).unwrap();
+    let file = root.0.join("binary");
+    let private = root.0.join("hidden");
+    let external = outside.0.join("binary");
+    for path in [&file, &private, &external] {
+        std::fs::write(path, b"\xff\0\x80").unwrap();
+    }
+    host.protect_workspace_path(private.clone()).unwrap();
+    assert!(host.supports_private_file_read());
+    let ctx = OpContext::default();
+    let result = host
+        .read_private_file(file.clone(), PrivateFileBuffer::new(3, ()), &ctx)
+        .await
+        .unwrap();
+    assert_eq!(result.as_bytes(), b"\xff\0\x80");
+    for path in [private, external, root.0.join("sub/../binary")] {
+        let result = host
+            .read_private_file(path, PrivateFileBuffer::new(3, ()), &ctx)
+            .await;
+        assert!(
+            matches!(result, Err(ToolError::Host(error)) if error.category == ErrorCategory::Permission)
+        );
+    }
+    ctx.cancel.cancel();
+    let result = host
+        .read_private_file(file, PrivateFileBuffer::new(3, ()), &ctx)
+        .await;
+    assert!(
+        matches!(result, Err(ToolError::Host(error)) if error.category == ErrorCategory::Cancelled)
+    );
+}
+
 #[cfg(windows)]
 #[tokio::test]
 async fn rejects_alternate_data_streams_and_device_namespace() {

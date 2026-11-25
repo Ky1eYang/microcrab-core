@@ -71,6 +71,12 @@ pub enum Error {
     Config(ErrorReason),
     #[error("session is busy")]
     Busy,
+    #[error("the frozen model tool catalog is incompatible; start a new Session")]
+    IncompatibleModelCatalog,
+    #[error(
+        "the unfinished Turn has a different frozen model tool catalog; settle or recover from compatible history, or start a new Session"
+    )]
+    ModelCatalogContinuationMismatch,
     #[error(
         "current State changed during observation; retry after the permission or mode update settles"
     )]
@@ -164,6 +170,12 @@ impl Error {
     /// Sanitized owned descriptions and canonical protocol facts are public.
     pub fn public_reason(&self) -> Option<&str> {
         match self {
+            Self::IncompatibleModelCatalog => {
+                Some("the frozen model tool catalog is incompatible; start a new Session")
+            }
+            Self::ModelCatalogContinuationMismatch => Some(
+                "the unfinished Turn has a different frozen model tool catalog; settle or recover from compatible history, or start a new Session",
+            ),
             Self::VariableConflict => Some(
                 "variable inspection is stale; inspect current variables and explicitly save again",
             ),

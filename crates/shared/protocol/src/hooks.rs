@@ -27,6 +27,11 @@ pub enum Moment {
 pub enum HookPayload {
     #[default]
     None,
+    /// Protected request structure, never the provider wire body or any argument.
+    ProtectedRequest {
+        tools: Vec<crate::ToolDefinition>,
+        tool_result_ids: Vec<String>,
+    },
     InputAdmitted {
         parts: Vec<InputPart>,
     },

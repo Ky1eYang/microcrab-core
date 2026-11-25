@@ -29,7 +29,7 @@ impl SessionInner {
             ActivityProjection::Snapshot(ActivitySnapshot {
                 position,
                 active: inbox.active,
-                paused: inbox.paused,
+                paused: inbox.is_paused(),
                 ready: inbox.ready(),
                 retired: inbox.retired,
             })
@@ -118,7 +118,7 @@ impl SessionInner {
             if inbox.retired {
                 return no_pending;
             }
-            if !no_pending || inbox.active || inbox.paused || inbox.ready() {
+            if !no_pending || inbox.active || inbox.is_paused() || inbox.ready() {
                 return false;
             }
             inbox.retired = true;

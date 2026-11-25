@@ -16,6 +16,8 @@ use std::{
 use tokio_util::sync::CancellationToken;
 #[path = "display_wire_invariance/cancellation.rs"]
 mod cancellation;
+#[path = "display_wire_invariance/image_audit.rs"]
+mod image_audit;
 
 #[derive(Default)]
 struct Recorder(Mutex<Vec<ModelObservation>>);
@@ -72,6 +74,10 @@ fn json_fixture(protocol: Protocol, thought: &str, answer: &str) -> String {
     }.to_string()
 }
 fn read_body(socket: &mut std::net::TcpStream) -> Vec<u8> {
+    read_request(socket).1
+}
+
+fn read_request(socket: &mut std::net::TcpStream) -> (String, Vec<u8>) {
     socket
         .set_read_timeout(Some(Duration::from_secs(10)))
         .unwrap();
@@ -82,8 +88,8 @@ fn read_body(socket: &mut std::net::TcpStream) -> Vec<u8> {
         assert!(read > 0, "request ended before complete body");
         bytes.extend_from_slice(&buffer[..read]);
         if let Some(end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
-            let length = std::str::from_utf8(&bytes[..end])
-                .unwrap()
+            let headers = std::str::from_utf8(&bytes[..end]).unwrap();
+            let length = headers
                 .lines()
                 .find_map(|line| {
                     let (name, value) = line.split_once(':')?;
@@ -92,7 +98,10 @@ fn read_body(socket: &mut std::net::TcpStream) -> Vec<u8> {
                 })
                 .unwrap();
             if bytes.len() >= end + 4 + length {
-                return bytes[end + 4..end + 4 + length].to_vec();
+                return (
+                    headers.to_owned(),
+                    bytes[end + 4..end + 4 + length].to_vec(),
+                );
             }
         }
     }

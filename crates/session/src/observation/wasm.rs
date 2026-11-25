@@ -3,7 +3,9 @@ use super::{FailureClass, ObservationKind, Position};
 use crate::runtime::tool::ToolContext;
 use crate::{
     Error,
-    observation::diagnostics::{DiagnosticCode, DiagnosticLayer, DiagnosticPhase, ToolDiagnostic},
+    observation::diagnostics::{
+        DiagnosticCode, DiagnosticLayer, DiagnosticPhase, ToolDiagnostic, WasmFailure,
+    },
 };
 use sha2::{Digest, Sha256};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -19,7 +21,7 @@ pub(crate) enum Phase {
     Drive,
 }
 impl Phase {
-    fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         match self {
             Self::Compile => "compile",
             Self::Instantiate => "instantiate",
@@ -69,6 +71,28 @@ impl EvidenceBoundary {
         }
     }
     pub(crate) fn failure(&self, error: wasmtime::Error, phase: Phase) -> Error {
+        self.classify_failure(error, phase, None, None)
+    }
+
+    /// Call only at an engine execution boundary after the runtime has installed
+    /// these allowances. Link/compile/budget setup errors use `failure` instead.
+    pub(crate) fn execution_failure(
+        &self,
+        error: wasmtime::Error,
+        phase: Phase,
+        fuel_limit: u64,
+        timeout_ms: u64,
+    ) -> Error {
+        self.classify_failure(error, phase, Some(fuel_limit), Some(timeout_ms))
+    }
+
+    fn classify_failure(
+        &self,
+        error: wasmtime::Error,
+        phase: Phase,
+        fuel_limit: Option<u64>,
+        wall_timeout_ms: Option<u64>,
+    ) -> Error {
         // IDs are process-scoped; they are neither durable global IDs nor handles.
         static NEXT: AtomicU64 = AtomicU64::new(1);
         let evidence_id = NEXT.fetch_add(1, Ordering::Relaxed);
@@ -77,25 +101,37 @@ impl EvidenceBoundary {
             Some(Stop::Deadline) => FailureClass::Timeout,
             None => FailureClass::WasmTrap,
         };
-        let cause = match error.downcast_ref::<Stop>() {
-            Some(Stop::Cancelled) => "cancelled",
-            Some(Stop::Deadline) => "wall_deadline",
-            None => match error.downcast_ref::<wasmtime::Trap>() {
-                Some(wasmtime::Trap::UnreachableCodeReached) => "unreachable",
-                Some(wasmtime::Trap::OutOfFuel) => "out_of_fuel",
-                Some(wasmtime::Trap::StackOverflow) => "stack_overflow",
-                Some(wasmtime::Trap::MemoryOutOfBounds) => "memory_out_of_bounds",
-                Some(wasmtime::Trap::TableOutOfBounds) => "table_out_of_bounds",
-                Some(wasmtime::Trap::IntegerDivisionByZero) => "integer_division_by_zero",
-                Some(wasmtime::Trap::IntegerOverflow) => "integer_overflow",
-                Some(wasmtime::Trap::BadConversionToInteger) => "bad_conversion_to_integer",
-                Some(wasmtime::Trap::IndirectCallToNull) => "indirect_call_to_null",
-                Some(wasmtime::Trap::BadSignature) => "bad_signature",
-                Some(wasmtime::Trap::Interrupt) => "interrupt",
-                Some(_) => "other_trap",
-                None => "wasmtime_error",
+        let trap = error.downcast_ref::<wasmtime::Trap>();
+        let wasm_failure = match error.downcast_ref::<Stop>() {
+            Some(Stop::Cancelled) => Some(WasmFailure::Cancelled),
+            Some(Stop::Deadline) => Some(WasmFailure::WallDeadline { wall_timeout_ms }),
+            None => match trap {
+                Some(wasmtime::Trap::UnreachableCodeReached) => Some(WasmFailure::Unreachable),
+                Some(wasmtime::Trap::OutOfFuel) => Some(WasmFailure::OutOfFuel { fuel_limit }),
+                Some(wasmtime::Trap::StackOverflow) => Some(WasmFailure::StackOverflow),
+                Some(wasmtime::Trap::MemoryOutOfBounds) => Some(WasmFailure::MemoryOutOfBounds),
+                Some(wasmtime::Trap::TableOutOfBounds) => Some(WasmFailure::TableOutOfBounds),
+                Some(wasmtime::Trap::IntegerDivisionByZero) => {
+                    Some(WasmFailure::IntegerDivisionByZero)
+                }
+                Some(wasmtime::Trap::IntegerOverflow) => Some(WasmFailure::IntegerOverflow),
+                Some(wasmtime::Trap::BadConversionToInteger) => {
+                    Some(WasmFailure::BadConversionToInteger)
+                }
+                Some(wasmtime::Trap::IndirectCallToNull) => Some(WasmFailure::IndirectCallToNull),
+                Some(wasmtime::Trap::BadSignature) => Some(WasmFailure::BadSignature),
+                Some(wasmtime::Trap::Interrupt) => Some(WasmFailure::Interrupt),
+                _ => None,
             },
         };
+        let cause = wasm_failure.map_or(
+            if trap.is_some() {
+                "other_trap"
+            } else {
+                "wasmtime_error"
+            },
+            WasmFailure::label,
+        );
         // Only module-local function indices and offsets are retained. Never ask
         // Wasmtime to format errors/frames: that can disclose names and source paths.
         let trace = error.downcast_ref::<wasmtime::WasmBacktrace>();
@@ -137,13 +173,77 @@ impl EvidenceBoundary {
         };
         let mut diagnostic = ToolDiagnostic::new(DiagnosticCode::WasmTrap, layer, public_phase);
         diagnostic.evidence_id = Some(evidence_id);
+        diagnostic.wasm_failure = wasm_failure;
         Error::Diagnostic(diagnostic)
     }
 }
 
-pub(crate) fn failure_id(error: &Error) -> Option<u64> {
-    match error {
-        Error::Diagnostic(d) if d.code == DiagnosticCode::WasmTrap => d.evidence_id,
-        _ => None,
+impl WasmFailure {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Unreachable => "unreachable",
+            Self::OutOfFuel { .. } => "out_of_fuel",
+            Self::StackOverflow => "stack_overflow",
+            Self::MemoryOutOfBounds => "memory_out_of_bounds",
+            Self::TableOutOfBounds => "table_out_of_bounds",
+            Self::IntegerDivisionByZero => "integer_division_by_zero",
+            Self::IntegerOverflow => "integer_overflow",
+            Self::BadConversionToInteger => "bad_conversion_to_integer",
+            Self::IndirectCallToNull => "indirect_call_to_null",
+            Self::BadSignature => "bad_signature",
+            Self::Interrupt => "interrupt",
+            Self::Cancelled => "cancelled",
+            Self::WallDeadline { .. } => "wall_deadline",
+        }
+    }
+}
+
+/// The only facts retained across calls on a poisoned slot. Nothing from the
+/// native error, arguments, or earlier effect outcome is kept here.
+#[derive(Clone, Copy)]
+pub(crate) struct FailureEvidence {
+    pub(crate) id: u64,
+    pub(crate) cause: Option<WasmFailure>,
+}
+impl FailureEvidence {
+    pub(crate) fn from_error(error: &Error) -> Option<Self> {
+        match error {
+            Error::Diagnostic(d) if d.code == DiagnosticCode::WasmTrap => Some(Self {
+                id: d.evidence_id?,
+                cause: d.wasm_failure,
+            }),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_typed_allowlisted_causes_get_budget_facts() {
+        let boundary = EvidenceBoundary::new("test-component", None);
+        let native = wasmtime::format_err!("out_of_fuel at /private/source.wat");
+        for error in [native, wasmtime::Trap::HeapMisaligned.into()] {
+            let diagnostic = boundary
+                .execution_failure(error, Phase::Invoke, 123, 456)
+                .tool_diagnostic();
+            assert_eq!(diagnostic.wasm_failure, None);
+            let public = diagnostic.result_json();
+            assert!(!public.contains("/private/source.wat"));
+            assert!(!public.contains("fuel_limit"));
+            assert!(!public.contains("wall_timeout_ms"));
+        }
+        let deadline = boundary
+            .execution_failure(Stop::Deadline.into(), Phase::Invoke, 123, 456)
+            .tool_diagnostic();
+        assert_eq!(
+            deadline.wasm_failure,
+            Some(WasmFailure::WallDeadline {
+                wall_timeout_ms: Some(456)
+            })
+        );
+        assert!(!deadline.result_json().contains("fuel_limit"));
     }
 }

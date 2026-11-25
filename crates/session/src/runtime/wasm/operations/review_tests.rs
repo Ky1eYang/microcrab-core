@@ -86,10 +86,14 @@ fn store(
             next_output: 1,
             borrowed_processes: Default::default(),
             admitted_process_scope: None,
+            process_launch_uncertain: false,
             process_grants: Default::default(),
             binding: None,
             tool_context: Some(context),
             operation_scope: Some(("write".into(), arguments)),
+            web: None,
+            private_bytes: None,
+            guest_observation: None,
             confinement_diagnostic: None,
             operation_cancelled: false,
             operation_diagnostic: None,
@@ -110,6 +114,7 @@ fn store(
             cache_points_remaining: 2,
             patch_plan: None,
             patch_receipts: Vec::new(),
+            patch_version_refs: Vec::new(),
         },
     )
 }
@@ -448,7 +453,7 @@ fn scope_presence_without_proof_cannot_write_and_confinement_survives_handled_su
 
 #[test]
 fn mutation_bridge_preflights_entire_call_and_rejects_unplanned_order() {
-    use super::super::microcrab::host::{file_mutation as wire, text_write as write};
+    use super::super::microcrab::host0_1_0::{file_mutation as wire, text_write as write};
     let runtime = tokio::runtime::Runtime::new().unwrap();
     let root = tempfile::tempdir().unwrap();
     let host: Arc<dyn host::Host> =
@@ -549,7 +554,7 @@ impl host::Host for CommitCancelHost {
 }
 #[test]
 fn mutation_bridge_awaits_known_publication_when_caller_cancels_after_commit() {
-    use super::super::microcrab::host::{file_mutation as wire, text_write as write};
+    use super::super::microcrab::host0_1_0::{file_mutation as wire, text_write as write};
     let runtime = tokio::runtime::Runtime::new().unwrap();
     let root = tempfile::tempdir().unwrap();
     let cancel = tokio_util::sync::CancellationToken::new();
@@ -719,9 +724,9 @@ impl host::Host for AlteredPreflightHost {
         Err(host::ToolError::invalid_request("unexpected mutation"))
     }
 }
-fn mutation_preflight_requests() -> Vec<super::super::microcrab::host::file_mutation::FileMutation>
+fn mutation_preflight_requests() -> Vec<super::super::microcrab::host0_1_0::file_mutation::FileMutation>
 {
-    use super::super::microcrab::host::{file_mutation as wire, text_write as write};
+    use super::super::microcrab::host0_1_0::{file_mutation as wire, text_write as write};
     vec![
         wire::FileMutation::Write(write::WriteRequest {
             path: "a".into(),
@@ -813,7 +818,7 @@ fn mutation_preflight_rejects_host_changed_effects_before_reads_reservations_or_
 }
 #[test]
 fn mutation_preflight_accepts_only_host_equivalent_path_spelling_changes() {
-    use super::super::microcrab::host::file_mutation as wire;
+    use super::super::microcrab::host0_1_0::file_mutation as wire;
     let runtime = tokio::runtime::Runtime::new().unwrap();
     let host = Arc::new(AlteredPreflightHost {
         change: ChangedPreflight::PathSpelling,
@@ -846,7 +851,7 @@ fn mutation_preflight_accepts_only_host_equivalent_path_spelling_changes() {
 
 #[test]
 fn failed_mutation_preflight_never_publishes_a_plan_or_leaks_evidence_capacity() {
-    use super::super::microcrab::host::{file_mutation as wire, text_write as write};
+    use super::super::microcrab::host0_1_0::{file_mutation as wire, text_write as write};
     let runtime = tokio::runtime::Runtime::new().unwrap();
     for exhaust_output in [true, false] {
         let host = Arc::new(AlteredPreflightHost {

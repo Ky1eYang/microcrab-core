@@ -228,7 +228,11 @@ fn render_user_run(
         let versioned = matches!(
             user,
             Some(ContentItem::User {
-                envelope: Some(_),
+                envelope: Some(
+                    CarrierEnvelopeVersion::V1
+                        | CarrierEnvelopeVersion::Important { .. }
+                        | CarrierEnvelopeVersion::ExternalDialogue { .. }
+                ),
                 ..
             })
         );

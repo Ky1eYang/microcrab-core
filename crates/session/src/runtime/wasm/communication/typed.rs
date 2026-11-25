@@ -1,5 +1,5 @@
 //! Typed Session communication; only dynamic values cross as JSON text.
-use super::super::microcrab::session::variables::{
+use super::super::microcrab::session0_2_0::variables::{
     CallFacts, MetadataEntry, Persistence, Role, ScopedEntry, VariableChangeSet, VariableEntry,
     Visibility,
 };

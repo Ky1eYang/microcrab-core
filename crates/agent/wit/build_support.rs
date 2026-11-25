@@ -43,6 +43,16 @@ pub fn stage(manifest: &Path, world: &str, runtime: bool) -> io::Result<PathBuf>
         &root.join("crates/session/wit/scoped-variables.wit"),
         &variables,
     )?;
+    if runtime {
+        copy(
+            &root.join("crates/session/wit/file-versions.wit"),
+            &out.join("file-versions.wit"),
+        )?;
+        copy(
+            &root.join("crates/session/wit/observation.wit"),
+            &out.join("deps/session-observation/observation.wit"),
+        )?;
+    }
     Ok(out)
 }
 

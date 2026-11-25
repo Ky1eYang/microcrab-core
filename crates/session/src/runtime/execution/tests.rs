@@ -3,6 +3,7 @@ mod content;
 mod media;
 mod notices;
 mod ownership;
+mod private_capture;
 mod target_wait;
 use super::*;
 use crate::{Error, Limits};

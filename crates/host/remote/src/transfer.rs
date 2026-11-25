@@ -15,6 +15,20 @@ fn digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 impl RemoteHost {
+    // Caller holds the web lane lock when attempting to reserve a shared ID.
+    pub(super) fn legacy_owns_transfer(&self, id: &str, generation: u64) -> bool {
+        self.transfers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(id)
+            || self
+                .retired_transfers
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .any(|(retired, old_generation)| retired == id && *old_generation == generation)
+    }
+
     pub(crate) fn retire_transfer(&self, id: String, generation: u64) {
         if id.is_empty() || id.len() > 256 {
             return;
@@ -40,6 +54,17 @@ impl RemoteHost {
             || reference.sha256.len() != 64
         {
             return Err(unavailable("invalid Host transfer declaration"));
+        }
+        let route = self.route.lock().unwrap_or_else(|e| e.into_inner());
+        if !route
+            .as_ref()
+            .is_some_and(|route| route.generation == generation)
+        {
+            return Err(unavailable("stale Host transfer route"));
+        }
+        let web = self.web.lock().unwrap_or_else(|e| e.into_inner());
+        if web.owns_transfer_id(&reference.transfer_id) {
+            return Err(unavailable("duplicate Host transfer id"));
         }
         // Cancellation also locks pending first; hold it through transfer admission.
         let pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());

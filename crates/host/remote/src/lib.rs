@@ -5,11 +5,14 @@ mod consumption;
 mod diagnostics;
 mod files;
 mod payload;
+mod private_file;
 mod process;
 mod processes;
+pub use private_file::{PrivateFileReader, PrivateFileTransfer};
 mod readiness;
 mod reconciliation;
 mod transfer;
+mod web_transport;
 use microcrab_host_api::{
     Capabilities, Host, HostAPI, HostInfo, NetApi, Platform, ProcessApi, ShellApi, ToolError,
 };
@@ -22,7 +25,7 @@ use std::{
     },
     time::Instant,
 };
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 
 const OPERATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
@@ -37,6 +40,7 @@ pub struct RemoteHost {
     generation: AtomicU64,
     readiness: Mutex<readiness::Readiness>,
     readiness_changed: tokio::sync::Notify,
+    readiness_observation: watch::Sender<()>,
     pending: Mutex<HashMap<String, Pending>>,
     retired: Mutex<VecDeque<(String, String, u64)>>,
     retired_transfers: Mutex<VecDeque<(String, u64)>>,
@@ -49,6 +53,7 @@ pub struct RemoteHost {
     operation_history: Mutex<VecDeque<serde_json::Value>>,
     isolated_receipts: Mutex<BTreeMap<String, String>>,
     files: files::Files,
+    web: Mutex<web_transport::WebLane>,
 }
 struct Route {
     generation: u64,
@@ -57,6 +62,11 @@ struct Route {
     sender: mpsc::Sender<HostFrame>,
     stop: CancellationToken,
     last_received: Instant,
+    private_files: Option<Arc<dyn PrivateFileReader>>,
+    glob_ignore: bool,
+    glob_paths: bool,
+    web_transport_v1: bool,
+    web_transport_ws_pull: bool,
 }
 struct Pending {
     raw_read: bool,
@@ -132,6 +142,7 @@ impl RemoteHost {
             generation: AtomicU64::new(0),
             readiness: Mutex::new(readiness::Readiness::default()),
             readiness_changed: tokio::sync::Notify::new(),
+            readiness_observation: watch::channel(()).0,
             pending: Mutex::new(HashMap::new()),
             retired: Mutex::new(VecDeque::new()),
             retired_transfers: Mutex::new(VecDeque::new()),
@@ -144,6 +155,7 @@ impl RemoteHost {
             operation_history: Mutex::new(VecDeque::new()),
             isolated_receipts: Mutex::new(BTreeMap::new()),
             files: files::Files::default(),
+            web: Mutex::default(),
         }))
     }
     pub fn set_scope(&self, scope: microcrab_host_protocol::BindingScope) -> Result<(), ToolError> {
@@ -201,6 +213,120 @@ impl RemoteHost {
         lease_generation: String,
         bridge_instance_id: String,
     ) -> Result<(), ToolError> {
+        self.attach_route(
+            outbound,
+            generation,
+            lease_generation,
+            bridge_instance_id,
+            None,
+        )
+    }
+
+    /// Only trusted native composition may supply a negotiated binary reader.
+    pub fn attach_route(
+        self: &Arc<Self>,
+        outbound: mpsc::Sender<HostFrame>,
+        generation: u64,
+        lease_generation: String,
+        bridge_instance_id: String,
+        private_files: Option<Arc<dyn PrivateFileReader>>,
+    ) -> Result<(), ToolError> {
+        self.attach_route_with_glob_ignore(
+            outbound,
+            generation,
+            lease_generation,
+            bridge_instance_id,
+            private_files,
+            false,
+        )
+    }
+
+    /// The capability belongs to this authenticated route, not its pinned
+    /// descriptor, and is never inherited when the route is replaced.
+    pub fn attach_route_with_glob_ignore(
+        self: &Arc<Self>,
+        outbound: mpsc::Sender<HostFrame>,
+        generation: u64,
+        lease_generation: String,
+        bridge_instance_id: String,
+        private_files: Option<Arc<dyn PrivateFileReader>>,
+        glob_ignore: bool,
+    ) -> Result<(), ToolError> {
+        self.attach_route_with_glob_capabilities(
+            outbound,
+            generation,
+            lease_generation,
+            bridge_instance_id,
+            private_files,
+            (glob_ignore, false),
+        )
+    }
+
+    /// Rule-file and resolved-path acknowledgments are independently negotiated.
+    pub fn attach_route_with_glob_capabilities(
+        self: &Arc<Self>,
+        outbound: mpsc::Sender<HostFrame>,
+        generation: u64,
+        lease_generation: String,
+        bridge_instance_id: String,
+        private_files: Option<Arc<dyn PrivateFileReader>>,
+        glob_capabilities: (bool, bool),
+    ) -> Result<(), ToolError> {
+        self.attach_route_with_capabilities(
+            outbound,
+            generation,
+            lease_generation,
+            bridge_instance_id,
+            private_files,
+            glob_capabilities,
+            false,
+        )
+    }
+
+    /// `web_transport_v1` means this exact authenticated native Project route
+    /// already proved a matching explicit v1 offer/ack. It is neither inferred
+    /// from descriptor pins nor inherited onto replacement routes.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Keep existing attachment fences explicit"
+    )]
+    pub fn attach_route_with_capabilities(
+        self: &Arc<Self>,
+        outbound: mpsc::Sender<HostFrame>,
+        generation: u64,
+        lease_generation: String,
+        bridge_instance_id: String,
+        private_files: Option<Arc<dyn PrivateFileReader>>,
+        glob_capabilities: (bool, bool),
+        web_transport_v1: bool,
+    ) -> Result<(), ToolError> {
+        self.attach_route_with_web_transport_capabilities(
+            outbound,
+            generation,
+            lease_generation,
+            bridge_instance_id,
+            private_files,
+            glob_capabilities,
+            (web_transport_v1, false),
+        )
+    }
+
+    /// The second web bit is a matching offer/ack for `ws_pull` on this same
+    /// route. It cannot grant the v1 Project authority it depends on.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Keep existing attachment fences explicit"
+    )]
+    pub fn attach_route_with_web_transport_capabilities(
+        self: &Arc<Self>,
+        outbound: mpsc::Sender<HostFrame>,
+        generation: u64,
+        lease_generation: String,
+        bridge_instance_id: String,
+        private_files: Option<Arc<dyn PrivateFileReader>>,
+        (glob_ignore, glob_paths): (bool, bool),
+        (web_transport_v1, ws_pull): (bool, bool),
+    ) -> Result<(), ToolError> {
         if generation == 0 || lease_generation.is_empty() || bridge_instance_id.is_empty() {
             return Err(unavailable("invalid Host route generation"));
         }
@@ -222,8 +348,14 @@ impl RemoteHost {
             sender: outbound.clone(),
             stop: stop.clone(),
             last_received: Instant::now(),
+            private_files,
+            glob_ignore,
+            glob_paths,
+            web_transport_v1,
+            web_transport_ws_pull: web_transport_v1 && ws_pull,
         });
         self.generation.store(generation, Ordering::SeqCst);
+        self.publish_readiness_change();
         drop(route);
         let weak = Arc::downgrade(self);
         tokio::spawn(async move {
@@ -328,9 +460,14 @@ impl RemoteHost {
                 old.stop.cancel();
             }
             self.fail_pending(message);
+            self.publish_readiness_change();
         }
     }
     fn fail_pending(&self, message: &'static str) {
+        self.web
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .route_lost();
         self.processes.notify_route_change();
         let pending = std::mem::take(&mut *self.pending.lock().unwrap_or_else(|e| e.into_inner()));
         self.transfers

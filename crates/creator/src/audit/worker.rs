@@ -1,8 +1,9 @@
 //! One bounded lane owns recording. publish never waits; loss is a sticky error,
 //! never a silently complete-looking audit. flush is an acknowledged barrier.
-use super::recorder::{EffectiveRequest, Recorder, RecorderOptions, error};
+use super::recorder::{EffectiveRequest, ProtectedRequest, Recorder, RecorderOptions, error};
 use microcrab_auditor::{
-    AuditBody, AuditRecord, Auditor, AuditorError, BoxFuture, HookContext, Injection, Moment,
+    AuditBody, AuditRecord, Auditor, AuditorError, BoxFuture, HookContext, HookPayload, Injection,
+    Moment,
 };
 use microcrab_storage::AuditAnchor;
 use std::{
@@ -65,6 +66,7 @@ impl Shared {
 enum Command {
     Effective(
         EffectiveRequest,
+        Option<ProtectedRequest>,
         oneshot::Sender<Result<String, AuditorError>>,
     ),
     Published(serde_json::Value),
@@ -83,6 +85,7 @@ struct RequestScope {
 struct PreparedScope {
     scope: RequestScope,
     generation: u64,
+    protected: bool,
 }
 #[derive(Default)]
 struct ScopeHeads {
@@ -280,7 +283,11 @@ impl Auditor for NativeAuditor {
             self.shared.fail(error("audit producer sequence overflow"));
             return;
         };
-        let sent = event == Moment::RequestPrepared && body.sent_request.is_some();
+        let prepared_event = event == Moment::RequestPrepared;
+        let has_sent_body = body.sent_request.is_some();
+        let protected_tool_call_ids = body.protected_tool_call_ids;
+        let authored_image_arguments = body.authored_image_arguments;
+        let tool_execution_id = body.tool_execution_id;
         let complete = body.outcome.is_some();
         let call = body.call_id.clone();
         let scope = RequestScope {
@@ -309,11 +316,15 @@ impl Auditor for NativeAuditor {
             response_content_type: body.response_content_type,
             started_at_unix_ms: body.started_at_unix_ms,
             elapsed_ms: body.elapsed_ms,
+            response_completed_at_ms: body.response_completed_at_ms,
             first_token_ms: body.first_token_ms,
             generation_ms: body.generation_ms,
             timing_source: body.timing_source,
             outcome: body.outcome,
             usage: body.usage,
+            protected_tool_call_ids: (event == Moment::RoundCompleted)
+                .then_some(protected_tool_call_ids)
+                .flatten(),
         };
         let mut value = match serde_json::to_value(record) {
             Ok(value) => value,
@@ -324,6 +335,12 @@ impl Auditor for NativeAuditor {
             }
         };
         if matches!(event, Moment::ToolCall | Moment::ToolResult) {
+            if let Some(execution_id) = tool_execution_id {
+                value["tool_execution_id"] = serde_json::json!(execution_id);
+            }
+            if event == Moment::ToolCall && authored_image_arguments {
+                value["authored_image_arguments"] = serde_json::json!(true);
+            }
             let anchor = self
                 .anchor
                 .lock()
@@ -332,6 +349,9 @@ impl Auditor for NativeAuditor {
                 .scopes
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
+            if event == Moment::ToolCall && authored_image_arguments {
+                value["producer_request_head"] = serde_json::json!(anchor.request_head);
+            }
             let key = serde_json::json!([
                 value["epoch"],
                 value["turn_id"],
@@ -378,8 +398,9 @@ impl Auditor for NativeAuditor {
         }
         if let Some(call) = call {
             let mut heads = self.shared.heads.lock().unwrap_or_else(|e| e.into_inner());
-            if sent
+            if prepared_event
                 && let (Some(head), Some(prepared)) = (heads.get(&call), scopes.prepared.get(&call))
+                && (has_sent_body || prepared.protected)
                 && prepared.generation == scopes.generation
                 && prepared.scope.epoch == scope.epoch
                 && prepared.scope.subagent == scope.subagent
@@ -407,13 +428,31 @@ impl Auditor for NativeAuditor {
     ) -> BoxFuture<'a, Result<Injection, AuditorError>> {
         Box::pin(async move {
             self.shared.healthy()?;
-            if moment != Moment::RequestPrepared || context.request_body.is_none() {
+            if moment != Moment::RequestPrepared {
                 return Ok(Injection::default());
             }
+            let protected = match context.payload {
+                HookPayload::ProtectedRequest {
+                    tools,
+                    tool_result_ids,
+                } => Some(ProtectedRequest {
+                    frozen_tools: tools,
+                    tool_result_ids,
+                }),
+                _ => None,
+            };
+            if protected.is_none() && context.request_body.is_none() {
+                return Ok(Injection::default());
+            }
+            let is_protected = protected.is_some();
             let call_id = context
                 .call_id
                 .ok_or_else(|| error("RequestPrepared recording requires call_id"))?;
-            let body = context.request_body.expect("checked request body");
+            let body = if is_protected {
+                ""
+            } else {
+                context.request_body.unwrap_or_default()
+            };
             if body.len() > self.max_record_bytes {
                 self.shared
                     .fail(error("audit effective request byte budget exceeded"));
@@ -450,7 +489,7 @@ impl Auditor for NativeAuditor {
                     return Err(error("audit writer is closed"));
                 }
                 self.sender
-                    .send(Command::Effective(request, reply))
+                    .send(Command::Effective(request, protected, reply))
                     .await
                     .map_err(|_| error("audit writer closed"))?;
             }
@@ -463,9 +502,14 @@ impl Auditor for NativeAuditor {
                 scopes.synchronize(&anchor);
                 scopes.known.insert(identity.clone(), scope.clone());
                 if scopes.generation == generation {
-                    scopes
-                        .prepared
-                        .insert(call_id.clone(), PreparedScope { scope, generation });
+                    scopes.prepared.insert(
+                        call_id.clone(),
+                        PreparedScope {
+                            scope,
+                            generation,
+                            protected: is_protected,
+                        },
+                    );
                 }
                 self.shared
                     .heads
@@ -524,8 +568,8 @@ async fn run(mut recorder: Recorder, mut receiver: mpsc::Receiver<Command>, shar
                 Command::Close => {
                     unreachable!("close was handled before starting a publication")
                 }
-                Command::Effective(request, reply) => {
-                    let result = result.and_then(|_| recorder.effective(request));
+                Command::Effective(request, protected, reply) => {
+                    let result = result.and_then(|_| recorder.record_effective(request, protected));
                     if let Err(error) = &result {
                         state.fail(error.clone());
                     }

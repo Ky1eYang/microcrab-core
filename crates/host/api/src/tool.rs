@@ -172,6 +172,12 @@ impl ToolError {
 /// and metadata come from the foundational HostAPI supertrait.
 #[async_trait]
 pub trait Host: HostAPI {
+    /// Stable, exact workspace authority for the SHA-256 typed text APIs. A
+    /// carrier that cannot authenticate this identity must leave it unavailable.
+    fn file_version_authority(&self) -> Option<String> {
+        None
+    }
+
     /// Operations implemented by this Host, independent of linked guest imports.
     /// This is availability discovery, never an authorization decision.
     fn tool_capabilities(&self) -> Vec<String> {
@@ -254,6 +260,47 @@ pub trait Host: HostAPI {
         Err(ToolError::unsupported("glob"))
     }
 
+    /// Discover bounded ignore sources under the configured Host root. A Host
+    /// without this operation must fail explicitly, not return an empty snapshot.
+    async fn glob_ignore_snapshot(
+        &self,
+        ctx: &crate::OpContext,
+    ) -> Result<GlobIgnoreSnapshot, ToolError> {
+        ctx.check()?;
+        Err(ToolError::unsupported("glob_ignore_snapshot"))
+    }
+
+    /// Filter using only the supplied workspace-scoped rules, before result
+    /// admission. An empty list never consults disk; `include_ignored` bypasses
+    /// only filtering and does not bypass path admission.
+    async fn glob_with_ignore_rules(
+        &self,
+        ctx: &crate::OpContext,
+        _request: GlobRequest,
+        _rules: Vec<GlobIgnoreRuleFile>,
+    ) -> Result<GlobOutput, ToolError> {
+        ctx.check()?;
+        Err(ToolError::unsupported("glob_with_ignore_rules"))
+    }
+
+    /// Materialize concrete workspace-relative exclusions or report why the list is incomplete.
+    async fn glob_ignored_paths(&self, ctx: &crate::OpContext) -> Result<Vec<String>, ToolError> {
+        ctx.check()?;
+        Err(ToolError::unsupported("glob_ignored_paths"))
+    }
+
+    /// The supplied concrete paths are the only ignore filter; a search-work limit
+    /// is reported separately from omitted matching output.
+    async fn glob_with_ignored_paths(
+        &self,
+        ctx: &crate::OpContext,
+        _request: GlobRequest,
+        _paths: Vec<String>,
+    ) -> Result<ResolvedGlobOutput, ToolError> {
+        ctx.check()?;
+        Err(ToolError::unsupported("glob_with_ignored_paths"))
+    }
+
     async fn grep(
         &self,
         _request: GrepRequest,
@@ -284,6 +331,120 @@ pub trait Host: HostAPI {
         Err(ToolError::unsupported("cache_point"))
     }
 
+    /// Authenticated native Project binding for an active, explicitly
+    /// negotiated web transport route. Inspection and unproven routes return None.
+    fn web_transport_binding(&self) -> Option<crate::web_transport::ProjectScope> {
+        None
+    }
+
+    /// Availability only. Implementations revalidate capability and lease at dispatch.
+    fn supports_web_transport(&self) -> bool {
+        self.web_transport_binding().is_some()
+    }
+
+    /// One non-redirecting, credential-free GET at the invocation-admitted URL.
+    async fn http_get(
+        &self,
+        ctx: &crate::OpContext,
+        _scope: &crate::web_transport::ConnectionScope,
+        _url: &str,
+        _max_bytes: u32,
+    ) -> crate::web_transport::WebTransportResult<crate::web_transport::HttpResponse> {
+        crate::web_transport::unsupported(ctx)
+    }
+
+    /// Never replay an open. The scope is allocated by Runtime, not the peer.
+    async fn ws_open(
+        &self,
+        ctx: &crate::OpContext,
+        _scope: &crate::web_transport::ConnectionScope,
+        _url: &str,
+    ) -> crate::web_transport::WebTransportResult<()> {
+        crate::web_transport::unsupported(ctx)
+    }
+
+    /// Observe locally known ownership; never send a ping or consume a frame.
+    async fn ws_status(
+        &self,
+        ctx: &crate::OpContext,
+        _scope: &crate::web_transport::ConnectionScope,
+    ) -> crate::web_transport::WebTransportResult<()> {
+        crate::web_transport::unsupported(ctx)
+    }
+
+    /// Send exactly one complete UTF-8 message, once; never reconnect.
+    async fn ws_send(
+        &self,
+        ctx: &crate::OpContext,
+        _scope: &crate::web_transport::ConnectionScope,
+        _text: &str,
+    ) -> crate::web_transport::WebTransportResult<()> {
+        crate::web_transport::unsupported(ctx)
+    }
+
+    /// Consume at most one complete message. Never return a truncated message.
+    async fn ws_receive(
+        &self,
+        ctx: &crate::OpContext,
+        _scope: &crate::web_transport::ConnectionScope,
+        _max_bytes: u32,
+    ) -> crate::web_transport::WebTransportResult<crate::web_transport::WsReceive> {
+        crate::web_transport::unsupported(ctx)
+    }
+
+    /// Consume at most one complete message, with a soft wait up to
+    /// [`crate::web_transport::WEB_MAX_WS_SOFT_WAIT_MS`]. Zero checks
+    /// immediately. `Empty` preserves the scope; a hard deadline or cancellation
+    /// is not `Empty`. Fence an unconfirmed consume, never replay.
+    async fn ws_pull(
+        &self,
+        ctx: &crate::OpContext,
+        _scope: &crate::web_transport::ConnectionScope,
+        _max_bytes: u32,
+        _soft_wait_ms: u32,
+    ) -> crate::web_transport::WebTransportResult<crate::web_transport::WsPull> {
+        crate::web_transport::unsupported(ctx)
+    }
+
+    /// Retire this exact scoped identity, including any racing pending open.
+    async fn ws_close(
+        &self,
+        ctx: &crate::OpContext,
+        _scope: &crate::web_transport::ConnectionScope,
+    ) -> crate::web_transport::WebTransportResult<()> {
+        crate::web_transport::unsupported(ctx)
+    }
+
+    /// Runtime-only teardown for a retired Session epoch. Fence pending opens
+    /// from this owner and release its sockets; never affect another owner.
+    async fn ws_release_scope(
+        &self,
+        ctx: &crate::OpContext,
+        _owner: &crate::web_transport::ConnectionOwner,
+    ) -> crate::web_transport::WebTransportResult<()> {
+        crate::web_transport::unsupported(ctx)
+    }
+
+    /// Whether this Host can currently use a confined private binary read lane.
+    /// Capability is not permission; implementations revalidate on dispatch.
+    fn supports_private_file_read(&self) -> bool {
+        false
+    }
+
+    /// Read a confined regular file directly into a caller-owned, precharged
+    /// binary allocation. No generic JSON/text carrier, retained source, or
+    /// duplicate raster is allowed. The Host owns the buffer until its actual
+    /// read worker settles, including when the caller drops its future.
+    async fn read_private_file(
+        &self,
+        _path: PathBuf,
+        _buffer: PrivateFileBuffer,
+        context: &crate::OpContext,
+    ) -> Result<PrivateFileBuffer, ToolError> {
+        context.check().map_err(ToolError::Host)?;
+        Err(ToolError::unsupported("read_private_file"))
+    }
+
     /// Read a regular file under the Host's configured root. Relative paths resolve
     /// against that root. Implementations must enforce the caller's byte bound.
     async fn read_file(
@@ -296,6 +457,60 @@ pub trait Host: HostAPI {
             return Err(ToolError::Cancelled);
         }
         Err(ToolError::unsupported("read_file"))
+    }
+}
+
+/// Bounded caller-owned raster read space. The opaque owner keeps its allocation
+/// reservation until the actual Host worker drops or returns the buffer.
+pub struct PrivateFileBuffer {
+    data: Vec<u8>,
+    max_bytes: usize,
+    _owner: Box<dyn Send>,
+}
+
+impl PrivateFileBuffer {
+    pub fn new(max_bytes: usize, owner: impl Send + 'static) -> Self {
+        Self {
+            data: Vec::new(),
+            max_bytes,
+            _owner: Box::new(owner),
+        }
+    }
+
+    pub fn max_bytes(&self) -> usize {
+        self.max_bytes
+    }
+
+    /// Allocate the exact observed length once. A growing or shrinking source
+    /// must be rejected rather than extending or partially returning this buffer.
+    pub fn allocate(&mut self, length: usize) -> Result<&mut [u8], ToolError> {
+        if length > self.max_bytes {
+            return Err(ToolError::FileLimit);
+        }
+        if self.data.capacity() != 0 {
+            return Err(ToolError::invalid_request(
+                "private file buffer is already allocated",
+            ));
+        }
+        self.data
+            .try_reserve_exact(length)
+            .map_err(|_| ToolError::worker("private file allocation failed"))?;
+        self.data.resize(length, 0);
+        Ok(&mut self.data)
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.data
+    }
+
+    /// Fill the exact-size, previously allocated buffer without reallocating.
+    pub fn as_bytes_mut(&mut self) -> &mut [u8] {
+        &mut self.data
+    }
+
+    /// Transfer to the already-reserved admitted image output owner without copying.
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.data
     }
 }
 
@@ -319,6 +534,10 @@ pub(crate) fn known_unsupported(operation: &'static str) -> &'static str {
         "filesystem.stat" => "host capability is unsupported: filesystem.stat",
         "filesystem.write" => "host capability is unsupported: filesystem.write",
         "glob" => "host capability is unsupported: glob",
+        "glob_ignore_snapshot" => "host capability is unsupported: glob_ignore_snapshot",
+        "glob_ignored_paths" => "host capability is unsupported: glob_ignored_paths",
+        "glob_with_ignored_paths" => "host capability is unsupported: glob_with_ignored_paths",
+        "glob_with_ignore_rules" => "host capability is unsupported: glob_with_ignore_rules",
         "grep" => "host capability is unsupported: grep",
         "info" => "host capability is unsupported: info",
         "net.accept" => "host capability is unsupported: net.accept",
@@ -348,6 +567,7 @@ pub(crate) fn known_unsupported(operation: &'static str) -> &'static str {
         "process.write_stdin" => "host capability is unsupported: process.write_stdin",
         "read" => "host capability is unsupported: read",
         "read_file" => "host capability is unsupported: read_file",
+        "read_private_file" => "Host does not support confined private binary reads",
         "shell.capture-status" => "host capability is unsupported: shell.capture-status",
         "shell.drain" => "host capability is unsupported: shell.drain",
         "shell.launch" => "host capability is unsupported: shell.launch",

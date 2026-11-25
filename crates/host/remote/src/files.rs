@@ -42,7 +42,7 @@ impl Files {
             ));
         }
         let id = NEXT_ID
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
             .map_err(|_| HostError::known(ErrorCategory::Io, "primitive resource IDs exhausted"))?;
         let id = HandleId(id);
         entries.insert(id, File { bytes, owner });

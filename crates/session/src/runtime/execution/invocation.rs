@@ -100,6 +100,47 @@ impl ToolContext {
             .ok_or_else(|| Error::tool("output requires an admitted execution"))?;
         self.state.executions().open_output(id, options, controller)
     }
+    pub(crate) fn open_private_output(
+        &self,
+        media_type: String,
+        controller: Arc<dyn super::ExecutionController>,
+    ) -> Result<(super::OutputWriter, super::BufferedOutput), Error> {
+        let id = self
+            .execution_id
+            .ok_or_else(|| Error::tool("output requires an admitted execution"))?;
+        self.state
+            .executions()
+            .open_private_output(id, media_type, controller)
+    }
+    pub(crate) async fn launch_private_output(
+        &self,
+        request: microcrab_host_api::PrivateShellRequest,
+        writer: super::OutputWriter,
+        cancellation: tokio_util::sync::CancellationToken,
+    ) -> Result<Arc<dyn super::ExecutionController>, Error> {
+        if !self
+            .execution_id
+            .is_some_and(|id| writer.belongs_to(&self.state.executions(), id))
+        {
+            return Err(Error::denied(
+                "private output is not owned by this invocation",
+            ));
+        }
+        let handle = self
+            .processes
+            .launch_private_shell(&self.tool, &self.call_id, request, cancellation)
+            .await?;
+        let registry = self.processes.registry();
+        match registry.attach_private_output(&self.session_id, handle, writer) {
+            Ok(controller) => Ok(controller),
+            Err(error) => {
+                self.processes
+                    .release_process(handle, tokio_util::sync::CancellationToken::new())
+                    .await?;
+                Err(error)
+            }
+        }
+    }
     pub async fn attach_process_output(
         &self,
         writer: crate::runtime::execution::OutputWriter,

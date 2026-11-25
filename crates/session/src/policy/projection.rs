@@ -1,23 +1,54 @@
 //! Model-visible compiled tool facts; projection never resolves approvals.
-use super::{Action, CompiledToolPolicy, PermissionController, PermissionError, PolicySnapshot};
-use crate::runtime::tool::ToolOrigin;
+use super::{
+    Action, CompiledToolPolicy, PermissionController, PermissionError, PermissionListError,
+    PolicySnapshot,
+};
+use crate::runtime::handler::permissions::AppliedCatalog;
 use serde_json::{Value, json};
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, RwLock, Weak};
 
 /// A weak port avoids State -> controller -> auditor -> State ownership cycles.
 #[derive(Clone)]
 pub(crate) struct PermissionObservation {
     controller: Weak<PermissionController>,
-    tools: Arc<Vec<(String, ToolOrigin)>>,
+    catalog: ObservationCatalog,
+}
+
+#[derive(Clone)]
+enum ObservationCatalog {
+    Runtime(Weak<RwLock<AppliedCatalog>>),
+    #[cfg(test)]
+    Fixture(Arc<Vec<(String, ToolOrigin)>>),
+}
+
+fn observed_policy_error(error: PermissionListError) -> PermissionError {
+    match error {
+        PermissionListError::Busy => PermissionError::StalePolicy,
+        PermissionListError::Policy(error) => error,
+        PermissionListError::Unavailable | PermissionListError::Budget => {
+            PermissionError::Unavailable
+        }
+    }
 }
 impl PermissionObservation {
+    pub(crate) fn runtime(
+        controller: &Arc<PermissionController>,
+        tools: &Arc<RwLock<AppliedCatalog>>,
+    ) -> Self {
+        Self {
+            controller: Arc::downgrade(controller),
+            catalog: ObservationCatalog::Runtime(Arc::downgrade(tools)),
+        }
+    }
+
+    #[cfg(test)]
     pub(super) fn new(
         controller: &Arc<PermissionController>,
         tools: Vec<(String, ToolOrigin)>,
     ) -> Self {
         Self {
             controller: Arc::downgrade(controller),
-            tools: Arc::new(tools),
+            catalog: ObservationCatalog::Fixture(Arc::new(tools)),
         }
     }
     /// A current-State reader can derive permissions and all directory entries
@@ -68,12 +99,40 @@ impl PermissionObservation {
         row["arguments_unresolved"] = json!(actions.len() > 1);
         Ok((summary, row))
     }
-    pub(crate) fn project(&self) -> Result<Value, PermissionError> {
+    pub(crate) fn project(
+        &self,
+        names: Option<&std::collections::BTreeSet<String>>,
+    ) -> Result<Value, PermissionError> {
         let controller = self
             .controller
             .upgrade()
             .ok_or(PermissionError::Unavailable)?;
-        project_model_tools(&controller, &controller.snapshot()?, self.tools.as_ref())
+        match &self.catalog {
+            ObservationCatalog::Runtime(tools) => {
+                let tools = tools.upgrade().ok_or(PermissionError::Unavailable)?;
+                let (catalog, policy) =
+                    AppliedCatalog::observe(&tools, &controller).map_err(observed_policy_error)?;
+                let value = project_model_tools(
+                    &controller,
+                    &policy,
+                    catalog.registry().tool_names(),
+                    names,
+                )?;
+                let (current, current_policy) =
+                    AppliedCatalog::observe(&tools, &controller).map_err(observed_policy_error)?;
+                if !catalog.matches(&current) || policy.revision != current_policy.revision {
+                    return Err(PermissionError::StalePolicy);
+                }
+                Ok(value)
+            }
+            #[cfg(test)]
+            ObservationCatalog::Fixture(tools) => project_model_tools(
+                &controller,
+                &controller.snapshot()?,
+                tools.iter().map(|(name, _)| name.as_str()),
+                names,
+            ),
+        }
     }
 }
 
@@ -95,6 +154,7 @@ fn strip_model_facts(row: &mut Value) {
     }
 }
 
+#[cfg(test)]
 pub(super) fn project_tools(
     controller: &PermissionController,
     snapshot: &PolicySnapshot,
@@ -129,10 +189,11 @@ pub(super) fn project_tools(
 
 /// Model grouping is presentation only. Management rows keep exact tool and
 /// owner witnesses; admission never consumes these grouped objects.
-fn project_model_tools(
+fn project_model_tools<'a>(
     controller: &PermissionController,
     snapshot: &PolicySnapshot,
-    tools: &[(String, ToolOrigin)],
+    tools: impl ExactSizeIterator<Item = &'a str>,
+    names: Option<&std::collections::BTreeSet<String>>,
 ) -> Result<Value, PermissionError> {
     if tools.len() > 4096 {
         return Err(PermissionError::InvalidConfiguration(
@@ -140,12 +201,15 @@ fn project_model_tools(
         ));
     }
     let lineage = controller.lineage()?;
-    let rows = tools.iter().map(|(name, _)| {
-        let (compiled, _) = controller.compiled_chain(snapshot, name)?;
-        let mut policy = serde_json::to_value(compiled).map_err(serialization)?;
-        strip_model_facts(&mut policy);
-        Ok((name.clone(), policy))
-    });
+    controller.ensure_witness(snapshot.revision, &lineage)?;
+    let rows = tools
+        .filter(|name| names.is_none_or(|set| set.contains(*name)))
+        .map(|name| {
+            let compiled = PermissionController::compile_witness(snapshot, &lineage, name)?;
+            let mut policy = serde_json::to_value(compiled).map_err(serialization)?;
+            strip_model_facts(&mut policy);
+            Ok((name.to_owned(), policy))
+        });
     let value = group_model_policies(rows)?;
     controller.ensure_witness(snapshot.revision, &lineage)?;
     Ok(value)

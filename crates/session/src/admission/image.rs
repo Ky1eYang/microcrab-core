@@ -62,6 +62,22 @@ pub fn image_type(media_type: &str) -> Option<&'static str> {
     })
 }
 
+/// Derive a canonical encoded image type from signature, never from a filename
+/// or caller assertion. Call validation separately for header and dimensions.
+pub(crate) fn signature_type(data: &[u8]) -> Result<&'static str, Error> {
+    if data.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Ok("image/png")
+    } else if data.starts_with(&[0xff, 0xd8]) {
+        Ok("image/jpeg")
+    } else if data.starts_with(b"GIF87a") || data.starts_with(b"GIF89a") {
+        Ok("image/gif")
+    } else if data.starts_with(b"RIFF") && data.get(8..12) == Some(b"WEBP") {
+        Ok("image/webp")
+    } else {
+        Err(Error::tool("unsupported or missing image signature"))
+    }
+}
+
 /// Raw image bytes loaded from a Session-authorized attachment identity.
 pub struct ResolvedAttachment {
     pub media_type: String,
@@ -151,6 +167,24 @@ mod tests {
         bytes.extend_from_slice(&height.to_be_bytes());
         bytes.extend_from_slice(&[8, 2, 0, 0, 0, 0, 0, 0, 0]);
         bytes
+    }
+
+    #[test]
+    fn path_signature_detection_agrees_with_every_supported_header() {
+        let webp = b"RIFF\x12\0\0\0WEBPVP8L\x05\0\0\0\x2f\x01\x80\0\0\0";
+        let jpeg = [0xff, 0xd8, 0xff, 0xc0, 0, 11, 8, 0, 2, 0, 3, 1, 1, 0x11, 0];
+        let gif = b"GIF89a\x02\0\x03\0\0\0\0\x2c\0\0\0\0\x02\0\x03\0\0\x02\x01\0\0\x3b";
+        for (media_type, bytes) in [
+            ("image/png", png(1, 1).as_slice()),
+            ("image/jpeg", jpeg.as_slice()),
+            ("image/webp", webp.as_slice()),
+            ("image/gif", gif.as_slice()),
+        ] {
+            assert_eq!(signature_type(bytes).unwrap(), media_type);
+            assert!(validate_image(media_type, bytes).is_ok());
+        }
+        assert!(signature_type(b"RIFF/not-webp").is_err());
+        assert!(validate_image(signature_type(b"GIF89a").unwrap(), b"GIF89a").is_err());
     }
 
     #[test]

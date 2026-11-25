@@ -192,6 +192,8 @@ causes! {
     UnsupportedShellRead => "host capability is unsupported: shell.read",
     UnsupportedShellWrite => "host capability is unsupported: shell.write",
     UnsupportedWrite => "host capability is unsupported: write",
+    WebTransportStale => "web transport connection identity is stale; connect explicitly",
+    WebTransportClosed => "web transport connection is closed; connect explicitly",
 }
 
 #[cfg(test)]

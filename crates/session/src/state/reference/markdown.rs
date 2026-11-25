@@ -1,6 +1,6 @@
 //! Explicit bounded Markdown sources. Loading is asynchronous; projection/read use
 //! one atomically replaced catalog, so State snapshots never perform filesystem IO.
-use super::{Reference, ReferenceContent, ReferenceInfo};
+use super::{Reference, ReferenceContent, ReferenceInfo, ReferenceProjection};
 use crate::{
     Error,
     utils::markdown::{MarkdownDocument, parse_markdown},
@@ -42,9 +42,81 @@ impl Default for ReferenceLimits {
 }
 #[derive(Default)]
 struct Catalog {
-    projection: Vec<Value>,
+    documents: Vec<DocumentRow>,
     listed: Vec<ReferenceInfo>,
     bodies: BTreeMap<String, String>,
+}
+
+struct DocumentRow {
+    location: String,
+    fields: serde_json::Map<String, Value>,
+    metadata: Option<Value>,
+    revision: DocumentRevision,
+}
+
+impl DocumentRow {
+    fn projection(&self, short: bool) -> Value {
+        let mut fields = self.fields.clone();
+        let (key, value) = if short {
+            ("revision", &self.revision.label)
+        } else {
+            ("content_digest", &self.revision.digest)
+        };
+        fields.insert(key.into(), json!(value));
+        fields.insert("path".into(), json!(self.location));
+        if let Some(metadata) = &self.metadata {
+            fields.insert("metadata".into(), metadata.clone());
+        }
+        Value::Object(fields)
+    }
+}
+
+struct DocumentRevision {
+    digest: String,
+    marker: String,
+    label: String,
+    overflow: u64,
+}
+
+impl DocumentRevision {
+    fn new(digest: String) -> Self {
+        use sha2::{Digest, Sha256};
+        // Derive the short marker from the complete digest, not a prefix of
+        // it. A canonical prefix collision does not survive an ordinary reload.
+        let mut hash = Sha256::new();
+        hash.update(b"microcrab-markdown-revision-v1:\0");
+        hash.update(digest.as_bytes());
+        let marker = format!("{:x}", hash.finalize());
+        let label = marker[..16].to_owned();
+        Self {
+            digest,
+            marker,
+            label,
+            overflow: 0,
+        }
+    }
+
+    fn observe(&mut self, previous: &Self) -> Result<(), Error> {
+        self.overflow = previous.overflow;
+        if self.digest == previous.digest {
+            self.label.clone_from(&previous.label);
+        } else if self.marker[..16] == previous.marker[..16] {
+            if let Some(length) = [20, 24].into_iter().find(|&length| {
+                length >= previous.label.len() && self.marker[..length] != previous.marker[..length]
+            }) {
+                self.label = self.marker[..length].to_owned();
+            } else {
+                self.overflow = self.overflow.checked_add(1).ok_or_else(|| {
+                    crate::budget::reject(
+                        crate::LimitKind::Arithmetic,
+                        "Markdown revision collision counter exhausted",
+                    )
+                })?;
+                self.label = format!("{}~{:x}", &self.marker[..24], self.overflow);
+            }
+        }
+        Ok(())
+    }
 }
 
 /// A concrete Reference implementation for Markdown/skill documents. Reloading
@@ -362,8 +434,19 @@ impl Reference for MarkdownReferences {
         &self.kind
     }
     async fn load(&self) -> Result<(), Error> {
-        let next = self.build().await?;
-        *self.catalog.write().unwrap_or_else(|e| e.into_inner()) = next;
+        let mut next = self.build().await?;
+        let mut current = self.catalog.write().unwrap_or_else(|e| e.into_inner());
+        let previous: BTreeMap<_, _> = current
+            .documents
+            .iter()
+            .map(|row| (&row.location, &row.revision))
+            .collect();
+        for row in &mut next.documents {
+            if let Some(revision) = previous.get(&row.location) {
+                row.revision.observe(revision)?;
+            }
+        }
+        *current = next;
         Ok(())
     }
     fn list(&self) -> Result<Vec<ReferenceInfo>, Error> {
@@ -387,12 +470,30 @@ impl Reference for MarkdownReferences {
             }))
     }
     fn change(&self) -> Result<Option<Value>, Error> {
-        Ok(Some(json!(
-            self.catalog
-                .read()
-                .unwrap_or_else(|e| e.into_inner())
-                .projection
+        let catalog = self.catalog.read().unwrap_or_else(|e| e.into_inner());
+        Ok(Some(Value::Array(
+            catalog
+                .documents
+                .iter()
+                .map(|row| row.projection(false))
+                .collect(),
         )))
+    }
+    fn projections(&self) -> Result<ReferenceProjection, Error> {
+        let catalog = self.catalog.read().unwrap_or_else(|e| e.into_inner());
+        let projection = |short| {
+            Some(Value::Array(
+                catalog
+                    .documents
+                    .iter()
+                    .map(|row| row.projection(short))
+                    .collect(),
+            ))
+        };
+        Ok(ReferenceProjection {
+            exact: projection(false),
+            short_model: projection(true),
+        })
     }
 }
 fn reference_error(error: impl std::fmt::Display) -> Error {
@@ -493,11 +594,7 @@ fn add_document(
     }
     let description = document.metadata.description.as_deref().unwrap_or("");
     visit(&document.root, &location, description, &mut catalog.listed);
-    let mut projection = compact_node(&document.root);
-    // Keep the full source witness: same-length body edits must still produce a
-    // State patch, even when every disclosed title and section ID stays stable.
-    projection["content_digest"] = json!(content_digest);
-    projection["path"] = json!(location);
+    let projection = compact_node(&document.root);
     let mut metadata = serde_json::to_value(&document.metadata)?;
     let fields = metadata
         .as_object_mut()
@@ -514,10 +611,16 @@ fn add_document(
                 _ => true,
             }
     });
-    if !fields.is_empty() {
-        projection["metadata"] = metadata;
-    }
-    catalog.projection.push(projection);
+    let metadata = (!fields.is_empty()).then_some(metadata);
+    let Value::Object(fields) = projection else {
+        unreachable!("Markdown node projection is an object")
+    };
+    catalog.documents.push(DocumentRow {
+        location,
+        fields,
+        metadata,
+        revision: DocumentRevision::new(content_digest),
+    });
     for (id, body) in document.bodies {
         if catalog.bodies.insert(id, body).is_some() {
             return Err(Error::reference("duplicate Markdown reference ID"));

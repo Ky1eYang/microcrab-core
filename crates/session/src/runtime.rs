@@ -10,4 +10,8 @@ pub mod tool;
 pub mod wasm;
 
 pub use handler::{Runtime, RuntimeHandler, TurnOutcome, TurnStopReason};
-pub use tool::{BuiltinTool, ToolOrigin, ToolRegistration, builtin_tools};
+pub use tool::{
+    AdmittedDialogueReply, BuiltinTool, DialogueReplyAdapter, DialogueReplyPosition,
+    DialogueReplyReceipt, DialogueReplyRegistration, DialogueReplyRequest,
+    MAX_DIALOGUE_REPLY_RECEIPT_BYTES, ToolOrigin, ToolRegistration, builtin_tools,
+};

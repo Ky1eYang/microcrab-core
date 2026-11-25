@@ -70,18 +70,20 @@ fn catalog() -> Vec<microcrab_agent_types::AgentInfo> {
         variables: Default::default(),
     }]
 }
-fn has_permission(session: &Session, name: &str) -> bool {
-    session.state_view().unwrap()["permission"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|row| {
-            row["tools"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|value| value == name)
-        })
+fn has_model_permission(session: &Session, name: &str) -> bool {
+    let mut state = json!({});
+    for item in session.messages() {
+        if let microcrab_session::context::ContentItem::State(frame) = item {
+            microcrab_transport::apply_state_patch(&mut state, &frame).unwrap();
+        }
+    }
+    state["permission"].as_array().unwrap().iter().any(|row| {
+        row["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| value == name)
+    })
 }
 fn job_runtime() -> Runtime {
     Runtime::new(
@@ -102,16 +104,36 @@ async fn unsupported_job_catalog_is_rejected_without_rewriting_frozen_context() 
     let original = journal.latest().unwrap();
     let before = serde_json::to_value(source.context_snapshot().unwrap()).unwrap();
     let current = BuiltinTool::Job.definition();
+    // Reconstruct the previous six-action declaration: it understood bounded
+    // public reads, but no typed private redirect or selector contract.
     let mut old_shape = current.clone();
-    old_shape.parameters["properties"]["args"]["properties"]
+    old_shape.parameters["properties"]["action"]["enum"] =
+        json!(["status", "read", "wait", "write", "cancel", "release"]);
+    let rules = old_shape.parameters.as_object_mut().unwrap();
+    rules.remove("if");
+    rules.remove("then");
+    let properties = rules.get_mut("properties").unwrap()["args"]["properties"]
         .as_object_mut()
-        .unwrap()
-        .remove("max_bytes");
+        .unwrap();
+    for name in ["channel", "expected_mime", "variable"] {
+        properties.remove(name);
+    }
+    // Restore the exact image-only redirect description and MIME enum.
+    let mut raster_redirect = current.clone();
+    let action = &mut raster_redirect.parameters["properties"]["action"]["description"];
+    *action = json!(action.as_str().unwrap().replace(
+        "shares complete successful captured bytes",
+        "shares a complete successful captured image"
+    ));
+    raster_redirect.parameters["properties"]["args"]["properties"]["expected_mime"] = json!({
+        "type":"string", "enum":["image/png","image/jpeg","image/gif","image/webp"],
+        "description":"Redirect-only exact declared MIME. The image is validated separately."
+    });
     let mut changed_description = current;
     changed_description
         .description
         .push_str(" unsupported catalog");
-    for unsupported in [old_shape, changed_description] {
+    for unsupported in [old_shape, raster_redirect, changed_description] {
         let mut recover = original.clone();
         recover.context.tools = vec![unsupported];
         let frozen = serde_json::to_value(&recover.context).unwrap();
@@ -150,7 +172,9 @@ fn current_job_descriptor_has_one_complete_bounded_output_contract() {
     );
     assert_eq!(
         definition.parameters["properties"]["action"]["enum"],
-        json!(["status", "read", "wait", "write", "cancel", "release"])
+        json!([
+            "status", "read", "wait", "write", "cancel", "release", "redirect"
+        ])
     );
     assert!(
         definition.parameters["properties"]["action"]["description"]
@@ -246,8 +270,16 @@ async fn old_frozen_catalog_restores_and_adopts_new_builtin_only_on_explicit_upd
     );
     assert_eq!(restored.context_snapshot().unwrap().epoch, epoch);
     assert_eq!(restored.state().limits.max_tool_output_bytes, 16 * 1024);
-    assert!(!has_permission(&restored, "expand"));
-    assert!(!has_permission(&restored, "delegate"));
+    assert!(restored.state_view().unwrap().get("permission").is_none());
+    let list = restored
+        .permission_list(microcrab_session::policy::PermissionListView::Current)
+        .unwrap();
+    let microcrab_session::policy::PermissionList::Current { current } = list else {
+        unreachable!("the requested view was Current");
+    };
+    assert!(current.tools.iter().any(|tool| tool.name == "expand"));
+    assert!(!has_model_permission(&restored, "expand"));
+    assert!(!has_model_permission(&restored, "delegate"));
     assert!(
         restored
             .state_view()
@@ -261,8 +293,8 @@ async fn old_frozen_catalog_restores_and_adopts_new_builtin_only_on_explicit_upd
         recover.context.tools
     );
     assert_eq!(restored.context_snapshot().unwrap().epoch, epoch);
-    assert!(!has_permission(&restored, "expand"));
-    assert!(!has_permission(&restored, "delegate"));
+    assert!(!has_model_permission(&restored, "expand"));
+    assert!(!has_model_permission(&restored, "delegate"));
     restored
         .submit("materialize explicitly updated epoch")
         .await
@@ -271,8 +303,8 @@ async fn old_frozen_catalog_restores_and_adopts_new_builtin_only_on_explicit_upd
     assert!(next.tools.iter().any(|tool| tool.name == "expand"));
     assert!(!next.pending_epoch);
     assert_eq!(next.epoch, epoch + 1);
-    assert!(has_permission(&restored, "expand"));
-    assert!(has_permission(&restored, "delegate"));
+    assert!(has_model_permission(&restored, "expand"));
+    assert!(has_model_permission(&restored, "delegate"));
     assert_eq!(
         restored.state_view().unwrap()["delegatable_agents"][0]["name"],
         "child"

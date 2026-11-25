@@ -24,6 +24,7 @@ pub(crate) struct OperationReservation {
     resume_pending: bool,
     pub(crate) user_target: Option<bool>,
     pub(crate) carrier_run: Vec<crate::admission::inbox::IdleCarrier>,
+    pub(super) model_admission: Option<crate::PreparedModelAdmission>,
     _operation: tokio::sync::OwnedMutexGuard<()>,
     _foreground: tokio::sync::OwnedMutexGuard<()>,
 }
@@ -59,6 +60,7 @@ impl OperationReservation {
             resume_pending: false,
             user_target: None,
             carrier_run: Vec::new(),
+            model_admission: None,
         }
     }
 }
@@ -72,7 +74,7 @@ impl SessionInner {
         // A retiring conversation must reject new input concretely even when
         // an earlier foreground reservation has not yet been released.
         self.ensure_model_open()?;
-        let mut reservation = self.reserve().await?;
+        let mut reservation = self.reserve_model().await?;
         reservation.user_target = Some(targeted_child);
         self.submit_reserved(
             Some(input),
@@ -111,18 +113,38 @@ impl SessionInner {
         if self.replacing.load(Ordering::Acquire) {
             return Err(Error::Cancelled);
         }
-        Ok(OperationReservation {
-            _operation: operation,
-            _foreground: foreground,
-            interrupt_reason: Arc::new(Mutex::new(None)),
-            pending: Mutex::new(None),
-            submission_operation_id: None,
-            admission_resolver: None,
-            resume_pending: false,
-            user_target: None,
-            carrier_run: Vec::new(),
-        })
+        Ok(OperationReservation::from_guards(operation, foreground))
     }
+    /// The single model reservation boundary, also called by autonomous inbox
+    /// after its operation-first / foreground-try-lock arbitration.
+    pub(super) async fn prepare_model_reservation(
+        &self,
+        reservation: &mut OperationReservation,
+    ) -> Result<(), Error> {
+        self.ensure_model_open()?;
+        let prepared = self.prepare_model_admission().await?;
+        self.ensure_model_open()?;
+        if self.replacing.load(Ordering::Acquire) {
+            return Err(Error::Cancelled);
+        }
+        if let Some(prepared) = &prepared {
+            let mut context = self
+                .context
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            self.model_catalog_candidate(&mut context, prepared, self.has_continuation())?;
+        }
+        reservation.model_admission = prepared;
+        Ok(())
+    }
+
+    pub(crate) async fn reserve_model(&self) -> Result<OperationReservation, Error> {
+        let mut reservation = self.reserve().await?;
+        self.prepare_model_reservation(&mut reservation).await?;
+        Ok(reservation)
+    }
+
     pub(super) async fn reserve_replacement(
         self: &Arc<Self>,
     ) -> Result<ReplacementReservation, Error> {
@@ -187,7 +209,7 @@ impl SessionInner {
         let mut reservation = tokio::select! {
             biased;
             _ = cancellation.cancelled() => return Err(Error::Cancelled),
-            result = self.reserve() => result?,
+            result = self.reserve_model() => result?,
         };
         self.ensure_model_open()?;
         if cancellation.is_cancelled() {
@@ -284,7 +306,10 @@ impl SessionInner {
         let explicit_retry = reservation.is_some() && input.is_none();
         let (operation, token) = match reservation {
             Some(owned) => owned,
-            None => (Arc::new(self.reserve().await?), CancellationToken::new()),
+            None => (
+                Arc::new(self.reserve_model().await?),
+                CancellationToken::new(),
+            ),
         };
         let mut selected_carriers = operation.carrier_run.clone();
         {
@@ -312,6 +337,7 @@ impl SessionInner {
             // Explicit pending resume clears it only after claiming the exact entry.
             if queued.is_none() || resume_pending {
                 inbox.paused = false;
+                inbox.model_admission_paused = false;
             }
             if queued.is_none()
                 && input.is_none()
@@ -386,6 +412,7 @@ impl SessionInner {
                 admission_resolver.as_deref(),
                 user_target,
                 carrier_run.clone(),
+                _operation.model_admission.as_ref(),
             ))
             .catch_unwind()
             .await;
@@ -558,6 +585,7 @@ impl SessionInner {
         admission_resolver: Option<&dyn crate::InputAdmissionResolver>,
         user_target: Option<bool>,
         carrier_run: Vec<crate::admission::inbox::IdleCarrier>,
+        model_admission: Option<&crate::PreparedModelAdmission>,
     ) -> Result<TurnOutcome, Error> {
         if input.is_some()
             && let Some(targeted) = user_target
@@ -616,7 +644,7 @@ impl SessionInner {
         } else {
             false
         };
-        let catalog = if input.is_some() {
+        let external_catalog = if input.is_some() {
             self.pending_tools
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -625,6 +653,39 @@ impl SessionInner {
         } else {
             None
         };
+        let catalog = if let Some(prepared) = model_admission {
+            let mut candidate = self
+                .context
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            let managed_changed =
+                self.model_catalog_candidate(&mut candidate, prepared, self.has_continuation())?;
+            if managed_changed || external_catalog.is_some() {
+                let external = external_catalog.as_ref().map(|(_, tools)| tools.clone());
+                let registry = self.model_registry(prepared, external)?;
+                if external_catalog.is_some() {
+                    candidate.replace_tools_for_environment(registry.definitions())?;
+                }
+                Some((registry, candidate))
+            } else {
+                None
+            }
+        } else if let Some((_, tools)) = &external_catalog {
+            let registry = self.runtime.prepare_external_tools(tools.clone())?;
+            let mut candidate = self
+                .context
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            candidate.replace_tools_for_environment(registry.definitions())?;
+            Some((registry, candidate))
+        } else {
+            None
+        };
+        if input.is_none() && catalog.is_some() {
+            return Err(Error::config("no suspended round continuation"));
+        }
         if let Some(input) = &input {
             if self.has_continuation() && !self.retry_ready() && !route_changed && catalog.is_none()
             {
@@ -632,19 +693,21 @@ impl SessionInner {
                     "resume or recover before submitting a new turn",
                 ));
             }
-            let mut preview_context = self
-                .context
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .clone();
+            let mut preview_context = match &catalog {
+                Some((_, candidate)) => candidate.clone(),
+                None => self
+                    .context
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone(),
+            };
             if route_changed {
                 preview_context.prepare_protocol_epoch()?;
             }
-            if let Some((_, tools)) = &catalog {
-                let registry = self.runtime.prepare_external_tools(tools.clone())?;
-                preview_context.replace_tools_for_environment(registry.definitions())?;
-            }
             let preview = self.state.preview();
+            preview.set_short_model_refs(crate::runtime::tool::short_model_refs(
+                preview_context.frozen_tools(),
+            ));
             preview.install_switch_mode_availability(switch_mode_available(
                 self.kind,
                 preview_context.frozen_tools(),
@@ -657,6 +720,8 @@ impl SessionInner {
                     state.turn_id = None;
                     state.round_id = None;
                     state.last_turn_id = 0;
+                    state.dialogue_turn = None;
+                    state.dialogue_turn_live = false;
                 });
                 preview.refresh_preview(Boundary::EpochStarted)?;
             }
@@ -732,13 +797,10 @@ impl SessionInner {
                 admission_transition.armed = true;
                 *admitted = true;
             }
-            if let Some((_, tools)) = &catalog {
-                self.apply_external_tools(tools.clone()).await?;
-                context = self
-                    .context
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .clone();
+            if let Some((registry, candidate)) = &catalog {
+                self.apply_catalog(registry.clone(), candidate.clone())
+                    .await?;
+                context = candidate.clone();
             }
             if route_changed {
                 context.prepare_protocol_epoch()?;
@@ -758,11 +820,18 @@ impl SessionInner {
                 self.boundary(Boundary::EpochEnded, None, &cancellation)
                     .await?;
                 context.materialize_epoch()?;
+                self.journal
+                    .retire_file_versions(self.state.processes().session_id())
+                    .await?;
                 self.state.update(|state| {
                     state.epoch_id = context.epoch();
                     state.turn_id = None;
                     state.round_id = None;
                     state.last_turn_id = 0;
+                    // The old certificate belongs to the settled historical
+                    // epoch and cannot validate under the new coordinates.
+                    state.dialogue_turn = None;
+                    state.dialogue_turn_live = false;
                 });
                 // Keep the owned Context consistent even if an acknowledged callback faults.
                 *self.context.lock().unwrap_or_else(|e| e.into_inner()) = context.clone();
@@ -940,7 +1009,7 @@ impl SessionInner {
             if self.route.is_some() || !carrier_run.is_empty() {
                 self.persist(&context, None).await?;
             }
-            if let Some((generation, _)) = &catalog {
+            if let Some((generation, _)) = &external_catalog {
                 self.applied_tools.store(*generation, Ordering::Release);
             }
         }

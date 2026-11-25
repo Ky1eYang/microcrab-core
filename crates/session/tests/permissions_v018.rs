@@ -1,7 +1,7 @@
 //! v0.1.8 authorization layers, native builtins and explicit catalog epochs.
 use async_trait::async_trait;
 use microcrab_agent_types::{AgentInfo, AgentMode, AgentRole, Variable};
-use microcrab_permission::{Action, Permission};
+use microcrab_permission::{Action, CompiledToolPolicy, Permission, evaluate_compiled};
 use microcrab_protocol::{Response, ToolCall, ToolDefinition};
 use microcrab_session::context::{Content, ContentItem};
 use microcrab_session::runtime::execution::ToolOutput;
@@ -70,20 +70,23 @@ impl Client for Model {
 fn permission(tool: &str, action: Action) -> Permission {
     serde_json::from_value(json!({"tool":{"kind":"exact","value":tool},"action":action})).unwrap()
 }
-fn row(view: &Value, name: &str) -> Value {
-    view["permission"]
-        .as_array()
+fn row(session: &Session, name: &str) -> Value {
+    use microcrab_session::policy::{PermissionList, PermissionListView};
+    let PermissionList::Current { current } = session
+        .permission_list(PermissionListView::Current)
         .unwrap()
-        .iter()
-        .find(|row| {
-            row["tools"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|value| value == name)
-        })
-        .unwrap()
-        .clone()
+    else {
+        unreachable!("the requested view was Current");
+    };
+    serde_json::to_value(
+        current
+            .tools
+            .into_iter()
+            .find(|row| row.name == name)
+            .unwrap()
+            .policy,
+    )
+    .unwrap()
 }
 fn edit(session: &Session, rules: Vec<Permission>) {
     let policy = session.permission_controller().snapshot().unwrap();
@@ -175,9 +178,25 @@ async fn native_builtins_override_guest_defaults_but_user_rules_win_and_expand_r
         .references(vec![DynReference::new(Catalog).unwrap()])
         .build()
         .unwrap();
-    let view = session.state_view().unwrap();
-    for name in ["delegate", "expand", "job", "sleep"] {
-        assert_eq!(row(&view, name)["action"], "allow");
+    assert!(session.state_view().unwrap().get("permission").is_none());
+    for name in ["delegate", "expand", "sleep"] {
+        assert_eq!(row(&session, name)["action"], "allow");
+    }
+    let job = row(&session, "job");
+    assert_eq!(job["kind"], "conditional");
+    let job: CompiledToolPolicy = serde_json::from_value(job).unwrap();
+    for action in [
+        "status", "read", "wait", "write", "cancel", "release", "redirect",
+    ] {
+        let expected = if action == "redirect" {
+            Action::Ask
+        } else {
+            Action::Allow
+        };
+        assert_eq!(
+            evaluate_compiled(&job, &json!({"action":action})).unwrap(),
+            expected
+        );
     }
     assert!(BuiltinTool::from_name("mcp").is_none());
     assert!(
@@ -194,10 +213,7 @@ async fn native_builtins_override_guest_defaults_but_user_rules_win_and_expand_r
     session.submit("expand installed reference").await.unwrap();
     assert!(session.messages().iter().any(|item| matches!(item, ContentItem::Tool { call_id, content, .. } if call_id == "expand-1" && content == "actual reference body")));
     edit(&session, vec![permission("sleep", Action::Deny)]);
-    assert_eq!(
-        row(&session.state_view().unwrap(), "sleep")["action"],
-        "deny"
-    );
+    assert_eq!(row(&session, "sleep")["action"], "deny");
     let before = session.permission_controller().snapshot().unwrap();
     let mut attempted = before.config.clone();
     attempted.defaults.clear();
@@ -229,24 +245,15 @@ async fn provider_defaults_are_scoped_low_priority_and_unknown_is_denied() {
     let session = Session::builder_arc(model.clone(), runtime)
         .build()
         .unwrap();
-    assert_eq!(
-        row(&session.state_view().unwrap(), "declared")["action"],
-        "allow"
-    );
-    assert_eq!(
-        row(&session.state_view().unwrap(), "unknown")["action"],
-        "deny"
-    );
+    assert_eq!(row(&session, "declared")["action"], "allow");
+    assert_eq!(row(&session, "unknown")["action"], "deny");
     model.call("provider-1", "declared", json!({}));
     session.submit("call declared provider").await.unwrap();
     assert!(session.messages().iter().any(
         |item| matches!(item, ContentItem::Tool { content, .. } if content == "provider executed")
     ));
     edit(&session, vec![permission("declared", Action::Deny)]);
-    assert_eq!(
-        row(&session.state_view().unwrap(), "declared")["action"],
-        "deny"
-    );
+    assert_eq!(row(&session, "declared")["action"], "deny");
     let policy = session.permission_controller().snapshot().unwrap();
     let mut attempted = policy.config.clone();
     attempted.provider_defaults.clear();
@@ -284,15 +291,9 @@ async fn opaque_guest_name_uses_declared_mode_grants_and_user_can_override_it() 
         .agent(agent)
         .build()
         .unwrap();
-    assert_eq!(
-        row(&session.state_view().unwrap(), "write")["action"],
-        "allow"
-    );
+    assert_eq!(row(&session, "write")["action"], "allow");
     edit(&session, vec![permission("write", Action::Deny)]);
-    assert_eq!(
-        row(&session.state_view().unwrap(), "write")["action"],
-        "deny"
-    );
+    assert_eq!(row(&session, "write")["action"], "deny");
     session.close().await.unwrap();
 }
 #[tokio::test]
@@ -418,9 +419,9 @@ async fn eligibility_requires_executor_and_live_authorization_and_uses_declared_
         .messages()
         .iter()
         .find_map(|item| match item {
-            ContentItem::Tool { call_id, content, .. } if call_id == "canonical-delegate" => {
-                serde_json::from_str(content).ok()
-            }
+            ContentItem::Tool {
+                call_id, content, ..
+            } if call_id == "canonical-delegate" => serde_json::from_str(content).ok(),
             _ => None,
         })
         .unwrap();
@@ -565,9 +566,7 @@ async fn native_job_keeps_all_six_actions_allowed_in_every_mode_and_args_overrid
     .unwrap();
     for mode in ["plan", "build"] {
         session.select_mode(mode).await.unwrap();
-        let mut projected = row(&session.state_view().unwrap(), "job");
-        projected.as_object_mut().unwrap().remove("tools");
-        projected.as_object_mut().unwrap().remove("owners");
+        let projected = row(&session, "job");
         let policy: CompiledToolPolicy = serde_json::from_value(projected).unwrap();
         for action in ["status", "read", "wait", "write", "cancel", "release"] {
             assert_eq!(
@@ -582,10 +581,8 @@ async fn native_job_keeps_all_six_actions_allowed_in_every_mode_and_args_overrid
         matcher: Matcher::Exact("write".into()),
     }];
     edit(&session, vec![deny_write]);
-    let mut projected = row(&session.state_view().unwrap(), "job");
+    let projected = row(&session, "job");
     assert_eq!(projected["kind"], "conditional");
-    projected.as_object_mut().unwrap().remove("tools");
-    projected.as_object_mut().unwrap().remove("owners");
     let policy: CompiledToolPolicy = serde_json::from_value(projected).unwrap();
     assert_eq!(
         evaluate_compiled(&policy, &json!({"action":"write"})).unwrap(),

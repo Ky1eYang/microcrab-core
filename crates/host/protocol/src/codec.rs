@@ -3,7 +3,7 @@
 //! have one serde schema travel as that JSON, unchanged between carriers.
 use crate::{
     BindingScope, BridgeDiagnostic, ErrorCode, HostCause, HostDescriptor, HostRequest,
-    MAX_CHUNK_BYTES, MAX_FRAME_BYTES, OperationReceipt, WireError, WireFrame,
+    MAX_CHUNK_BYTES, MAX_FRAME_BYTES, OperationReceipt, WebTransportFeatures, WireError, WireFrame,
 };
 use microcrab_host_api::{HandleId, process::ProcessHandle};
 use prost::Message;
@@ -114,22 +114,70 @@ fn chunk(
 }
 
 pub fn frame_to_proto(frame: &WireFrame) -> Result<pb::HostFrame, WireError> {
-    pb::HostFrame::decode(encode_frame(frame)?.as_slice())
-        .map_err(|_| invalid("encoded Host frame is not a protobuf HostFrame"))
+    frame_to_proto_with_web_transport_version(frame, None)
 }
 
 pub fn frame_from_proto(frame: pb::HostFrame) -> Result<WireFrame, WireError> {
-    let mut bytes = Vec::new();
-    frame
-        .encode(&mut bytes)
-        .map_err(|_| invalid("cannot encode Host frame"))?;
-    decode_frame(&bytes)
+    frame_from_proto_with_web_transport_version(frame).map(|(frame, _)| frame)
+}
+
+pub fn frame_from_proto_with_web_transport_version(
+    frame: pb::HostFrame,
+) -> Result<(WireFrame, Option<u32>), WireError> {
+    frame_from_proto_with_web_transport_features(frame)
+        .map(|(frame, features)| (frame, features.version))
+}
+
+pub fn frame_from_proto_with_web_transport_features(
+    frame: pb::HostFrame,
+) -> Result<(WireFrame, WebTransportFeatures), WireError> {
+    if frame.encoded_len() > MAX_FRAME_BYTES {
+        return Err(invalid("Host frame exceeds the protocol byte limit"));
+    }
+    decode_proto(frame)
 }
 
 /// Encode one native frame. Callers send these bytes as one WebSocket binary
 /// message or as one gRPC `HostFrame`.
 pub fn encode_frame(frame: &WireFrame) -> Result<Vec<u8>, WireError> {
+    encode_frame_with_web_transport_version(frame, None)
+}
+
+/// Attach an additive protobuf-only offer (Pair/Resume) or acknowledgment
+/// (Hello). A Hello acknowledgment is emitted only after authentication by
+/// the carrier; this codec neither validates a route nor grants capability.
+pub fn encode_frame_with_web_transport_version(
+    frame: &WireFrame,
+    version: Option<u32>,
+) -> Result<Vec<u8>, WireError> {
+    encode_frame_with_web_transport_features(frame, WebTransportFeatures { version, ws_pull: false })
+}
+
+pub fn encode_frame_with_web_transport_features(
+    frame: &WireFrame,
+    features: WebTransportFeatures,
+) -> Result<Vec<u8>, WireError> {
+    encode_message(frame_to_proto_with_web_transport_features(frame, features)?)
+}
+
+pub fn frame_to_proto_with_web_transport_version(
+    frame: &WireFrame,
+    version: Option<u32>,
+) -> Result<pb::HostFrame, WireError> {
+    frame_to_proto_with_web_transport_features(frame, WebTransportFeatures { version, ws_pull: false })
+}
+
+pub fn frame_to_proto_with_web_transport_features(
+    frame: &WireFrame,
+    features: WebTransportFeatures,
+) -> Result<pb::HostFrame, WireError> {
     use pb::host_frame::Body;
+    let WebTransportFeatures { version, ws_pull } = features;
+    if (version.is_some() || ws_pull)
+        && !matches!(frame, WireFrame::Pair { .. } | WireFrame::Resume { .. } | WireFrame::Hello { .. })
+    {
+        return Err(invalid("web transport features require a Control handshake frame"));
+    }
     let body = match frame {
         WireFrame::Inspect { request } => {
             request.validate()?;
@@ -169,6 +217,8 @@ pub fn encode_frame(frame: &WireFrame) -> Result<Vec<u8>, WireError> {
             expected_workspace_id: expected_workspace_id.clone(),
             expected_descriptor_digest: expected_descriptor_digest.clone(),
             expected_workspace_root: expected_workspace_root.clone(),
+            web_transport_version: version,
+            web_transport_ws_pull: ws_pull.then_some(true),
         }),
         WireFrame::Resume {
             credential,
@@ -186,6 +236,8 @@ pub fn encode_frame(frame: &WireFrame) -> Result<Vec<u8>, WireError> {
             expected_workspace_id: expected_workspace_id.clone(),
             expected_descriptor_digest: expected_descriptor_digest.clone(),
             expected_workspace_root: expected_workspace_root.clone(),
+            web_transport_version: version,
+            web_transport_ws_pull: ws_pull.then_some(true),
         }),
         WireFrame::WorkspaceBound {
             descriptor,
@@ -204,6 +256,8 @@ pub fn encode_frame(frame: &WireFrame) -> Result<Vec<u8>, WireError> {
             descriptor_json: json_bytes(descriptor)?,
             credential: credential.clone(),
             lease_generation: lease_generation.clone(),
+            web_transport_version: version,
+            web_transport_ws_pull: ws_pull.then_some(true),
         }),
         WireFrame::Request {
             request_id,
@@ -290,21 +344,51 @@ pub fn encode_frame(frame: &WireFrame) -> Result<Vec<u8>, WireError> {
             lease_generation: lease_generation.clone(),
         }),
     };
-    encode_message(pb::HostFrame { body: Some(body) })
+    let frame = pb::HostFrame { body: Some(body) };
+    if frame.encoded_len() > MAX_FRAME_BYTES {
+        return Err(invalid("Host frame exceeds the protocol byte limit"));
+    }
+    Ok(frame)
 }
 
 /// Decode one native frame produced by [`encode_frame`].
 pub fn decode_frame(bytes: &[u8]) -> Result<WireFrame, WireError> {
+    decode_frame_with_web_transport_version(bytes).map(|(frame, _)| frame)
+}
+
+/// Return the optional raw version for authenticated Control callers only.
+/// Legacy callers can keep decoding just the original `WireFrame`.
+pub fn decode_frame_with_web_transport_version(
+    bytes: &[u8],
+) -> Result<(WireFrame, Option<u32>), WireError> {
+    decode_frame_with_web_transport_features(bytes)
+        .map(|(frame, features)| (frame, features.version))
+}
+
+pub fn decode_frame_with_web_transport_features(
+    bytes: &[u8],
+) -> Result<(WireFrame, WebTransportFeatures), WireError> {
     if bytes.len() > MAX_FRAME_BYTES {
         return Err(invalid("Host frame exceeds the protocol byte limit"));
     }
     let frame = pb::HostFrame::decode(bytes)
         .map_err(|error| invalid(format!("Host protobuf decoding failed: {error}")))?;
+    decode_proto(frame)
+}
+
+fn decode_proto(frame: pb::HostFrame) -> Result<(WireFrame, WebTransportFeatures), WireError> {
     let Some(body) = frame.body else {
         return Err(invalid("Host frame has no body"));
     };
     use pb::host_frame::Body;
-    Ok(match body {
+    let (version, ws_pull) = match &body {
+        Body::Pair(frame) => (frame.web_transport_version, frame.web_transport_ws_pull),
+        Body::Resume(frame) => (frame.web_transport_version, frame.web_transport_ws_pull),
+        Body::Hello(frame) => (frame.web_transport_version, frame.web_transport_ws_pull),
+        _ => (None, None),
+    };
+    let features = WebTransportFeatures { version, ws_pull: ws_pull == Some(true) };
+    let frame = match body {
         Body::Inspect(frame) => {
             let body = match frame.authentication {
                 Some(pb::inspect::Authentication::Pair(pair)) => Body::Pair(pair),
@@ -424,7 +508,8 @@ pub fn decode_frame(bytes: &[u8]) -> Result<WireFrame, WireError> {
         Body::Detach(frame) => WireFrame::Detach {
             lease_generation: frame.lease_generation,
         },
-    })
+    };
+    Ok((frame, features))
 }
 
 #[cfg(test)]
@@ -647,6 +732,46 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn web_transport_offer_is_protobuf_only_and_cannot_negotiate_inspection() {
+        use crate::{WEB_TRANSPORT_V1, web_transport_v1_negotiated};
+        let pair = WireFrame::Pair {
+            token: "secret".into(),
+            scope: BindingScope::project("backend".into(), "binding".into(), "project".into()),
+            directory: None,
+            expected_host_id: None,
+            expected_workspace_id: None,
+            expected_descriptor_digest: None,
+            expected_workspace_root: None,
+        };
+        let legacy = encode_frame(&pair).unwrap();
+        assert_eq!(decode_frame_with_web_transport_version(&legacy).unwrap().1, None);
+        let offered = encode_frame_with_web_transport_version(&pair, Some(WEB_TRANSPORT_V1)).unwrap();
+        assert_ne!(offered, legacy);
+        assert_eq!(encode_frame(&decode_frame(&offered).unwrap()).unwrap(), legacy);
+        assert_eq!(decode_frame_with_web_transport_version(&offered).unwrap().1, Some(WEB_TRANSPORT_V1));
+        let v1_only = WebTransportFeatures { version: Some(WEB_TRANSPORT_V1), ws_pull: false };
+        assert_eq!(decode_frame_with_web_transport_features(&offered).unwrap().1, v1_only);
+        assert_eq!(encode_frame_with_web_transport_features(&pair, v1_only).unwrap(), offered);
+        let pull_offer = encode_frame_with_web_transport_features(&pair, WebTransportFeatures::V1).unwrap();
+        assert_eq!(decode_frame_with_web_transport_features(&pull_offer).unwrap().1, WebTransportFeatures::V1);
+        assert_eq!(decode_frame_with_web_transport_version(&pull_offer).unwrap().1, Some(WEB_TRANSPORT_V1));
+        assert_eq!(encode_frame(&decode_frame(&pull_offer).unwrap()).unwrap(), legacy);
+        let inspect = WireFrame::Inspect { request: crate::InspectRequest::new("inspect-1".into(), &pair).unwrap() };
+        assert!(frame_to_proto_with_web_transport_version(&inspect, Some(WEB_TRANSPORT_V1)).is_err());
+        assert!(frame_to_proto_with_web_transport_features(&inspect, WebTransportFeatures::V1).is_err());
+        let mut proto = frame_to_proto(&inspect).unwrap();
+        let Some(pb::host_frame::Body::Inspect(inspect)) = &mut proto.body else { unreachable!() };
+        let Some(pb::inspect::Authentication::Pair(pair)) = &mut inspect.authentication else { unreachable!() };
+        pair.web_transport_version = Some(WEB_TRANSPORT_V1);
+        pair.web_transport_ws_pull = Some(true);
+        assert_eq!(frame_from_proto_with_web_transport_features(proto).unwrap().1, WebTransportFeatures::default());
+        assert!(web_transport_v1_negotiated(Some(WEB_TRANSPORT_V1), Some(WEB_TRANSPORT_V1)));
+        assert!(!web_transport_v1_negotiated(Some(WEB_TRANSPORT_V1), None));
+        assert!(!web_transport_v1_negotiated(None, Some(WEB_TRANSPORT_V1)));
+        assert!(!web_transport_v1_negotiated(Some(WEB_TRANSPORT_V1 + 1), Some(WEB_TRANSPORT_V1 + 1)));
     }
 
     #[test]

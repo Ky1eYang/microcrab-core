@@ -87,6 +87,11 @@ pub(crate) fn validate_request_rewrite(
             "request rewrite changed frozen system or tools",
         ));
     }
+    if tool_call_groups(&original) != tool_call_groups(&rewritten) {
+        return Err(Error::protocol(
+            "request rewrite changed authored tool calls",
+        ));
+    }
     // A signature belongs to its model Content and exact ordered Parts, including
     // signed text and empty/signature-only tails. Keep its conversation position.
     let signed_groups = |body: &Value| -> Vec<(usize, Value)> {
@@ -126,6 +131,23 @@ pub(crate) fn validate_request_rewrite(
         return Err(Error::Limit("request rewrite output token budget".into()));
     }
     Ok(())
+}
+
+fn tool_call_groups(body: &Value) -> Vec<(&Value, Vec<&Value>)> {
+    body["contents"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|content| {
+            let calls: Vec<_> = content["parts"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|part| part.get("functionCall"))
+                .collect();
+            (!calls.is_empty()).then_some((&content["role"], calls))
+        })
+        .collect()
 }
 
 pub(super) fn canonical_fields(value: &Value) -> Result<(), Error> {

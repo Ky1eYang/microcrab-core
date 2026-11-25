@@ -7,7 +7,7 @@ mod tests;
 
 pub use microcrab_protocol::{HookPayload, Moment, VariablesChange};
 pub use producer::ChannelAuditor;
-pub use records::{AuditBody, AuditOutcome, AuditRecord};
+pub use records::{AuditBody, AuditOutcome, AuditRecord, ToolPresentation};
 use serde::{Deserialize, Serialize};
 use std::future::Future;
 use std::pin::Pin;

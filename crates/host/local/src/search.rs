@@ -7,8 +7,8 @@ use crate::{
 use globset::{GlobBuilder, GlobMatcher};
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use microcrab_host_api::{
-    GlobEntry, GlobEntryKind, GlobOutput, GlobRequest, GrepMatch, GrepOutput, GrepRequest,
-    ToolError,
+    GlobEntry, GlobEntryKind, GlobIgnoreRuleFile, GlobOutput, GlobRequest, GrepMatch, GrepOutput,
+    GrepRequest, ToolError,
 };
 use std::{
     fs,
@@ -18,7 +18,16 @@ use std::{
 };
 use tokio_util::sync::CancellationToken;
 
+mod ignore_rules;
+mod resolved;
+use ignore_rules::ExplicitRules;
+pub(crate) use ignore_rules::{
+    resolved_paths as glob_ignored_paths, snapshot as glob_ignore_snapshot,
+};
+pub(crate) use resolved::search as glob_with_ignored_paths;
+
 const ENTRIES: usize = 16_384;
+const DEPTH: usize = 64;
 const SCAN_BYTES: usize = 64 * 1024 * 1024;
 const LINE_BYTES: usize = 1024 * 1024;
 const RESULTS: usize = 4096;
@@ -107,12 +116,16 @@ fn walk(
     protected: &crate::paths::Policy,
     requested: &Path,
     options: WalkOptions,
+    explicit: Option<&ExplicitRules>,
     token: &CancellationToken,
     mut visit: impl FnMut(&Path, &Path, GlobEntryKind) -> Result<bool, ToolError>,
 ) -> Result<bool, ToolError> {
     cancelled(token)?;
     let search = admit(root, requested, protected)?;
     let metadata = fs::symlink_metadata(&search)?;
+    if explicit.is_some_and(|rules| rules.excludes_search_root(root, &search, metadata.is_dir())) {
+        return Ok(false);
+    }
     if metadata.is_file() {
         return Ok(!visit(
             &search,
@@ -132,7 +145,7 @@ fn walk(
     while let Some((directory, mut inherited, depth)) = pending.pop() {
         cancelled(token)?;
         admit(root, &directory, protected)?;
-        if !options.ignored {
+        if !options.ignored && explicit.is_none() {
             match rules(&directory, protected, &mut rule_bytes, token) {
                 Ok(rule) => inherited.push(Arc::new(rule)),
                 Err(ToolError::FileLimit) => return Ok(true),
@@ -171,7 +184,11 @@ fn walk(
             } else {
                 continue;
             };
-            if !options.ignored {
+            if let Some(rules) = explicit {
+                if rules.excludes(root, &path, kind == GlobEntryKind::Directory) {
+                    continue;
+                }
+            } else if !options.ignored {
                 let mut excluded = false;
                 for rule in &inherited {
                     let matched = rule.matched(&path, kind == GlobEntryKind::Directory);
@@ -195,7 +212,7 @@ fn walk(
                 return Ok(true);
             }
             if kind == GlobEntryKind::Directory {
-                if depth >= 64 {
+                if depth >= DEPTH {
                     return Ok(true);
                 }
                 pending.push((path, inherited.clone(), depth + 1));
@@ -209,6 +226,32 @@ pub(crate) fn glob_files(
     root: &Path,
     protected: &crate::paths::Policy,
     request: GlobRequest,
+    token: &CancellationToken,
+) -> Result<GlobOutput, ToolError> {
+    glob_selection(root, protected, request, None, token)
+}
+
+pub(crate) fn glob_with_ignore_rules(
+    root: &Path,
+    protected: &crate::paths::Policy,
+    request: GlobRequest,
+    rules: Vec<GlobIgnoreRuleFile>,
+    token: &CancellationToken,
+) -> Result<GlobOutput, ToolError> {
+    cancelled(token)?;
+    let explicit = if request.include_ignored {
+        None
+    } else {
+        Some(ExplicitRules::new(root, protected, rules, token)?)
+    };
+    glob_selection(root, protected, request, explicit.as_ref(), token)
+}
+
+fn glob_selection(
+    root: &Path,
+    protected: &crate::paths::Policy,
+    request: GlobRequest,
+    explicit: Option<&ExplicitRules>,
     token: &CancellationToken,
 ) -> Result<GlobOutput, ToolError> {
     cancelled(token)?;
@@ -230,6 +273,7 @@ pub(crate) fn glob_files(
             ignored: request.include_ignored,
             include_directories: request.include_directories,
         },
+        explicit,
         token,
         |path, relative, kind| {
             if matcher.is_match(match_path(path, &search)) {
@@ -290,6 +334,7 @@ pub(crate) fn grep_files(
         protected,
         &request.root,
         WalkOptions::default(),
+        None,
         token,
         |path, relative, _kind| {
             if include

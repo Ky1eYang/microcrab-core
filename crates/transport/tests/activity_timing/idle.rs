@@ -248,6 +248,7 @@ async fn all_protocols_headers_or_body_silence_finish_timed_out_audit_and_observ
             assert_eq!(completed.outcome, Some(AuditOutcome::TimedOut));
             assert_eq!(completed.response_status, headers.then_some(200));
             assert!(!completed.response_complete.unwrap_or(false));
+            assert!(completed.response_completed_at_ms.is_none());
             assert!(records.try_recv().is_err());
             assert!(
                 matches!(&observer.records.lock().unwrap().last().unwrap().state,
@@ -294,6 +295,7 @@ async fn all_protocols_caller_cancellation_settles_once_as_cancelled_after_progr
         let completed = records.try_recv().unwrap();
         assert_eq!(prepared.call_id, completed.call_id);
         assert_eq!(completed.outcome, Some(AuditOutcome::Cancelled));
+        assert!(completed.response_completed_at_ms.is_none());
         assert!(records.try_recv().is_err());
         assert!(
             matches!(&observer.records.lock().unwrap().last().unwrap().state,

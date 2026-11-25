@@ -1,8 +1,208 @@
 //! User policy edits and explicit external-catalog epoch admission.
 use super::*;
-use crate::policy::{PermissionConfig, PermissionError, PolicySnapshot};
+use crate::policy::{
+    CurrentPermissionList, CurrentToolPermission, ListBudget, Matcher, PermissionConfig,
+    PermissionController, PermissionError, PermissionInitialization, PermissionInventory,
+    PermissionInventoryMode, PermissionInventoryRule, PermissionInventoryTool, PermissionList,
+    PermissionListError, PermissionListView, PolicySnapshot,
+};
+use crate::runtime::handler::permissions::AppliedCatalog;
 
 impl SessionInner {
+    pub(crate) fn permission_list(
+        &self,
+        view: PermissionListView,
+    ) -> Result<PermissionList, PermissionListError> {
+        let controller = self.runtime.permission_controller();
+        let (generation, position, catalog, policy) = self.permission_list_position()?;
+        let revision = policy.revision;
+        let lineage = controller.lineage()?;
+        controller.ensure_witness(revision, &lineage)?;
+        let mut budget = ListBudget::new();
+        let tools = catalog.policy_rows(&policy, &lineage, &mut budget)?;
+        let inventory = match view {
+            PermissionListView::Current => None,
+            PermissionListView::Management => Some(self.permission_management(
+                &controller,
+                &catalog,
+                &policy,
+                &lineage,
+                &tools,
+                &mut budget,
+            )?),
+        };
+        let current = CurrentPermissionList {
+            runtime_instance_id: position.0.clone(),
+            catalog_revision: catalog.revision().to_string(),
+            policy_revision: policy.revision.to_string(),
+            ancestor_witness: PermissionController::ancestor_witness(&lineage),
+            agent: policy.config.agent.clone(),
+            mode: policy.config.mode.clone(),
+            tools,
+        };
+        let list = match inventory {
+            Some(tool_inventory) => PermissionList::Management {
+                current,
+                policy,
+                tool_inventory,
+            },
+            None => PermissionList::Current { current },
+        };
+        // Include envelope, config, collection delimiters and initialization in
+        // the exact byte bound. No response allocation is needed for counting.
+        ListBudget::new().charge(&list)?;
+        let (latest_generation, latest_position, latest_catalog, latest_policy) =
+            self.permission_list_position()?;
+        if latest_generation != generation
+            || latest_position != position
+            || !catalog.matches(&latest_catalog)
+            || latest_policy.revision != revision
+        {
+            return Err(PermissionError::StalePolicy.into());
+        }
+        controller.ensure_witness(revision, &lineage)?;
+        self.ensure_open()
+            .map_err(|_| PermissionListError::Unavailable)?;
+        if self.replacing.load(Ordering::Acquire) {
+            return Err(PermissionListError::Busy);
+        }
+        Ok(list)
+    }
+
+    /// `select_mode_now` can publish outside the turn operation latch. Its
+    /// existing mode guard keeps selected State and applied policy coherent.
+    /// A regular active turn does not itself exclude a current-list read.
+    fn permission_list_position(
+        &self,
+    ) -> Result<
+        (
+            u64,
+            (String, Option<String>),
+            AppliedCatalog,
+            PolicySnapshot,
+        ),
+        PermissionListError,
+    > {
+        self.ensure_open()
+            .map_err(|_| PermissionListError::Unavailable)?;
+        let mode = self
+            .configured_mode
+            .try_lock()
+            .map_err(|error| match error {
+                std::sync::TryLockError::WouldBlock => PermissionListError::Busy,
+                std::sync::TryLockError::Poisoned(_) => PermissionListError::Unavailable,
+            })?;
+        if self.replacing.load(Ordering::Acquire) {
+            return Err(PermissionListError::Busy);
+        }
+        let position = self.state.permission_position();
+        let (catalog, policy) = self.runtime.observe_applied_policy()?;
+        if position.1.as_deref().unwrap_or_default() != policy.config.mode {
+            return Err(PermissionError::StalePolicy.into());
+        }
+        self.ensure_open()
+            .map_err(|_| PermissionListError::Unavailable)?;
+        Ok((mode.0, position, catalog, policy))
+    }
+
+    fn permission_management(
+        &self,
+        controller: &PermissionController,
+        catalog: &AppliedCatalog,
+        policy: &PolicySnapshot,
+        lineage: &[(Arc<PermissionController>, PolicySnapshot)],
+        current_rows: &[CurrentToolPermission],
+        budget: &mut ListBudget,
+    ) -> Result<PermissionInventory, PermissionListError> {
+        let mut initialization = Vec::with_capacity(lineage.len() + 1);
+        initialization.push(policy.into());
+        initialization.extend(lineage.iter().map(|(_, snapshot)| snapshot.into()));
+        let origins = catalog.registry().origins();
+        let mut modes = Vec::new();
+        let mut add_mode = |name: &str,
+                            metadata: Option<&microcrab_agent_types::AgentMode>|
+         -> Result<(), PermissionListError> {
+            let current = name == policy.config.mode;
+            let projection = match metadata {
+                Some(mode) if !current => controller.inventory_mode(
+                    &origins,
+                    &mode.permissions,
+                    &policy.config.agent,
+                    name,
+                )?,
+                _ => policy.clone(),
+            };
+            if projection.revision != policy.revision {
+                return Err(PermissionError::StalePolicy.into());
+            }
+            budget.charge(&projection.config)?;
+            let mut tools = Vec::new();
+            let mut compiled = Vec::new();
+            let owners: Vec<_> = std::iter::once(controller.provenance(&projection))
+                .chain(
+                    lineage
+                        .iter()
+                        .map(|(owner, snapshot)| owner.provenance(snapshot)),
+                )
+                .collect();
+            for ((name, description), row) in
+                catalog.registry().tool_descriptions().zip(current_rows)
+            {
+                let tool = PermissionInventoryTool {
+                    name: name.to_owned(),
+                    description: description.to_owned(),
+                };
+                budget.charge(&tool)?;
+                tools.push(tool);
+                let compiled_policy = if current {
+                    row.policy.clone()
+                } else {
+                    PermissionController::compile_witness(&projection, lineage, name)?
+                };
+                let rule = PermissionInventoryRule {
+                    tool: Matcher::Exact(name.to_owned()),
+                    policy: compiled_policy,
+                    owners: owners.clone(),
+                };
+                budget.charge(&rule)?;
+                compiled.push(rule);
+            }
+            let description = metadata.map(|mode| mode.description.clone());
+            let prompt = metadata.map(|mode| mode.prompt.clone());
+            budget.charge(&description)?;
+            budget.charge(&prompt)?;
+            modes.push(PermissionInventoryMode {
+                name: name.to_owned(),
+                description,
+                prompt,
+                current,
+                tools,
+                policy: projection.config,
+                compiled,
+            });
+            Ok(())
+        };
+        let mut found_current = false;
+        if let Some(agent) = &self.agent {
+            for mode in &agent.modes {
+                if crate::session::mode_role_eligible(self.is_main, mode.role) {
+                    found_current |= policy.config.mode == mode.name;
+                    add_mode(&mode.name, Some(mode))?;
+                }
+            }
+        }
+        if !found_current {
+            add_mode(&policy.config.mode, None)?;
+        }
+        Ok(PermissionInventory {
+            agent: policy.config.agent.clone(),
+            modes,
+            initialization: PermissionInitialization::AllOf {
+                policies: initialization,
+            },
+        })
+    }
+
     pub(crate) fn replace_permissions_with_review(
         &self,
         expected_revision: u64,
@@ -14,56 +214,6 @@ impl SessionInner {
         self.runtime
             .permission_controller()
             .replace_user_with_review(expected_revision, config, review_client)
-    }
-    /// Inventory comes from this Session's immutable pinned agent and actual registry.
-    pub(crate) fn permission_inventory(&self) -> Result<serde_json::Value, PermissionError> {
-        let controller = self.runtime.permission_controller();
-        let current = controller.snapshot()?;
-        let lineage = controller.lineage()?;
-        let definitions = self.runtime.definitions();
-        let origins = definitions
-            .iter()
-            .filter_map(|tool| {
-                self.runtime
-                    .origin(&tool.name)
-                    .map(|origin| (tool.name.clone(), origin))
-            })
-            .collect::<Vec<_>>();
-        let tools = definitions
-            .iter()
-            .map(|tool| serde_json::json!({"name":tool.name,"description":tool.description}))
-            .collect::<Vec<_>>();
-        let mut modes = Vec::new();
-        if let Some(agent) = &self.agent {
-            for mode in &agent.modes {
-                if matches!(
-                    (self.is_main, mode.role),
-                    (true, microcrab_agent_types::AgentRole::SubAgent)
-                        | (false, microcrab_agent_types::AgentRole::MainAgent)
-                ) {
-                    continue;
-                }
-                let policy = controller.inventory_mode(
-                    &origins,
-                    &mode.permissions,
-                    &agent.name,
-                    &mode.name,
-                )?;
-                let compiled = controller.compiled_inventory(&policy, &origins)?;
-                modes.push(serde_json::json!({"name":mode.name,"description":mode.description,"prompt":mode.prompt,"current":current.config.mode == mode.name,"tools":tools,"policy":policy.config,"compiled":compiled}));
-            }
-        } else {
-            let compiled = controller.compiled_inventory(&current, &origins)?;
-            modes.push(serde_json::json!({"name":current.config.mode,"current":true,"tools":tools,"policy":current.config,"compiled":compiled}));
-        }
-        controller.ensure_witness(current.revision, &lineage)?;
-        let mut initialization = vec![
-            serde_json::json!({"revision":current.revision,"agent":current.config.agent,"mode":current.config.mode,"action":current.config.initialization}),
-        ];
-        initialization.extend(lineage.iter().map(|(_, policy)| serde_json::json!({"revision":policy.revision,"agent":policy.config.agent,"mode":policy.config.mode,"action":policy.config.initialization})));
-        Ok(
-            serde_json::json!({"agent":current.config.agent,"modes":modes,"initialization":{"kind":"all_of","policies":initialization}}),
-        )
     }
     pub(crate) fn replace_permissions(
         &self,
@@ -86,7 +236,10 @@ impl SessionInner {
     ) -> Result<(), Error> {
         self.ensure_open()?;
         // Validate without replacing the applied registry or an active lease.
-        self.runtime.prepare_external_tools(tools.clone())?;
+        let registry = self.runtime.prepare_external_tools(tools.clone())?;
+        if let Some(owner) = &self.model_admission {
+            registry.validate_model_owner(owner.as_ref())?;
+        }
         let mut configured = self.pending_tools.lock().unwrap_or_else(|e| e.into_inner());
         let generation = configured
             .as_ref()
@@ -95,18 +248,12 @@ impl SessionInner {
         *configured = Some((generation, tools));
         Ok(())
     }
-    pub(super) async fn apply_external_tools(
+    pub(super) async fn apply_catalog(
         &self,
-        tools: Vec<Arc<dyn crate::runtime::tool::Tool>>,
+        registry: Arc<crate::runtime::tool::ToolRegistry>,
+        context: Context,
     ) -> Result<(), Error> {
         let _fence = self.endpoint.fence().await?;
-        let registry = self.runtime.prepare_external_tools(tools)?;
-        let mut context = self
-            .context
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .clone();
-        context.replace_tools_for_environment(registry.definitions())?;
         let controller = self.runtime.permission_controller();
         let provider = registry.provider_defaults()?;
         let mut state = self.state.recovery_snapshot();
@@ -154,7 +301,10 @@ impl SessionInner {
                 .map_err(|error| {
                     Error::config_with_private(error.public_reason(), error.to_string())
                 })?;
-            match controller.publish_tools(registry.origins(), provider.clone(), policy) {
+            match self
+                .runtime
+                .publish_catalog(registry.clone(), provider.clone(), policy)
+            {
                 Ok(()) => {
                     published = true;
                     break;
@@ -174,8 +324,11 @@ impl SessionInner {
             ));
         }
         self.state
-            .install_permission(controller.observe(registry.origins()));
-        self.runtime.publish_registry(registry);
+            .set_model_permission_names(context.frozen_tools());
+        self.state
+            .set_short_model_refs(crate::runtime::tool::short_model_refs(
+                context.frozen_tools(),
+            ));
         self.state
             .install_delegate_availability(self.runtime.delegate_available());
         self.state

@@ -87,8 +87,11 @@ impl AgentLifecycle {
         tokio::task::spawn_blocking(move || {
             tracing::dispatcher::with_default(&dispatch, || {
                 let epoch = slot.cancellation.clone();
+                let ready = lease.ready();
                 slot.run(lease, |cached| {
-                    if cached.as_ref().is_some_and(|instance| instance.init_ready) {
+                    if ready {
+                        // A replacement inherits only the settled permission to
+                        // invoke. It never repeats the initialization export.
                         return Ok(());
                     }
                     let result = compiled.run(
@@ -100,8 +103,11 @@ impl AgentLifecycle {
                         Some(invocation),
                         Some((String::new(), serde_json::json!({}))),
                         |bindings, store, boundary| {
+                            store.data_mut().guest_observation = compiled
+                                .observation_scope(Phase::Init, None)
+                                .map(|scope| (scope, Phase::Init));
                             let result = bindings.call_init(&mut *store).map_err(|error| {
-                                boundary.failure(error, crate::observation::wasm::Phase::Init)
+                                compiled.execution_failure(boundary, error, Phase::Init)
                             })?;
                             match result {
                                 InitResult::Ready => Ok(()),

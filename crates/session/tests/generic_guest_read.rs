@@ -50,6 +50,258 @@ impl Client for Once {
         })
     }
 }
+struct GlobTurns(Mutex<u64>);
+#[async_trait]
+impl Client for GlobTurns {
+    async fn complete(
+        &self,
+        _: &Content,
+        _: &dyn Auditor,
+        variables: &dyn VariableView,
+        _: CancellationToken,
+    ) -> Result<Response, microcrab_transport::Error> {
+        let mut step = self.0.lock().unwrap();
+        let call = if *step % 2 == 0 {
+            assert!(
+                variables.get("glob_ignored").is_some(),
+                "init must publish rules before the first provider request"
+            );
+            vec![ToolCall {
+                id: format!("state-glob-{}", *step),
+                name: "glob".into(),
+                arguments: json!({"root":".","pattern":"**/*.png","include_ignored":*step == 4}),
+                provider_metadata: None,
+            }]
+        } else {
+            vec![]
+        };
+        *step += 1;
+        Ok(Response {
+            content: "done".into(),
+            tool_calls: call,
+            provider_metadata: None,
+            usage: Default::default(),
+        })
+    }
+}
+
+#[tokio::test]
+#[ignore = "set MICROCRAB_CODING_WASM to the v0.2.6 Coding Component"]
+async fn maintained_coding_glob_consumes_live_state_without_rereading_ignore_files() {
+    let root = tempfile::tempdir().unwrap();
+    for dir in ["sub", "target"] {
+        std::fs::create_dir(root.path().join(dir)).unwrap();
+    }
+    for name in ["root.png", "sub/nested.png", "target/hello.png"] {
+        std::fs::write(root.path().join(name), b"fixture").unwrap();
+    }
+    std::fs::write(root.path().join(".gitignore"), "target/\n").unwrap();
+    std::fs::write(root.path().join("sub/.ignore"), "nested.png\n").unwrap();
+    let host = Arc::new(LocalHost::new(root.path(), ShellLimits::default()).unwrap());
+    let bytes = std::fs::read(std::env::var_os("MICROCRAB_CODING_WASM").unwrap()).unwrap();
+    let agent = WasmAgent::load(&bytes, WasmLimits::default(), host.clone()).unwrap();
+    let runtime = Runtime::new(
+        agent
+            .tools()
+            .into_iter()
+            .map(ToolRegistration::Wasm)
+            .collect(),
+        Arc::new(DenyAll),
+    )
+    .unwrap();
+    let session = Session::builder(GlobTurns(Mutex::new(0)), runtime)
+        .session_id("coding-live-ignore")
+        .host(host)
+        .agent(agent.agents()[0].clone())
+        .permissions(serde_json::from_value(json!({"initialization":"allow"})).unwrap())
+        .build()
+        .unwrap();
+    session.select_mode("plan").await.unwrap();
+    session.submit("initial rules").await.unwrap();
+    let state = session.state_handle();
+    let initial = state.extract("glob_ignored").unwrap();
+    assert_eq!(
+        initial,
+        json!([{"path":".gitignore","content":"target/\n"},{"path":"sub/.ignore","content":"nested.png\n"}])
+    );
+    std::fs::write(root.path().join(".gitignore"), "*.png\n").unwrap();
+    state.inject("glob_ignored", json!([])).await.unwrap();
+    session
+        .submit("use the edited empty list, not the files")
+        .await
+        .unwrap();
+    state
+        .inject("glob_ignored", json!({"status":"incomplete"}))
+        .await
+        .unwrap();
+    session.submit("explicit ignore bypass").await.unwrap();
+    session.submit("unavailable ignore list").await.unwrap();
+    let outputs: Vec<_> = session
+        .messages()
+        .into_iter()
+        .filter_map(|item| match item {
+            ContentItem::Tool {
+                call_id, content, ..
+            } if call_id.starts_with("state-glob-") => Some(content),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(outputs.len(), 4);
+    assert!(
+        outputs[0].contains("root.png")
+            && !outputs[0].contains("hello.png")
+            && !outputs[0].contains("nested.png")
+    );
+    for index in [1, 2] {
+        assert!(
+            outputs[index].contains("root.png")
+                && outputs[index].contains("hello.png")
+                && outputs[index].contains("nested.png")
+        );
+    }
+    assert!(outputs[3].contains("glob_ignored is unavailable or invalid"));
+    session.close().await.unwrap();
+}
+
+struct ResolvedGlobTurns(Mutex<usize>);
+#[async_trait]
+impl Client for ResolvedGlobTurns {
+    async fn complete(
+        &self,
+        _: &Content,
+        _: &dyn Auditor,
+        variables: &dyn VariableView,
+        _: CancellationToken,
+    ) -> Result<Response, microcrab_transport::Error> {
+        let mut step = self.0.lock().unwrap();
+        if *step == 0 {
+            assert_eq!(
+                variables.get("glob_ignored"),
+                Some(json!(["sub/nested.png", "target/"]))
+            );
+        }
+        let mut arguments = json!({"root":".", "pattern":"target/hello.png"});
+        if *step == 4 {
+            arguments["ignored_list"] = json!(["target/"]);
+        }
+        if *step == 6 {
+            arguments["ignored_list"] = json!([]);
+        }
+        if *step == 8 {
+            arguments["ignored_list"] = Value::Null;
+        }
+        let tool_calls = if *step % 2 == 0 {
+            vec![ToolCall {
+                id: format!("resolved-glob-{}", *step),
+                name: "glob".into(),
+                arguments,
+                provider_metadata: None,
+            }]
+        } else {
+            vec![]
+        };
+        *step += 1;
+        Ok(Response {
+            content: "done".into(),
+            tool_calls,
+            provider_metadata: None,
+            usage: Default::default(),
+        })
+    }
+}
+
+#[tokio::test]
+#[ignore = "set MICROCRAB_RESOLVED_GLOB_WASM to the new Coding Component"]
+async fn maintained_coding_glob_injects_concrete_live_paths_only_on_the_dispatch_copy() {
+    let root = tempfile::tempdir().unwrap();
+    for dir in ["sub", "target"] {
+        std::fs::create_dir(root.path().join(dir)).unwrap();
+    }
+    for name in ["sub/nested.png", "target/hello.png"] {
+        std::fs::write(root.path().join(name), b"fixture").unwrap();
+    }
+    std::fs::write(root.path().join(".gitignore"), "target/\n").unwrap();
+    std::fs::write(root.path().join("sub/.ignore"), "*.png\n").unwrap();
+    let host = Arc::new(LocalHost::new(root.path(), ShellLimits::default()).unwrap());
+    let bytes = std::fs::read(std::env::var_os("MICROCRAB_RESOLVED_GLOB_WASM").unwrap()).unwrap();
+    let agent = WasmAgent::load(&bytes, WasmLimits::default(), host.clone()).unwrap();
+    let runtime = Runtime::new(
+        agent
+            .tools()
+            .into_iter()
+            .map(ToolRegistration::Wasm)
+            .collect(),
+        Arc::new(DenyAll),
+    )
+    .unwrap();
+    let session = Session::builder(ResolvedGlobTurns(Mutex::new(0)), runtime)
+        .session_id("coding-resolved-glob")
+        .host(host)
+        .agent(agent.agents()[0].clone())
+        .permissions(serde_json::from_value(json!({"initialization":"allow"})).unwrap())
+        .build()
+        .unwrap();
+    session.select_mode("plan").await.unwrap();
+    session.submit("initial exclusions").await.unwrap();
+    let state = session.state_handle();
+    std::fs::write(root.path().join(".gitignore"), "*.png\n").unwrap();
+    state.inject("glob_ignored", json!([])).await.unwrap();
+    session.submit("edited exclusions").await.unwrap();
+    session.submit("per-call override").await.unwrap();
+    state
+        .inject("glob_ignored", json!({"status":"unavailable"}))
+        .await
+        .unwrap();
+    session
+        .submit("explicit empty list despite unavailable state")
+        .await
+        .unwrap();
+    session.submit("explicit null is rejected").await.unwrap();
+    session
+        .submit("unavailable default is rejected")
+        .await
+        .unwrap();
+    let items = session.messages();
+    let calls: Vec<_> = items
+        .iter()
+        .filter_map(|item| match item {
+            ContentItem::Assistant { tool_calls, .. } => Some(tool_calls),
+            _ => None,
+        })
+        .flatten()
+        .filter(|call| call.id.starts_with("resolved-glob-"))
+        .collect();
+    assert_eq!(calls.len(), 6);
+    for index in [0, 1, 5] {
+        assert!(calls[index].arguments.get("ignored_list").is_none());
+    }
+    assert_eq!(calls[2].arguments["ignored_list"], json!(["target/"]));
+    assert_eq!(calls[3].arguments["ignored_list"], json!([]));
+    assert_eq!(calls[4].arguments["ignored_list"], Value::Null);
+    let output: Vec<_> = items
+        .iter()
+        .filter_map(|item| match item {
+            ContentItem::Tool {
+                call_id, content, ..
+            } if call_id.starts_with("resolved-glob-") => Some(content),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(output.len(), 6);
+    for index in [0, 1, 2, 3] {
+        assert_eq!(
+            output[index].contains("hello.png"),
+            matches!(index, 1 | 3),
+            "{}",
+            output[index]
+        );
+    }
+    for index in [4, 5] {
+        assert!(output[index].contains("Single(Array)"), "{}", output[index]);
+    }
+    session.close().await.unwrap();
+}
+
 fn append_page(body: &mut String, page: &OutputPage) {
     assert!(page.closed);
     assert_eq!(page.start_cursor, 0);
@@ -114,9 +366,9 @@ async fn maintained_coding_large_read_preserves_escaped_unicode_through_closed_b
         .messages()
         .iter()
         .find_map(|item| match item {
-            ContentItem::Tool { call_id, content, .. } if call_id == "large-native-read" => {
-                Some(content.clone())
-            }
+            ContentItem::Tool {
+                call_id, content, ..
+            } if call_id == "large-native-read" => Some(content.clone()),
             _ => None,
         })
         .expect("actual maintained coding read returns a tool result");
@@ -179,7 +431,10 @@ async fn maintained_coding_large_read_preserves_escaped_unicode_through_closed_b
     assert_eq!(decoded["start_line"], 1);
     assert_eq!(decoded["truncated"], false);
     assert!(decoded["next_line"].is_null());
-    assert_eq!(decoded["version"].as_str().unwrap().len(), 64);
+    let version = decoded["version"].as_str().unwrap();
+    let digest = version.strip_prefix("fv_").expect("current Coding returns a scoped file-version reference");
+    assert!(matches!(digest.len(), 16 | 20 | 24));
+    assert!(digest.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)));
     let mut model_read = String::new();
     let mut model_cursor = 0;
     for _ in 0..256 {

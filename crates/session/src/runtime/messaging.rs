@@ -17,16 +17,6 @@ pub trait AgentPeer: Send + Sync {
         arguments: serde_json::Value,
         invocation: crate::runtime::tool::ToolContext,
     ) -> Result<crate::state::communication::inbox::QueuedReceipt, Error>;
-    #[doc(hidden)]
-    async fn reply_external_speaker(
-        &self,
-        _arguments: serde_json::Value,
-        _invocation: crate::runtime::tool::ToolContext,
-    ) -> Result<crate::runtime::tool::ToolOutput, Error> {
-        Err(Error::denied(
-            "external dialogue reply has no owning Session",
-        ))
-    }
     async fn enqueue_authenticated(
         &self,
         carrier: crate::state::communication::inbox::AcceptedCarrier,

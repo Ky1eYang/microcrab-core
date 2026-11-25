@@ -597,7 +597,15 @@ async fn disk_branch_hashes_retain_both_turn_two_nodes_and_exact_reopen_position
         let payload: serde_json::Value =
             serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
         assert_eq!(payload["parent"], a.checkpoint_id);
-        assert_eq!(payload["checkpoint"]["recover"]["state"]["last_turn_id"], 2);
+        let tail_hash = payload["checkpoint"]["recover_ref"]["tail_hash"]
+            .as_str()
+            .unwrap();
+        let tail_path = directory
+            .join("journal/blobs")
+            .join(format!("{tail_hash}.json"));
+        let tail: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(tail_path).unwrap()).unwrap();
+        assert_eq!(tail["state"]["last_turn_id"], 2);
     }
     journal.close().await.unwrap();
     let reopened = FileJournal::open(&directory).await.unwrap();
@@ -1053,4 +1061,114 @@ async fn unwitnessed_admission_is_conservative_and_baseline_change_resets() {
     next.context.baseline_generation += 1;
     journal.commit(next).await.unwrap();
     assert_ne!(journal.display_witness().await.lineage, before);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn file_ancestry_reuses_verified_prefix_and_rechecks_file_identity() {
+    let root = directory();
+    let session = "0123456789abcdef";
+    let journal = FileJournal::open(&root).await.unwrap();
+    let a = journal.commit(None, envelope(0)).await.unwrap();
+    let b = journal.commit(Some(a.clone()), envelope(1)).await.unwrap();
+    // Simulate legacy unindexed nodes so the byte-budgeted walk and prefix cache are exercised.
+    let _ = std::fs::remove_file(root.join("journal/ancestry_index.json"));
+    let node_path = |id: &str| root.join("journal/nodes").join(format!("{id}.json"));
+    let size_a = std::fs::metadata(node_path(&a.checkpoint_id))
+        .unwrap()
+        .len() as usize;
+    let size_b = std::fs::metadata(node_path(&b.checkpoint_id))
+        .unwrap()
+        .len() as usize;
+    let read = |id: String, budget| {
+        FileJournal::inspect_metadata(root.clone(), session.into(), id, budget, |_| false)
+    };
+    assert!(matches!(
+        read(b.checkpoint_id.clone(), size_b).await,
+        Err(Error::Limit(_))
+    ));
+    assert_eq!(
+        read(b.checkpoint_id.clone(), size_a).await.unwrap().len(),
+        2
+    );
+    assert_eq!(read(b.checkpoint_id.clone(), 0).await.unwrap().len(), 2);
+    let c = journal.commit(Some(b.clone()), envelope(2)).await.unwrap();
+    let _ = std::fs::remove_file(root.join("journal/ancestry_index.json"));
+    assert!(matches!(
+        read(c.checkpoint_id.clone(), 0).await,
+        Err(Error::Limit(_))
+    ));
+    let size_c = std::fs::metadata(node_path(&c.checkpoint_id))
+        .unwrap()
+        .len() as usize;
+    assert_eq!(
+        read(c.checkpoint_id.clone(), size_c).await.unwrap().len(),
+        3
+    );
+    journal
+        .move_head(
+            c,
+            a.clone(),
+            Travel::To {
+                checkpoint_id: a.checkpoint_id.clone(),
+            },
+        )
+        .await
+        .unwrap();
+    let d = journal.commit(Some(a.clone()), envelope(3)).await.unwrap();
+    let ancestry = FileJournal::inspect_ancestry(&root, session.into(), d.checkpoint_id.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        ancestry,
+        vec![d.checkpoint_id.clone(), a.checkpoint_id.clone()]
+    );
+    assert_eq!(read(d.checkpoint_id.clone(), 0).await.unwrap().len(), 2);
+    let nodes = root.join("journal/nodes");
+    let replaced = root.join("journal/replaced-nodes");
+    // Both paths are exact children of our disposable fixture; replacing the
+    // directory must not borrow proof from the still-present old incarnation.
+    std::fs::rename(&nodes, &replaced).unwrap();
+    std::fs::create_dir(&nodes).unwrap();
+    for id in [&d.checkpoint_id, &a.checkpoint_id] {
+        let name = format!("{id}.json");
+        std::fs::copy(replaced.join(&name), nodes.join(&name)).unwrap();
+    }
+    assert!(matches!(
+        read(d.checkpoint_id.clone(), 0).await,
+        Err(Error::Limit(_))
+    ));
+    assert!(
+        journal
+            .request_metadata(d.clone(), |_| false)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        FileJournal::inspect_ancestry(&root, session.into(), d.checkpoint_id.clone())
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+    let path = node_path(&a.checkpoint_id);
+    let mut bytes = std::fs::read(&path).unwrap();
+    let text = b"checkpoint";
+    let index = bytes
+        .windows(text.len())
+        .position(|part| part == text)
+        .unwrap();
+    bytes[index] = b'x';
+    std::fs::write(&path, bytes).unwrap(); // Same-size in-place corruption.
+    assert!(
+        FileJournal::inspect_ancestry(&root, session.into(), d.checkpoint_id.clone())
+            .await
+            .is_err()
+    );
+    std::fs::remove_file(path).unwrap();
+    assert!(
+        FileJournal::inspect_ancestry(&root, session.into(), d.checkpoint_id)
+            .await
+            .is_err()
+    );
 }

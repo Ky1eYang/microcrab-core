@@ -173,6 +173,62 @@ fn failed_archive_never_publishes_complete_and_reports_once() {
     assert_eq!(errors.load(Ordering::SeqCst), 1);
 }
 
+#[test]
+fn writer_drops_store_before_acknowledging_close_even_on_flush_error() {
+    struct CloseStore {
+        reply: Arc<Mutex<oneshot::Receiver<Result<(), String>>>>,
+        flushes: Arc<AtomicUsize>,
+    }
+    impl DisplayStore for CloseStore {
+        fn append(&mut self, _: u64, _: &ArchiveRecord) -> Result<(), Error> {
+            panic!("close must not append")
+        }
+        fn revision(&mut self) -> Result<u64, Error> {
+            Ok(0)
+        }
+        fn flush(&mut self) -> Result<(), Error> {
+            self.flushes.fetch_add(1, Ordering::SeqCst);
+            Err(Error::audit("injected flush error"))
+        }
+    }
+    impl Drop for CloseStore {
+        fn drop(&mut self) {
+            assert!(matches!(
+                self.reply.lock().unwrap().try_recv(),
+                Err(oneshot::error::TryRecvError::Empty)
+            ));
+        }
+    }
+    let (close, reply) = oneshot::channel();
+    let reply = Arc::new(Mutex::new(reply));
+    let flushes = Arc::new(AtomicUsize::new(0));
+    let writer = Writer {
+        store: Box::new(CloseStore {
+            reply: reply.clone(),
+            flushes: flushes.clone(),
+        }),
+        sequence: 0,
+        graph: DisplayGraph::empty(DisplayScope::new("owner", "root", "session")),
+        offsets: HashMap::new(),
+        state: Arc::new(Mutex::new(State::default())),
+        committed: Arc::new(|_| panic!("close must not publish")),
+        failed: Arc::new(|_| {}),
+    };
+    let (commands, receiver) = mpsc::channel(1);
+    assert!(commands.try_send(Command::Close(close)).is_ok());
+    writer.run(receiver);
+    assert_eq!(flushes.load(Ordering::SeqCst), 1);
+    assert!(
+        reply
+            .lock()
+            .unwrap()
+            .try_recv()
+            .unwrap()
+            .unwrap_err()
+            .contains("injected flush error")
+    );
+}
+
 #[cfg(feature = "storage-file")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancelled_first_close_and_repeated_close_wait_for_the_same_durable_ack() {
@@ -226,6 +282,10 @@ async fn cancelled_first_close_and_repeated_close_wait_for_the_same_durable_ack(
     release.send(()).unwrap();
     assert_eq!(append.await.unwrap().unwrap(), 1);
     second.await.unwrap();
+    // Hold the old recorder handle while immediately acquiring the same lease.
+    let mut reopened = source.open().unwrap();
+    assert_eq!(reopened.revision().unwrap(), 1);
+    drop(reopened);
     recorder.close().await.unwrap();
     assert!(
         recorder

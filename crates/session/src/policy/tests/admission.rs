@@ -312,6 +312,56 @@ async fn newly_added_ancestor_is_rechecked_after_await() {
     ));
 }
 #[tokio::test]
+async fn file_ref_predicates_use_exact_values_but_proof_seals_authored_copy_and_binding() {
+    let owner = Arc::new(PermissionController::new(Arc::new(CompatibilityAllow)));
+    let exact = "a".repeat(64);
+    let alias = "fv_0123456789abcdef";
+    owner
+        .replace(
+            1,
+            PermissionConfig {
+                review: false,
+                overrides: vec![
+                    batch_rule(Action::Deny),
+                    Permission {
+                        args: vec![ArgumentPredicate {
+                            pointer: "/expected_version".into(),
+                            matcher: Matcher::Exact(exact.clone()),
+                        }],
+                        ..batch_rule(Action::Allow)
+                    },
+                ],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let authored = json!({"expected_version":alias});
+    let bound = json!({"expected_version":exact});
+    let mut context = invocation();
+    let request = request(&owner, &context, authored.clone());
+    assert!(matches!(
+        owner.admit(&request, &context, &issuer(), None).await,
+        Err(PermissionError::PolicyDenied { .. })
+    ));
+    context.file_version_policy_arguments = Some(Arc::new(bound.clone()));
+    context.admission = Some(
+        owner
+            .admit(&request, &context, &issuer(), None)
+            .await
+            .unwrap(),
+    );
+    context.ensure_admitted_arguments(&authored).unwrap();
+    assert!(context.ensure_admitted_arguments(&bound).is_err());
+    let mut replaced = context.clone();
+    replaced.file_version_policy_arguments = Some(Arc::new(bound));
+    assert!(matches!(
+        replaced.begin_dispatch(None),
+        Err(PermissionError::ProofMismatch(_))
+    ));
+    context.begin_dispatch(None).unwrap();
+}
+
+#[tokio::test]
 async fn clearing_context_proof_cannot_remint_for_the_same_execution() {
     let owner = Arc::new(PermissionController::new(Arc::new(CompatibilityAllow)));
     configure(&owner, Action::Allow);
@@ -605,8 +655,8 @@ fn delegate_partial_evaluation_keeps_unknown_guards_and_never_asks() {
         Action::Deny
     );
     assert_eq!(adapter.calls.load(Ordering::SeqCst), 0);
-    let projected = observation.project().unwrap();
+    let projected = observation.project(None).unwrap();
     let snapshot = owner.snapshot().unwrap();
     owner.replace(snapshot.revision, snapshot.config).unwrap();
-    assert_eq!(projected, observation.project().unwrap());
+    assert_eq!(projected, observation.project(None).unwrap());
 }

@@ -1,19 +1,44 @@
 //! External dialogue effects belong to the exact Session's acknowledged Turn.
 use super::*;
+use crate::observation::diagnostics::EffectKnowledge;
+use crate::runtime::execution::ExecutionStatus;
 use crate::runtime::tool::{
-    ToolContext, ToolOutput,
-    external_dialogue::{NAME, ReplyArguments},
+    DialogueReplyInvocation, DialogueReplyOwner, DialogueReplyReceipt, DialogueReplyRequest,
 };
 use crate::state::communication::{
     reply::{
         DialogueAdmissionKey, DialogueReplyBinding, DialogueReplyMutation, DialogueReplyStore,
-        DialogueTerminalReason, DurableDialogueReply,
+        DialogueTerminalReason, DurableDialogueReply, ReplyWrite,
     },
     turn::DialogueTurnWitness,
 };
-use serde_json::json;
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
+
+#[async_trait::async_trait]
+impl DialogueReplyOwner for SessionInner {
+    async fn commit_dialogue_reply(
+        &self,
+        proof: DialogueReplyInvocation,
+        request: DialogueReplyRequest,
+        authority: Box<dyn Send>,
+    ) -> Result<DialogueReplyReceipt, Error> {
+        let owner = self.self_weak.upgrade().ok_or(Error::Closed)?;
+        // Lock order is embedding authority -> Core reply fence -> storage CAS.
+        // No waiter owns a started write or releases its authority on cancellation.
+        tokio::spawn(async move {
+            let _authority = authority;
+            owner.append_external_dialogue(proof, request).await
+        })
+        .await
+        .map_err(|_| {
+            self.faulted.store(true, Ordering::Release);
+            uncertain(Error::lifecycle(
+                "external dialogue write owner stopped unexpectedly",
+            ))
+        })?
+    }
+}
 
 impl SessionInner {
     pub(crate) async fn observe_external_dialogue_reply(
@@ -31,75 +56,83 @@ impl SessionInner {
         Ok(record)
     }
 
-    pub(super) async fn reply_external_speaker_owned(
+    fn verify_reply_invocation(
         &self,
-        arguments: Value,
-        invocation: ToolContext,
-    ) -> Result<ToolOutput, Error> {
-        let owner = self.self_weak.upgrade().ok_or(Error::Closed)?;
-        // The generic execution timeout may drop its waiter on cancellation.
-        // A started durable mutation must finish under the reply fence anyway.
-        match tokio::spawn(
-            async move { owner.append_external_dialogue(arguments, invocation).await },
-        )
-        .await
-        {
-            Ok(result) => result,
-            Err(_) => {
-                self.faulted.store(true, Ordering::Release);
-                Err(uncertain(Error::lifecycle(
-                    "external dialogue write owner stopped unexpectedly",
-                )))
-            }
-        }
-    }
-
-    async fn append_external_dialogue(
-        &self,
-        arguments: Value,
-        invocation: ToolContext,
-    ) -> Result<ToolOutput, Error> {
-        let store = self.dialogue_reply_store.lock().await;
+        proof: &DialogueReplyInvocation,
+        snapshot: &SessionState,
+        witness: &DialogueTurnWitness,
+    ) -> Result<(), Error> {
         self.ensure_model_open()?;
-        let store = store
-            .as_deref()
-            .ok_or_else(|| Error::denied("external dialogue reply storage is unavailable"))?;
-        let identity = self
-            .communication_identity()
-            .ok_or_else(|| Error::denied("Session has no external dialogue identity"))?;
-        let witness = self
-            .state
-            .live_dialogue_turn()
-            .filter(DialogueTurnWitness::expects_reply_store)
-            .ok_or_else(|| Error::denied("no admitted external dialogue in the current Turn"))?;
-        let (agent, epoch, turn, admissions) = witness.exact_parts();
-        let snapshot = self.state();
+        let invocation = proof.context();
+        let (agent, epoch, turn, _) = witness.exact_parts();
+        let identity = snapshot.communication.as_ref().map(|value| &value.identity);
         if self.kind != crate::SessionKind::Interactive
-            || identity.depth != 0
-            || identity.interaction != SessionInteraction::Persistent
-            || &identity.agent_id != agent
+            || identity.is_none_or(|identity| {
+                identity.depth != 0
+                    || identity.interaction != SessionInteraction::Persistent
+                    || &identity.agent_id != agent
+            })
+            || proof.agent() != agent
+            || proof.epoch() != epoch
+            || proof.turn() != turn
             || !self.state.same_owner(&invocation.state)
             || invocation.session_id != self.state.processes().session_id()
             || !invocation.subject.is_tool()
-            || invocation.tool != NAME
+            || !self
+                .runtime
+                .dialogue_reply_is_registered(&invocation.tool, proof.registration_identity())
             || invocation.turn_id != Some(turn.number())
+            || snapshot.turn_id != invocation.turn_id
             || snapshot.epoch_id != epoch
             || invocation.round_id.is_none()
             || invocation.round_id != snapshot.round_id
-            || invocation.execution_id.is_none()
             || invocation.execution_progress.is_none()
         {
             return Err(Error::denied(
                 "external dialogue reply invocation does not belong to this Turn",
             ));
         }
-        invocation
-            .ensure_admitted_arguments(&arguments)
-            .map_err(|error| error.into_runtime_error())?;
-        let args = ReplyArguments::parse(arguments)?;
+        let executions = self.state.executions();
+        let execution = invocation
+            .execution_id
+            .and_then(|id| executions.get(id).ok());
+        if execution.is_none_or(|row| {
+            row.status != ExecutionStatus::Running
+                || row.session_id != invocation.session_id
+                || row.call_id != invocation.call_id
+                || row.tool != invocation.tool
+                || row.agent != invocation.agent
+                || row.mode != invocation.mode
+                || row.subject != invocation.subject
+        }) {
+            return Err(Error::denied(
+                "external dialogue reply execution is not live",
+            ));
+        }
+        Ok(())
+    }
+
+    async fn append_external_dialogue(
+        &self,
+        proof: DialogueReplyInvocation,
+        request: DialogueReplyRequest,
+    ) -> Result<DialogueReplyReceipt, Error> {
+        let store = self.dialogue_reply_store.lock().await;
+        self.ensure_model_open()?;
+        let store = store
+            .as_deref()
+            .ok_or_else(|| Error::denied("external dialogue reply storage is unavailable"))?;
+        let witness = self
+            .state
+            .live_dialogue_turn()
+            .filter(DialogueTurnWitness::expects_reply_store)
+            .ok_or_else(|| Error::denied("no admitted external dialogue in the current Turn"))?;
+        self.verify_reply_invocation(&proof, &self.state(), &witness)?;
+        proof.verify_request(&request)?;
+        let (agent, _, turn, admissions) = witness.exact_parts();
         let mut candidates = admissions
             .iter()
-            .filter(|row| row.dialogue_alias() == Some(args.dialogue_id.as_str()));
+            .filter(|row| row.dialogue_alias() == Some(request.dialogue_id.as_str()));
         let admission = candidates
             .next()
             .filter(|_| candidates.next().is_none())
@@ -109,41 +142,63 @@ impl SessionInner {
         let record = load_exact(store, &binding)
             .await?
             .ok_or_else(|| Error::tool("external dialogue reply has not opened"))?;
-        if record.terminal().is_some()
-            || record.chunks().last().is_some_and(|chunk| chunk.is_final())
-        {
-            return Err(Error::tool(
-                "external dialogue no longer accepts reply chunks",
-            ));
-        }
-        let chunk_index = record.chunks().len();
-        let output = json!({"status":"committed", "dialogue_id":args.dialogue_id, "chunk_index":chunk_index, "is_final":args.is_final}).to_string();
-        crate::budget::check(
-            crate::LimitKind::ToolOutput,
-            output.len(),
-            snapshot.limits.max_tool_output_bytes,
-        )?;
-        // Claim this exact invocation once, immediately before the durable effect.
-        invocation
-            .begin_dispatch(None)
-            .map_err(|error| error.into_runtime_error())?;
+        let snapshot = self.state();
+        let is_final = request.is_final.unwrap_or(false);
         let mutation = DialogueReplyMutation::Append {
             binding,
             expected_revision: record.revision(),
             effect_id: Uuid::new_v4(),
-            message: args.message,
-            is_final: args.is_final,
+            message: request.message,
+            is_final,
             at_ms: now_ms()?,
         };
-        if let Err(error) = apply_exact(store, mutation, Some(&record)).await {
-            if error.tool_diagnostic().effects
-                == crate::observation::diagnostics::EffectKnowledge::MayHaveOccurred
-            {
-                self.faulted.store(true, Ordering::Release);
+        // The canonical transition checks the open/final flag, revision and
+        // per-dialogue byte/chunk budgets before consuming the dispatch claim.
+        let expected = mutation
+            .clone()
+            .apply(Some(&record))
+            .map_err(before_append)?;
+        let chunk =
+            expected.record().chunks().last().ok_or_else(|| {
+                Error::protocol("external dialogue append did not produce a chunk")
+            })?;
+        let receipt = proof
+            .prepare_receipt(
+                request.dialogue_id,
+                chunk.index(),
+                is_final,
+                snapshot.limits.max_tool_output_bytes,
+            )
+            .map_err(before_append)?;
+        let live = self
+            .state
+            .live_dialogue_turn()
+            .ok_or_else(|| Error::denied("no admitted external dialogue in the current Turn"))?;
+        self.verify_reply_invocation(&proof, &self.state(), &live)?;
+        // Validate current policy/interaction/cancellation and claim once at
+        // the last possible point before entering the storage CAS.
+        proof.begin_dispatch()?;
+        let written = AssertUnwindSafe(async { store.apply(mutation).await })
+            .catch_unwind()
+            .await;
+        let result = match written {
+            Ok(Ok(ReplyWrite::Applied(written))) if &written == expected.record() => {
+                Ok(proof.acknowledge(receipt))
             }
-            return Err(error);
+            Ok(Ok(_)) => Err(uncertain(Error::protocol(
+                "external dialogue write acknowledgment differs",
+            ))),
+            Ok(Err(error)) => Err(error),
+            Err(_) => Err(uncertain(Error::lifecycle(
+                "external dialogue storage panicked",
+            ))),
+        };
+        if let Err(error) = &result
+            && error.tool_diagnostic().effects == EffectKnowledge::MayHaveOccurred
+        {
+            self.faulted.store(true, Ordering::Release);
         }
-        Ok(ToolOutput::text(output))
+        result
     }
 
     /// Called only after the Context and carrier consumption have acknowledged.
@@ -301,8 +356,14 @@ async fn apply_exact(
     Ok(written.into_record())
 }
 
+fn before_append(error: Error) -> Error {
+    match error {
+        Error::Limit(limit) => Error::Limit(limit.before_effects()),
+        other => other,
+    }
+}
+
 fn uncertain(error: Error) -> Error {
-    use crate::observation::diagnostics::EffectKnowledge;
     let mut diagnostic = error.tool_diagnostic();
     diagnostic.effects = EffectKnowledge::MayHaveOccurred;
     diagnostic.retryable = Some(false);

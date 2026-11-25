@@ -5,12 +5,24 @@ pub use carrier::{decode_transfer_chunk, encode_transfer_chunk};
 pub use codec::pb;
 #[cfg(feature = "grpc")]
 pub use codec::{HostBridge, HostBridgeClient, HostBridgeServer};
-pub use codec::{decode_frame, encode_frame, frame_from_proto, frame_to_proto};
+pub use codec::{
+    decode_frame, decode_frame_with_web_transport_features, decode_frame_with_web_transport_version,
+    encode_frame, encode_frame_with_web_transport_features, encode_frame_with_web_transport_version,
+    frame_from_proto, frame_from_proto_with_web_transport_features,
+    frame_from_proto_with_web_transport_version, frame_to_proto,
+    frame_to_proto_with_web_transport_features, frame_to_proto_with_web_transport_version,
+};
+mod web_transport;
+pub use web_transport::{
+    WEB_TRANSPORT_V1, WebTransportFeatures, WebTransportRequest, web_transport_v1_negotiated,
+};
 mod cause;
 mod digest;
 pub use cause::HostCause;
 pub use digest::{descriptor_fingerprint, descriptor_matches_pin, payload_digest, sha256};
-use microcrab_host_api::{GlobRequest, GrepRequest, HostInfo, ReadRequest, WriteRequest};
+use microcrab_host_api::{
+    GlobIgnoreRuleFile, GlobRequest, GrepRequest, HostInfo, ReadRequest, WriteRequest,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 pub const PROTOCOL_VERSION: u32 = 2;
@@ -21,6 +33,20 @@ pub const MAX_PENDING_REQUESTS: usize = 32;
 /// Per-Control capability returned only after Pair/Resume authentication. Execute
 /// must present it; a workspace's public lease counter is never authentication.
 pub const GRPC_EXECUTE_TOKEN_HEADER: &str = "x-microcrab-execute-token";
+/// Offer and acknowledgment on authenticated gRPC Control only. A route-local
+/// negotiation, not a change to the immutable execution descriptor or pin.
+pub const GRPC_PRIVATE_FILE_HEADER: &str = "x-microcrab-private-file";
+pub const GRPC_PRIVATE_FILE_V1: &str = "1";
+/// Offer and acknowledgment on authenticated gRPC Control only. Keep this
+/// additive operation off the immutable descriptor and its existing pins.
+pub const GRPC_GLOB_IGNORE_HEADER: &str = "x-microcrab-glob-ignore";
+pub const GRPC_GLOB_IGNORE_V1: &str = "1";
+/// Separate acknowledgment: old peers supporting rule files do not support resolved paths.
+pub const GRPC_GLOB_PATHS_HEADER: &str = "x-microcrab-glob-paths";
+pub const GRPC_GLOB_PATHS_V1: &str = "1";
+pub const MAX_PRIVATE_FILE_BYTES: usize = 20 * 1024 * 1024;
+pub const MAX_PRIVATE_FILE_PATH_BYTES: usize = 4096;
+pub const MAX_PRIVATE_FILE_BUDGET_MS: u32 = 30_000;
 mod scope;
 pub use scope::{
     BindingScope, ConversationScope, ConversationScopeKind, ConversationScopeVersion, ProjectScope,
@@ -122,6 +148,16 @@ pub enum HostRequest {
     },
     Mutate(microcrab_host_api::FileMutation),
     Glob(GlobRequest),
+    GlobIgnoreSnapshot,
+    GlobWithIgnoreRules {
+        request: GlobRequest,
+        rules: Vec<GlobIgnoreRuleFile>,
+    },
+    GlobIgnoredPaths,
+    GlobWithIgnoredPaths {
+        request: GlobRequest,
+        paths: Vec<String>,
+    },
     Grep(GrepRequest),
     Normalize {
         path: String,
@@ -201,6 +237,7 @@ pub enum HostRequest {
         payload_digest: String,
         scope: BindingScope,
     },
+    WebTransport(WebTransportRequest),
     Unsupported {
         owner: String,
         operation: String,
@@ -216,6 +253,10 @@ impl HostRequest {
             Self::PreflightMutations { .. } => "preflight_mutations",
             Self::Mutate(_) => "mutate",
             Self::Glob(_) => "glob",
+            Self::GlobIgnoreSnapshot => "glob_ignore_snapshot",
+            Self::GlobWithIgnoreRules { .. } => "glob_with_ignore_rules",
+            Self::GlobIgnoredPaths => "glob_ignored_paths",
+            Self::GlobWithIgnoredPaths { .. } => "glob_with_ignored_paths",
             Self::Grep(_) => "grep",
             Self::Normalize { .. } => "normalize",
             Self::ReadFile { .. } => "read_file",
@@ -240,6 +281,7 @@ impl HostRequest {
             Self::ShellWrite { .. } => "shell_write",
             Self::Recovery => "recovery",
             Self::SettleUnknown { .. } => "settle_unknown",
+            Self::WebTransport(_) => "web_transport",
             Self::Unsupported { .. } => "unsupported",
         }
     }
@@ -257,7 +299,13 @@ impl HostRequest {
                 | Self::ProcessInventory
                 | Self::Recovery
                 | Self::SettleUnknown { .. }
+                | Self::WebTransport(WebTransportRequest::WsClose { .. } | WebTransportRequest::ReleaseScope { .. })
         )
+    }
+    /// These requests are correlated in memory only. Never persist a receipt,
+    /// extend their lifetime across lease changes, or replay them.
+    pub fn is_ephemeral(&self) -> bool {
+        matches!(self, Self::WebTransport(_))
     }
     pub fn is_process_operation(&self) -> bool {
         matches!(

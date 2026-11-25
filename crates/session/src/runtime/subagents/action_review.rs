@@ -1,7 +1,7 @@
 //! Internal clean-context review; never allocates a Session command or mutates Context.
 use super::{Builtin, ContextMode, Source};
 use crate::context::{Content, ContentItem};
-use crate::policy::{PermissionError, PermissionRequest, ReviewResult};
+use crate::policy::{InvocationSubject, PermissionError, PermissionRequest, ReviewResult};
 use crate::{Client, Error, State};
 use microcrab_auditor::Auditor;
 use microcrab_protocol::InputPart;
@@ -96,6 +96,67 @@ fn escape_review_data(value: &str, maximum: usize) -> Result<String, Error> {
     Ok(escaped)
 }
 
+#[derive(serde::Serialize)]
+struct InitReviewArguments<'a> {
+    component: String,
+    imports: &'a serde_json::Value,
+    trust: &'a str,
+}
+
+fn review_arguments(
+    permission: &PermissionRequest,
+    preview: Option<&serde_json::Value>,
+    short_model: bool,
+) -> Result<String, PermissionError> {
+    let encoded = match &permission.subject {
+        InvocationSubject::AgentInit { component, .. } if short_model => {
+            // Read scope from the exact typed initialization request, not the
+            // ordinary tool argument preview or an unrelated field named component.
+            let arguments = &permission.arguments;
+            let imports = arguments
+                .get("imports")
+                .filter(|value| {
+                    value
+                        .as_array()
+                        .is_some_and(|imports| imports.iter().all(serde_json::Value::is_string))
+                })
+                .ok_or(PermissionError::Review)?;
+            let trust = arguments
+                .get("trust")
+                .and_then(serde_json::Value::as_str)
+                .ok_or(PermissionError::Review)?;
+            if arguments
+                .get("component")
+                .and_then(serde_json::Value::as_str)
+                != Some(component)
+            {
+                return Err(PermissionError::Review);
+            }
+            let component = if component.len() == 64
+                && component
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            {
+                format!("{}…", &component[..16])
+            } else {
+                component.clone()
+            };
+            serde_json::to_string(&InitReviewArguments {
+                component,
+                imports,
+                trust,
+            })
+        }
+        _ => serde_json::to_string(preview.unwrap_or(&permission.arguments)),
+    }
+    .map_err(|_| PermissionError::Review)?;
+    Ok(encoded.replace('<', "\\u003c").replace('>', "\\u003e"))
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Model preview and grant-validation evidence are separate"
+)]
 pub(crate) async fn run(
     executor: &dyn super::OneShotExecutor,
     client: std::sync::Arc<dyn Client>,
@@ -103,16 +164,14 @@ pub(crate) async fn run(
     state: &State,
     issuer: &Content,
     permission: &PermissionRequest,
+    preview: Option<&serde_json::Value>,
     cancellation: &CancellationToken,
 ) -> Result<ReviewResult, PermissionError> {
     let input = serde_json::to_string(permission).map_err(|_| PermissionError::Review)?;
     if input.len() > 65536 {
         return Err(PermissionError::Review);
     }
-    let tool_args = serde_json::to_string(&permission.arguments)
-        .map_err(|_| PermissionError::Review)?
-        .replace('<', "\\u003c")
-        .replace('>', "\\u003e");
+    let tool_args = review_arguments(permission, preview, state.short_model_refs())?;
     let user_input = latest_user_text(issuer);
     let (mode, mode_prompt) = state.selected_mode_instructions();
     let operation_kind = if permission.subject.is_tool() {
@@ -168,6 +227,47 @@ pub(crate) async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compact_review_uses_typed_init_identity_without_rewriting_scope_or_tool_arguments() {
+        use serde_json::{Value, json};
+        let digest = "a1".repeat(32);
+        let exact = json!({"component": digest, "imports": ["write-text", "custom<scope>"], "trust": "exact trust statement"});
+        let mut request = PermissionRequest {
+            subject: InvocationSubject::AgentInit {
+                component: digest.clone(),
+                generation: 4,
+                attempt: 2,
+            },
+            session_id: "private session".into(),
+            call_id: format!("agent-init:4:2:{digest}"),
+            agent: "coding".into(),
+            mode: "normal".into(),
+            tool: String::new(),
+            arguments: exact.clone(),
+            revision: 7,
+        };
+        let encoded = review_arguments(&request, None, true).unwrap();
+        assert!(!encoded.contains(&digest));
+        assert!(!encoded.contains("<scope>"));
+        let short: Value = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(
+            short,
+            json!({"component": "a1a1a1a1a1a1a1a1…", "imports": exact["imports"], "trust": exact["trust"]})
+        );
+        assert_eq!(request.arguments, exact);
+        assert_eq!(
+            serde_json::from_str::<Value>(&review_arguments(&request, None, false).unwrap())
+                .unwrap(),
+            exact
+        );
+        request.subject = InvocationSubject::Tool;
+        assert_eq!(
+            serde_json::from_str::<Value>(&review_arguments(&request, None, true).unwrap())
+                .unwrap(),
+            exact
+        );
+    }
 
     #[test]
     fn real_user_selection_ignores_framework_carriers_and_does_not_skip_an_empty_latest_input() {

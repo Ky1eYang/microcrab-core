@@ -127,6 +127,12 @@ impl OperationReceipt {
             })
     }
 }
+/// An exact, already-committed external POST observation. This cannot enqueue.
+pub enum ExternalReplay {
+    Legacy(QueuedReceipt),
+    Dialogue(ExternalDialogueReceipt),
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AcceptedCarrier {
@@ -147,6 +153,27 @@ pub struct DurableInbox {
     pub pending: Vec<AcceptedCarrier>,
     pub receipts: Vec<OperationReceipt>,
 }
+impl AcceptedCarrier {
+    pub(crate) fn external(
+        operation_id: String,
+        identity: String,
+        body: String,
+    ) -> Result<Self, Error> {
+        let speaker = ExternalSpeaker {
+            identity: identity.clone(),
+        };
+        speaker.validate()?;
+        Ok(Self {
+            operation_id,
+            ordinal: 0,
+            body,
+            source: UserSource::External { identity },
+            correspondent: None,
+            speaker: Some(speaker),
+        })
+    }
+}
+
 impl DurableInbox {
     /// Idempotent full-sidecar publication with irreversible accepted receipts.
     pub fn check_successor(&self, previous: Option<&Self>) -> Result<bool, Error> {
@@ -204,6 +231,39 @@ impl DurableInbox {
     pub fn receipt(&self, operation_id: &str) -> Option<QueuedReceipt> {
         self.operation(operation_id)?.legacy_receipt()
     }
+    /// Check whether this POST names the same committed body, sender and (for
+    /// current rows) credential incarnation. A conflicting prior operation is
+    /// never treated as absence. The caller authorizes the current bearer first.
+    pub fn replay_external(
+        &self,
+        operation_id: &str,
+        identity: &str,
+        body: &str,
+        incarnation: Option<&ExternalCredentialIncarnation>,
+    ) -> Result<Option<ExternalReplay>, Error> {
+        validate_operation(operation_id)?;
+        validate_body(body)?;
+        let Some(row) = self.operation(operation_id) else {
+            return Ok(None);
+        };
+        let carrier = AcceptedCarrier::external(operation_id.into(), identity.into(), body.into())?;
+        let digest = Self::digest(&carrier)?;
+        if let Some(receipt) = row.legacy_receipt()
+            && row.matches_enqueue(&digest, None, None)
+        {
+            return Ok(Some(ExternalReplay::Legacy(receipt)));
+        }
+        if let Some(incarnation) = incarnation
+            && row.matches_enqueue(&digest, Some(identity), Some(incarnation))
+            && let Some(receipt) = row.authenticated_external_receipt(identity, incarnation)
+        {
+            return Ok(Some(ExternalReplay::Dialogue(receipt)));
+        }
+        Err(Error::config(
+            "operation id already names a different communication admission",
+        ))
+    }
+
     /// Match exact operation and credential incarnation; never infer a legacy link.
     pub fn authenticated_external_receipt(
         &self,

@@ -86,7 +86,7 @@ fn compact_projection_preserves_authored_values_and_rejects_duplicate_ids() {
         "digest".into(),
     )
     .unwrap();
-    let projection = &catalog.projection[0];
+    let projection = catalog.documents[0].projection(false);
     assert_eq!(projection["id"], root_id);
     assert!(projection.get("level").is_none());
     assert_eq!(projection["metadata"]["metadata"]["enabled"], false);
@@ -110,6 +110,107 @@ fn compact_projection_preserves_authored_values_and_rejects_duplicate_ids() {
             .unwrap_err()
             .to_string()
             .contains("duplicate Markdown reference ID")
+    );
+}
+
+#[test]
+fn exact_markdown_digest_distinguishes_even_forced_revision_prefix_collisions() {
+    let digest_a = format!("{}{}", "a".repeat(16), "0".repeat(48));
+    let digest_b = format!("{}{}", "a".repeat(16), "1".repeat(48));
+    let original = DocumentRevision::new(digest_a);
+    let mut changed = DocumentRevision::new(digest_b.clone());
+    assert_ne!(original.label, changed.label);
+    changed.marker.clone_from(&original.marker);
+    changed.observe(&original).unwrap();
+    assert_ne!(original.label, changed.label);
+    assert_eq!(changed.label, format!("{}~1", &original.marker[..24]));
+    let mut identical = DocumentRevision::new(digest_b);
+    identical.observe(&changed).unwrap();
+    assert_eq!(identical.label, changed.label);
+}
+
+#[tokio::test]
+async fn short_markdown_refresh_patches_model_context_without_rewriting_owner_or_history() {
+    use crate::{
+        State,
+        boundary::Boundary,
+        context::{ContentItem, Context},
+    };
+    use microcrab_transport::StateFrame;
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("guide.md");
+    std::fs::write(&path, "# Guide\nAlpha\n").unwrap();
+    let host =
+        Arc::new(microcrab_host_local::LocalHost::new(root.path(), Default::default()).unwrap());
+    let refs = super::super::References::new(vec![
+        super::super::DynReference::new(MarkdownReferences::new(
+            "references",
+            vec![ReferenceSource::HostPath {
+                path: "guide.md".into(),
+            }],
+            Some(host),
+        ))
+        .unwrap(),
+    ])
+    .unwrap();
+    let state = State::new(Default::default());
+    state.install_references(refs).unwrap();
+    state.load_references().await.unwrap();
+    state.refresh(Boundary::SessionCreated).unwrap();
+    let exact = state.view().unwrap();
+    assert_eq!(
+        exact["references"][0]["content_digest"]
+            .as_str()
+            .unwrap()
+            .len(),
+        64
+    );
+    assert_eq!(state.model_variables().unwrap(), exact);
+    state.set_short_model_refs(true);
+    let before = state.model_variables().unwrap();
+    assert!(before["references"][0].get("content_digest").is_none());
+    assert_eq!(
+        before["references"][0]["revision"].as_str().unwrap().len(),
+        16
+    );
+    assert_eq!(state.view().unwrap(), exact);
+    assert_eq!(
+        state.inspection().unwrap().values["references"],
+        exact["references"]
+    );
+    let mut context = Context::new("system".into(), vec![], 65_536).unwrap();
+    context.synchronize_state(&before).unwrap();
+    let prefix = context.content(128).unwrap().items;
+    let listed = state.list_references().unwrap();
+    state.load_references().await.unwrap();
+    state.refresh_reference_projection().unwrap();
+    assert_eq!(state.model_variables().unwrap(), before);
+    std::fs::write(path, "# Guide\nBravo\n").unwrap();
+    state.load_references().await.unwrap();
+    state.refresh_reference_projection().unwrap();
+    let after = state.model_variables().unwrap();
+    assert_ne!(
+        before["references"][0]["revision"],
+        after["references"][0]["revision"]
+    );
+    assert_eq!(
+        before["references"][0]["subjects"],
+        after["references"][0]["subjects"]
+    );
+    assert_eq!(state.list_references().unwrap(), listed);
+    assert_eq!(
+        state.read_reference(&listed[0].info.id).unwrap().body,
+        "# Guide\nBravo\n"
+    );
+    context.synchronize_state(&after).unwrap();
+    let items = context.content(128).unwrap().items;
+    assert_eq!(
+        serde_json::to_value(&items[..prefix.len()]).unwrap(),
+        serde_json::to_value(prefix).unwrap()
+    );
+    assert!(
+        matches!(items.last(), Some(ContentItem::State(StateFrame::StatePatch { set, .. }))
+        if set.get("references") == Some(&after["references"]))
     );
 }
 

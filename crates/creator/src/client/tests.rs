@@ -200,16 +200,40 @@ async fn fifth_retry_can_succeed_without_changing_the_request() {
         let (endpoint, server) = response_server_many(responses).await;
         let client = client(endpoint, 0, 1000);
         let content = content();
+        let (sender, mut records) = mpsc::unbounded_channel();
+        let auditor = microcrab_auditor::ChannelAuditor::from_sender(sender);
         let response = if streaming {
-            client
-                .stream(
+            let outcome = client
+                .stream_admitted_outcome(
                     &content,
-                    &NoopAuditor,
+                    &auditor,
                     &EmptyVariableView,
                     CancellationToken::new(),
                     None,
                 )
                 .await
+                .unwrap();
+            for _ in 0..5 {
+                let prepared = records.try_recv().unwrap();
+                let failed = records.try_recv().unwrap();
+                assert_eq!(prepared.call_id, failed.call_id);
+                assert!(failed.response_completed_at_ms.is_none());
+                assert_ne!(
+                    failed.call_id.as_deref(),
+                    outcome.attempt.as_ref().map(|a| a.call_id.as_str())
+                );
+            }
+            let prepared = records.try_recv().unwrap();
+            let terminal = records.try_recv().unwrap();
+            let attempt = outcome.attempt.unwrap();
+            assert_eq!(prepared.call_id, terminal.call_id);
+            assert_eq!(terminal.call_id.as_deref(), Some(attempt.call_id.as_str()));
+            assert_eq!(
+                terminal.response_completed_at_ms,
+                Some(attempt.response_completed_at_ms.unwrap().get())
+            );
+            assert!(records.try_recv().is_err());
+            outcome.response
         } else {
             client
                 .complete(
@@ -219,8 +243,8 @@ async fn fifth_retry_can_succeed_without_changing_the_request() {
                     CancellationToken::new(),
                 )
                 .await
-        }
-        .unwrap();
+                .unwrap()
+        };
         assert_eq!(response.content, "recovered");
         server.await.unwrap();
     }

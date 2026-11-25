@@ -1,6 +1,7 @@
 //! Scope identity is part of every receipt. Native v2 retains its original bytes;
 //! browser Conversations carry an explicit discriminator and version instead of
 //! inventing a Project. Strict alternatives reject mixed authority documents.
+pub use microcrab_host_api::web_transport::ProjectScope;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -8,13 +9,6 @@ use serde::{Deserialize, Serialize};
 pub enum BindingScope {
     Conversation(ConversationScope),
     Project(ProjectScope),
-}
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct ProjectScope {
-    pub binding_id: String,
-    pub backend_id: String,
-    pub project_id: String,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -76,7 +70,7 @@ impl BindingScope {
     }
     pub fn valid(&self) -> bool {
         let fields = match self {
-            Self::Project(scope) => [&scope.backend_id, &scope.binding_id, &scope.project_id],
+            Self::Project(scope) => return scope.valid(),
             Self::Conversation(scope) => {
                 [&scope.backend_id, &scope.binding_id, &scope.conversation_id]
             }

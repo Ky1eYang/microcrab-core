@@ -10,6 +10,7 @@ mod configuration;
 mod fork;
 pub(crate) mod functional;
 mod insertion;
+mod model_admission;
 mod permissions;
 mod recovery;
 use crate::boundary::Boundary;
@@ -94,6 +95,7 @@ pub(crate) struct SessionInner {
     pending_tools: Mutex<Option<(u64, Vec<Arc<dyn crate::runtime::tool::Tool>>)>>,
     applied_tools: std::sync::atomic::AtomicU64,
     route: Option<Arc<dyn crate::session::TurnRouting>>,
+    model_admission: Option<Arc<dyn crate::ModelAdmission>>,
     inbox_validation_failed: AtomicBool,
     client: Arc<dyn Client>,
     auto_compaction: Mutex<
@@ -172,6 +174,7 @@ pub(crate) struct SessionParts {
         Option<Arc<dyn crate::state::communication::reply::DialogueReplyStore>>,
     pub client: Arc<dyn Client>,
     pub route: Option<Arc<dyn crate::session::TurnRouting>>,
+    pub model_admission: Option<Arc<dyn crate::ModelAdmission>>,
     pub auto_compaction: Option<(
         crate::context::AutoCompactionPolicy,
         Arc<dyn crate::context::TokenEstimator>,
@@ -311,16 +314,9 @@ impl SessionInner {
         self.runtime.permission_controller()
     }
     fn bind_frozen_tools(&self, definitions: &[microcrab_protocol::ToolDefinition]) {
-        let origins = definitions
-            .iter()
-            .filter_map(|definition| {
-                self.runtime
-                    .origin(&definition.name)
-                    .map(|origin| (definition.name.clone(), origin))
-            })
-            .collect();
+        self.state.set_model_permission_names(definitions);
         self.state
-            .install_permission(self.runtime.permission_controller().observe(origins));
+            .set_short_model_refs(crate::runtime::tool::short_model_refs(definitions));
         self.state.install_delegate_availability(
             self.runtime.delegate_available()
                 && definitions

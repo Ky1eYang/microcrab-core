@@ -1,0 +1,29 @@
+package microcrab:session@0.2.3;
+
+/// Best-effort DEBUG diagnostics. No text, browser identity, or effect proof.
+interface browser-observation {
+  enum method {
+    browser-get-version,
+    target-get-targets, target-attach-to-target, target-detach-from-target,
+    target-create-target, target-activate-target, target-close-target,
+    accessibility-get-full-ax-tree,
+    runtime-enable, runtime-disable, runtime-call-function-on,
+    page-create-isolated-world, page-navigate, page-get-frame-tree, page-reload,
+    page-get-navigation-history, page-navigate-to-history-entry,
+    page-get-layout-metrics, page-capture-screenshot,
+    web-mcp-enable, web-mcp-invoke-tool, web-mcp-cancel-invocation,
+  }
+  enum phase { send, receive, classify }
+  enum confirmation { not-confirmed, confirmed }
+
+  record checkpoint {
+    command: method,
+    stage: phase,
+    /// One-based command count, local to this invocation. Never a wire CDP ID.
+    exchange: u8,
+    /// Whether the exact reply envelope was observed, not whether an effect ran.
+    reply: confirmation,
+  }
+
+  record-checkpoint: func(value: checkpoint);
+}

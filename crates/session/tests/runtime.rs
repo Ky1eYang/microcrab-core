@@ -50,6 +50,67 @@ impl Tool for Echo {
     }
 }
 
+#[tokio::test]
+async fn textual_conversion_preserves_original_call_and_matches_model_feedback() {
+    use microcrab_auditor::{AuditBody, Moment};
+    use microcrab_protocol::HookPayload;
+    use std::sync::Mutex;
+
+    struct Capture(Mutex<Vec<(Moment, HookPayload)>>);
+    impl Auditor for Capture {
+        fn is_enabled(&self) -> bool { true }
+        fn publish(&self, moment: Moment, body: AuditBody) {
+            if matches!(moment, Moment::ToolCall | Moment::ToolResult) {
+                self.0.lock().unwrap().push((moment, body.payload));
+            }
+        }
+    }
+    struct Exact(Arc<Mutex<Vec<Value>>>);
+    #[async_trait]
+    impl Tool for Exact {
+        fn definition(&self) -> ToolDefinition {
+            ToolDefinition {name:"exact".into(), description:"accept typed input".into(), parameters:json!({
+                "type":"object", "properties":{"count":{"type":"integer","x-microcrab-text-input":true},"ref":{"type":"string"}},
+                "required":["count","ref"],"additionalProperties":false
+            })}
+        }
+        async fn execute(&self, args: Value, _: ToolContext) -> Result<ToolOutput, Error> {
+            self.0.lock().unwrap().push(args);
+            Ok(ToolOutput::text("observed"))
+        }
+    }
+    let valid = json!({"count":"42","ref":"literal"});
+    let invalid = json!({"count":"42","ref":9.42e90});
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let runtime = Runtime::new(vec![ToolRegistration::External(Arc::new(Exact(seen.clone())))], Arc::new(AllowTools::new(["exact"]))).unwrap();
+    let audit = Arc::new(Capture(Mutex::new(Vec::new())));
+    let model = Once { response: Mutex::new(vec![
+        Response {tool_calls: [(&valid,"valid"),(&invalid,"invalid")].into_iter().map(|(arguments,id)| ToolCall {
+            id:id.into(), name:"exact".into(), arguments:arguments.clone(), provider_metadata:None
+        }).collect(), content:String::new(),provider_metadata:None,usage:Usage::default()},
+        Response {tool_calls:vec![], content:"done".into(),provider_metadata:None,usage:Usage::default()},
+    ])};
+    let session = microcrab_session::Session::builder(model,runtime).auditor(audit.clone()).build().unwrap();
+    session.submit("exercise explicit conversion").await.unwrap();
+    assert_eq!(*seen.lock().unwrap(), vec![json!({"count":42,"ref":"literal"})]);
+    let messages = session.messages();
+    let feedback = messages.iter().filter_map(|item| match item {
+        ContentItem::Tool {content,..} => Some(content.as_str()), _ => None
+    }).collect::<Vec<_>>();
+    let audited = audit.0.lock().unwrap();
+    let authored = audited.iter().filter_map(|(_, payload)| match payload {
+        HookPayload::ToolCall {arguments,..} => Some(arguments), _ => None
+    }).collect::<Vec<_>>();
+    assert_eq!(authored, vec![&valid,&invalid]);
+    let results = audited.iter().filter_map(|(_,payload)| match payload {
+        HookPayload::ToolResult {result,error} => result.as_deref().or(error.as_deref()), _ => None
+    }).collect::<Vec<_>>();
+    assert_eq!(results,feedback);
+    assert!(feedback[0].contains("schema-opted-in"));
+    assert!(feedback[1].contains("received JSON number"));
+    assert!(feedback[1].contains("not_started"));
+}
+
 fn context_with(tools: Vec<ToolDefinition>) -> Context {
     let mut context = Context::new("system".into(), tools, 2 * 1024 * 1024).unwrap();
     context.admit_user("inspect", &json!({})).unwrap();
@@ -240,6 +301,7 @@ async fn invalid_delegate_schema_records_failed_call_without_dispatch() {
         limit_owner: None,
         evidence_id: None,
         retryable: None,
+        wasm_failure: None,
     };
     for arguments in [
         json!({"input":"look"}),

@@ -4,8 +4,8 @@ use crate::{Error, Limits, observation::diagnostics::ToolDiagnostic};
 use async_trait::async_trait;
 use futures_util::{FutureExt, StreamExt};
 use microcrab_host_api::{
-    BoxStream, Bytes, ErrorCategory, Host, HostError, OpContext, ProcessApi, ShellApi,
-    ShellCaptureStatus, ShellPosition, ShellRequest, ToolError,
+    BoxStream, Bytes, ErrorCategory, Host, HostError, OpContext, PrivateShellRequest, ProcessApi,
+    ShellApi, ShellCaptureStatus, ShellPosition, ShellRequest, ToolError,
     process::{ProcessHandle, ProcessSpec, ProcessState, Signal},
 };
 use serde::{Deserialize, Serialize};
@@ -41,6 +41,7 @@ pub struct OwnedProcess {
     pub handle: ProcessHandle,
     pub pid: Option<u32>,
     pub capture: bool,
+    private: bool,
     releasing: AtomicBool,
     release_completion: Mutex<Option<ProcessRelease>>,
     bridged: AtomicBool,
@@ -680,12 +681,16 @@ impl ProcessRegistry {
             .clone();
         let ctx = self.context(admission_token.clone());
         let capture = matches!(&request, Launch::Shell(_));
+        let private = matches!(&request, Launch::PrivateShell(_));
         let spawn = async {
             match request {
                 Launch::Shell(mut request) => {
                     request.output_bytes =
                         request.output_bytes.min(self.limits.output_buffer_bytes);
                     ShellApi::launch(host.as_ref(), &ctx, request).await
+                }
+                Launch::PrivateShell(request) => {
+                    ShellApi::launch_private(host.as_ref(), &ctx, request).await
                 }
                 Launch::Process(spec) => ProcessApi::spawn(host.as_ref(), &ctx, spec).await,
             }
@@ -738,6 +743,7 @@ impl ProcessRegistry {
             handle,
             pid: status.pid,
             capture,
+            private,
             releasing: AtomicBool::new(false),
             release_completion: Mutex::new(None),
             bridged: AtomicBool::new(false),
@@ -844,7 +850,8 @@ impl ProcessRegistry {
                 .entries
                 .iter()
                 .filter(|(_, j)| {
-                    !j.releasing.load(Ordering::Acquire)
+                    !j.private
+                        && !j.releasing.load(Ordering::Acquire)
                         && j.status
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
@@ -1181,6 +1188,24 @@ impl ProcessControl for ProcessRegistry {
         )
         .await
     }
+    async fn launch_private_shell(
+        &self,
+        tool: &str,
+        call_id: &str,
+        request: PrivateShellRequest,
+        cancellation: CancellationToken,
+    ) -> Result<ProcessHandle, Error> {
+        self.launch_scoped(
+            &self.owner,
+            &self.owner,
+            tool,
+            call_id,
+            Launch::PrivateShell(request),
+            cancellation,
+            Default::default(),
+        )
+        .await
+    }
     async fn launch_process(
         &self,
         tool: &str,
@@ -1200,10 +1225,12 @@ impl ProcessControl for ProcessRegistry {
         .await
     }
     fn owns_process(&self, handle: ProcessHandle) -> bool {
-        self.owned_process(&self.owner, handle).is_some()
+        self.owned_process(&self.owner, handle)
+            .is_some_and(|process| !process.private)
     }
     fn process_pid(&self, handle: ProcessHandle) -> Option<Option<u32>> {
         self.owned_process(&self.owner, handle)
+            .filter(|process| !process.private)
             .map(|process| process.pid)
     }
     async fn release_process(
@@ -1221,8 +1248,15 @@ impl ProcessControl for ProcessRegistry {
         max: usize,
         cancellation: CancellationToken,
     ) -> Result<Option<Vec<u8>>, Error> {
+        if self
+            .owned_process(&self.owner, handle)
+            .is_some_and(|process| process.private)
+        {
+            return Err(Error::denied("private process pipe is not accessible"));
+        }
         self.read_pipe_scoped(&self.owner, handle, stderr, max, cancellation)
             .await
+            .map(|chunk| chunk.map(|chunk| chunk.to_vec()))
     }
 }
 
@@ -1287,6 +1321,9 @@ impl ProcessRegistry {
     ) -> Option<Value> {
         let mut values = serde_json::Map::new();
         for (_owner, process) in self.candidates() {
+            if process.private {
+                continue;
+            }
             if !is_main
                 && let Some(target) = caller_session
                 && process.session_id != target
@@ -1579,7 +1616,7 @@ impl ProcessRegistry {
         stderr: bool,
         max: usize,
         cancellation: CancellationToken,
-    ) -> Result<Option<Vec<u8>>, Error> {
+    ) -> Result<Option<Bytes>, Error> {
         let process = self
             .owned_process(session, handle)
             .ok_or_else(|| Error::denied("process belongs to another Session"))?;
@@ -1632,7 +1669,7 @@ impl ProcessRegistry {
             None
         } else {
             let count = max.min(pipe.pending.len());
-            Some(pipe.pending.split_to(count).to_vec())
+            Some(pipe.pending.split_to(count))
         };
         drop(pipe);
         // Never await after consuming bytes: an aborted caller must not lose a
@@ -1741,6 +1778,30 @@ impl ProcessControl for ScopedProcessControl {
             )
             .await
     }
+    async fn launch_private_shell(
+        &self,
+        tool: &str,
+        call_id: &str,
+        request: PrivateShellRequest,
+        cancellation: CancellationToken,
+    ) -> Result<ProcessHandle, Error> {
+        let agent = self
+            .agent
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        self.registry
+            .launch_scoped(
+                &self.session_id,
+                &agent,
+                tool,
+                call_id,
+                Launch::PrivateShell(request),
+                cancellation,
+                self.redaction.clone(),
+            )
+            .await
+    }
     async fn launch_process(
         &self,
         tool: &str,
@@ -1764,11 +1825,12 @@ impl ProcessControl for ScopedProcessControl {
     fn owns_process(&self, handle: ProcessHandle) -> bool {
         self.registry
             .owned_process(&self.session_id, handle)
-            .is_some()
+            .is_some_and(|process| !process.private)
     }
     fn process_pid(&self, handle: ProcessHandle) -> Option<Option<u32>> {
         self.registry
             .owned_process(&self.session_id, handle)
+            .filter(|process| !process.private)
             .map(|process| process.pid)
     }
     async fn release_process(
@@ -1787,9 +1849,17 @@ impl ProcessControl for ScopedProcessControl {
         max: usize,
         cancellation: CancellationToken,
     ) -> Result<Option<Vec<u8>>, Error> {
+        if self
+            .registry
+            .owned_process(&self.session_id, handle)
+            .is_some_and(|process| process.private)
+        {
+            return Err(Error::denied("private process pipe is not accessible"));
+        }
         self.registry
             .read_pipe_scoped(&self.session_id, handle, stderr, max, cancellation)
             .await
+            .map(|chunk| chunk.map(|chunk| chunk.to_vec()))
     }
 }
 fn redact_process_status(
@@ -1825,6 +1895,7 @@ fn host_error(error: HostError) -> Error {
 }
 enum Launch {
     Shell(ShellRequest),
+    PrivateShell(PrivateShellRequest),
     Process(ProcessSpec),
 }
 #[derive(Default)]
@@ -1898,6 +1969,7 @@ mod tests {
                         handle: ProcessHandle(microcrab_host_api::HandleId(id)),
                         pid: Some(id as u32),
                         capture: true,
+                        private: false,
                         releasing: AtomicBool::new(false),
                         release_completion: Mutex::new(None),
                         bridged: AtomicBool::new(false),
@@ -1947,6 +2019,7 @@ mod tests {
                     handle: ProcessHandle(microcrab_host_api::HandleId(1)),
                     pid,
                     capture: true,
+                    private: false,
                     releasing: AtomicBool::new(false),
                     release_completion: Mutex::new(None),
                     bridged: AtomicBool::new(false),

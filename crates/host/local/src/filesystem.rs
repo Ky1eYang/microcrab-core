@@ -48,6 +48,46 @@ fn metadata(path: &Path) -> Result<FileMeta> {
 }
 
 impl LocalHost {
+    pub(crate) async fn read_private_file_owned(
+        &self,
+        path: PathBuf,
+        mut buffer: microcrab_host_api::PrivateFileBuffer,
+        ctx: &OpContext,
+    ) -> std::result::Result<microcrab_host_api::PrivateFileBuffer, ToolError> {
+        self.filesystem_work(ctx, false, move |host, ctx, protected| {
+            if buffer.max_bytes() == 0 || buffer.max_bytes() > crate::text::HARD_BYTES {
+                return Err(ToolError::FileLimit.into_host_error());
+            }
+            // Unlike ordinary FsApi calls, a private read never inherits the
+            // unrestricted filesystem setting. Keep the same protected policy.
+            let path = crate::paths::resolve(&host.root, &path).map_err(tool_error)?;
+            if crate::paths::protected(&path, protected) {
+                return Err(HostError::known(
+                    ErrorCategory::Permission,
+                    "target path is protected by Host private-directory policy",
+                ));
+            }
+            let mut file = crate::workspace::open_regular(&path).map_err(tool_error)?;
+            let initial_length = file.metadata()?.len();
+            let length = usize::try_from(initial_length)
+                .map_err(|_| ToolError::FileLimit.into_host_error())?;
+            let data = buffer.allocate(length).map_err(tool_error)?;
+            // Read directly into the one precharged exact-size allocation. If the
+            // length changes, reject instead of delivering a prefix or reallocating.
+            for chunk in data.chunks_mut(8192) {
+                ctx.check()?;
+                file.read_exact(chunk)?;
+            }
+            if file.metadata()?.len() != initial_length {
+                return Err(ToolError::FileConflict.into_host_error());
+            }
+            ctx.check()?;
+            Ok(buffer)
+        })
+        .await
+        .map_err(ToolError::Host)
+    }
+
     async fn filesystem_work<T: Send + 'static>(
         &self,
         ctx: &OpContext,

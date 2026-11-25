@@ -1,4 +1,4 @@
-package microcrab:agent@0.8.0;
+package microcrab:agent@0.9.0;
 
 /// Immutable discovery facts, available without operation grants.
 interface host-info {
@@ -10,6 +10,7 @@ interface host-info {
 /// Runtime-owned storage, independent of tool names and Host process identity.
 interface execution {
   use microcrab:host/process@0.1.0.{process-handle};
+  use microcrab:host/shell@0.1.0.{shell-request};
   enum failure-kind { failed, timeout, cancelled }
   record tool-failure { kind: failure-kind, code: string, message: string, retryable: bool }
   resource buffer;
@@ -20,13 +21,20 @@ interface execution {
   record buffered-output { output: own<buffer>, include-initial: bool }
   variant tool-output { final(final-output), buffered(buffered-output) }
   record driver-step { state: list<u8>, wake-after-ms: u64, finished: bool }
-  create: func(channels: list<string>) -> result<own<buffer>, tool-failure>;
+  /// Bytes carry a declared MIME witness, not evidence of valid image content.
+  variant content-kind { text, bytes(string) }
+  record output-channel { name: string, kind: content-kind }
+  enum process-source { raw-pipes, shell-text }
+  create: func(channels: list<output-channel>) -> result<own<buffer>, tool-failure>;
   append: func(output: borrow<buffer>, channel: option<string>, content: string) -> result<_, tool-failure>;
   mark-truncated: func(output: borrow<buffer>) -> result<_, tool-failure>;
   finish: func(output: borrow<buffer>, failure: option<tool-failure>) -> result<_, tool-failure>;
-  /// Adopt an invocation-owned Host process. Captured selects Shell capture.
-  attach-process: func(output: borrow<buffer>, process: process-handle, captured: bool) -> result<_, tool-failure>;
-  retain-process: func(output: borrow<buffer>, process: process-handle, captured: bool) -> result<_, tool-failure>;
+  /// Adopt an invocation-owned Host process into public text capture.
+  attach-process: func(output: borrow<buffer>, process: process-handle, source: process-source) -> result<_, tool-failure>;
+  retain-process: func(output: borrow<buffer>, process: process-handle, source: process-source) -> result<_, tool-failure>;
+  /// Runtime takes sole ownership at launch. Requires exactly one Bytes stdout
+  /// channel; stderr is discarded and bytes are never returned to the guest.
+  launch-private-shell: func(output: borrow<buffer>, request: shell-request) -> result<_, tool-failure>;
   /// Register copied continuation state, driven by Runtime after invoke returns.
   attach-guest: func(output: borrow<buffer>, state: list<u8>) -> result<_, tool-failure>;
 }

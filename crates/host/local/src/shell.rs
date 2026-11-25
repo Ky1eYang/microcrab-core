@@ -162,10 +162,77 @@ impl LocalHost {
     pub fn root(&self) -> &Path {
         &self.root
     }
+
+    async fn state_glob_read<T: Send + 'static>(
+        &self,
+        ctx: &microcrab_host_api::OpContext,
+        work: impl FnOnce(&Path, &crate::paths::Policy, &CancellationToken) -> Result<T, ToolError>
+        + Send
+        + 'static,
+    ) -> Result<T, ToolError> {
+        let token = ctx.cancel.child_token();
+        let _cancel_on_drop = token.clone().drop_guard();
+        ctx
+            .run(async {
+                let permit = self.permits.clone().acquire_owned().await.map_err(|_| {
+                    microcrab_host_api::HostError::known(
+                        microcrab_host_api::ErrorCategory::Io,
+                        "Host file admission closed",
+                    )
+                })?;
+                let guard = self.workspace.clone().read_owned().await;
+                let root = self.root.clone();
+                let protected_paths = self.protected_paths.clone();
+                let result = tokio::task::spawn_blocking(move || {
+                    let (_permit, _guard) = (permit, guard);
+                    let protected = protected_paths
+                        .read()
+                        .map_err(|_| ToolError::worker("private path policy lock poisoned"))?;
+                    work(&root, &protected, &token)
+                })
+                .await
+                .map_err(|error| {
+                    ToolError::Worker(
+                        microcrab_host_api::FailureReason::from(error.to_string())
+                            .with_public_reason("Host file worker failed"),
+                    )
+                })
+                .and_then(std::convert::identity);
+                Ok(result)
+            })
+            .await?
+    }
 }
 
 #[async_trait]
 impl Host for LocalHost {
+    fn file_version_authority(&self) -> Option<String> {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let root = self.root.to_str()?;
+            let machine = std::fs::read_to_string("/etc/machine-id").ok()?;
+            let machine = machine.trim();
+            if machine.len() != 32 || !machine.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return None;
+            }
+            let metadata = self.root.metadata().ok()?;
+            let unrestricted = self.protected_paths.read().ok()?.unrestricted;
+            use sha2::{Digest, Sha256};
+            let facts = format!(
+                "microcrab.local-file-authority.v1\0{machine}:{}:{}:{unrestricted}:{root}",
+                metadata.dev(),
+                metadata.ino()
+            );
+            Some(format!(
+                "local-linux:{:x}",
+                Sha256::digest(facts.as_bytes())
+            ))
+        }
+        #[cfg(not(target_os = "linux"))]
+        None
+    }
+
     fn tool_capabilities(&self) -> Vec<String> {
         [
             "read",
@@ -378,6 +445,46 @@ impl Host for LocalHost {
         })?
     }
 
+    async fn glob_ignore_snapshot(
+        &self,
+        ctx: &microcrab_host_api::OpContext,
+    ) -> Result<microcrab_host_api::GlobIgnoreSnapshot, ToolError> {
+        self.state_glob_read(ctx, crate::search::glob_ignore_snapshot)
+            .await
+    }
+
+    async fn glob_with_ignore_rules(
+        &self,
+        ctx: &microcrab_host_api::OpContext,
+        request: microcrab_host_api::GlobRequest,
+        rules: Vec<microcrab_host_api::GlobIgnoreRuleFile>,
+    ) -> Result<microcrab_host_api::GlobOutput, ToolError> {
+        self.state_glob_read(ctx, move |root, protected, token| {
+            crate::search::glob_with_ignore_rules(root, protected, request, rules, token)
+        })
+        .await
+    }
+
+    async fn glob_ignored_paths(
+        &self,
+        ctx: &microcrab_host_api::OpContext,
+    ) -> Result<Vec<String>, ToolError> {
+        self.state_glob_read(ctx, crate::search::glob_ignored_paths)
+            .await
+    }
+
+    async fn glob_with_ignored_paths(
+        &self,
+        ctx: &microcrab_host_api::OpContext,
+        request: microcrab_host_api::GlobRequest,
+        paths: Vec<String>,
+    ) -> Result<microcrab_host_api::ResolvedGlobOutput, ToolError> {
+        self.state_glob_read(ctx, move |root, protected, token| {
+            crate::search::glob_with_ignored_paths(root, protected, request, paths, token)
+        })
+        .await
+    }
+
     async fn grep(
         &self,
         request: microcrab_host_api::GrepRequest,
@@ -485,6 +592,19 @@ impl Host for LocalHost {
                     .with_public_reason("Host file worker failed"),
             )
         })?
+    }
+
+    fn supports_private_file_read(&self) -> bool {
+        true
+    }
+
+    async fn read_private_file(
+        &self,
+        path: PathBuf,
+        buffer: microcrab_host_api::PrivateFileBuffer,
+        context: &microcrab_host_api::OpContext,
+    ) -> Result<microcrab_host_api::PrivateFileBuffer, ToolError> {
+        self.read_private_file_owned(path, buffer, context).await
     }
 
     async fn read_file(

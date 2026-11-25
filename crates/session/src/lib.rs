@@ -21,6 +21,7 @@ pub use admission::inbox::{
     InboxSnapshot, NoticeFact, NoticeKey, NoticeKind, PendingInput, PendingInputError,
     PendingInputMode, StateDelivery, StateNotice,
 };
+pub use admission::model::{ModelAdmission, PreparedModelAdmission};
 pub use boundary::{ApplyPoint, ChangeOrigin, ConfigurationEffect, TransportImpact};
 pub use budget::{LimitError, LimitKind, Limits};
 pub use error::{Error, ErrorReason, ProviderTimeoutDetails};
@@ -40,14 +41,18 @@ pub use session::{
     SettlementGuard, TurnRouting,
 };
 pub use state::{
-    DynReference, ListedReference, Reference, ReferenceContent, ReferenceInfo, SessionState, State,
-    VariableCommit, VariableDescriptor, VariableInspection, VariableWitness,
+    BytesVariableAvailability, BytesVariableKind, BytesVariableLifecycle, BytesVariableMetadata,
+    BytesWriteReceipt, DynReference, ListedReference, PreparedBytesWrite, Reference,
+    ReferenceContent, ReferenceInfo, SessionState, State, VariableCommit, VariableDescriptor,
+    VariableInspection, VariableWitness,
 };
 
 pub use microcrab_agent_types::{AgentInfo, AgentMode, AgentRole, HostInfo, OsFamily};
 pub use runtime::execution;
 pub use runtime::journal::{Journal, NavigationBoundary, Recover, RoundContinuation};
 pub use runtime::tool::delegate::DelegateExecutor;
+#[cfg(feature = "wasm")]
+pub use runtime::wasm::ComponentCapability;
 
 pub use inner::delegation::{
     ChildFactory, ChildSession, Children, Completion, DelegateUsage, OwnedDelegateExecutor,

@@ -413,25 +413,33 @@ impl SessionInner {
         self.state()
             .references
             .validate_variables(&recover.state.variables)?;
-        if recover.context.tools.iter().any(|frozen| {
-            frozen.name == "job" && !definitions.iter().any(|installed| installed == frozen)
-        }) {
-            return Err(Error::config(
-                "restored job catalog is unsupported; create a new Session with current tool definitions",
-            ));
+        crate::runtime::execution::job::require_current_definition(&recover.context.tools)?;
+        crate::runtime::tool::view_image::require_current_definition(&recover.context.tools)?;
+        let managed = self
+            .model_admission
+            .as_ref()
+            .map(|owner| owner.dialogue_reply().definition());
+        if recover
+            .context
+            .tools
+            .iter()
+            .any(|frozen| managed.is_some_and(|tool| frozen.name == tool.name && frozen != tool))
+        {
+            return Err(Error::IncompatibleModelCatalog);
         }
         let exact_frozen = recover.context.tools.iter().all(|frozen| {
-            definitions.iter().any(|installed| {
-                installed == frozen
-                    || (frozen.name == "expand"
-                        && self.runtime.origin(&frozen.name)
-                            == Some(crate::runtime::tool::ToolOrigin::Builtin)
-                        && Self::prior_expand_definition(frozen, installed))
-                    || (frozen.name == "delegate"
-                        && self.runtime.origin(&frozen.name)
-                            == Some(crate::runtime::tool::ToolOrigin::Builtin)
-                        && Self::prior_delegate_definition(frozen, installed))
-            })
+            managed.is_some_and(|tool| frozen == tool)
+                || definitions.iter().any(|installed| {
+                    installed == frozen
+                        || (frozen.name == "expand"
+                            && self.runtime.origin(&frozen.name)
+                                == Some(crate::runtime::tool::ToolOrigin::Builtin)
+                            && Self::prior_expand_definition(frozen, installed))
+                        || (frozen.name == "delegate"
+                            && self.runtime.origin(&frozen.name)
+                                == Some(crate::runtime::tool::ToolOrigin::Builtin)
+                            && Self::prior_delegate_definition(frozen, installed))
+                })
         });
         let extras_are_native = definitions
             .iter()
@@ -443,7 +451,9 @@ impl SessionInner {
                     .any(|frozen| frozen.name == installed.name)
             })
             .all(|extra| {
-                self.runtime.origin(&extra.name) == Some(crate::runtime::tool::ToolOrigin::Builtin)
+                managed.is_some_and(|tool| extra == tool)
+                    || self.runtime.origin(&extra.name)
+                        == Some(crate::runtime::tool::ToolOrigin::Builtin)
             });
         if !exact_frozen || !extras_are_native {
             return Err(Error::config(
@@ -502,19 +512,61 @@ impl SessionInner {
     }
 
     pub(crate) async fn install_initial(&self, recover: Recover) -> Result<(), Error> {
-        let context = self.validate_recover(&recover)?;
+        let prepared = self.prepare_restore_model(&recover).await?;
+        let registry = prepared
+            .as_ref()
+            .map(|prepared| self.model_registry(prepared, None))
+            .transpose()?;
+        let context = match &registry {
+            Some(registry) => self.validate_recover_catalog(&recover, &registry.definitions())?,
+            None => self.validate_recover(&recover)?,
+        };
+        // Validate the exact effect delta before any recovery reconciliation.
+        let model_changed =
+            self.validate_recovered_model_context(&recover, &context, prepared.as_ref())?;
         if let Some(route) = &self.route {
             route.validate_restore(&recover).await?;
         }
-        self.reconcile_recovered_dialogues(recover.state.dialogue_turn.as_ref())
-            .await?;
-        let refresh = self.refresh_required(&recover);
+        let route_refresh = self.refresh_required(&recover);
         let selected_history = self.journal.has_selected_history().await;
-        let (recover, context) = if refresh {
-            self.refresh_live_recover(&recover, context)?
-        } else {
-            (recover, context)
-        };
+        let historical = recover.clone();
+        let (recover, context) = self.live_recovery(
+            recover,
+            context,
+            route_refresh,
+            model_changed,
+            prepared.as_ref(),
+        )?;
+        #[cfg(feature = "wasm")]
+        if self.journal.supports_file_versions() {
+            let session = self.state.processes().session_id().to_owned();
+            if let Some(ledger) = self.journal.load_file_versions(&session).await?
+                && (!selected_history
+                    || !self
+                        .host
+                        .as_ref()
+                        .and_then(|host| host.file_version_authority())
+                        .is_some_and(|host| ledger.matches(&host, context.epoch())))
+            {
+                self.journal.retire_file_versions(&session).await?;
+            }
+        }
+        self.reconcile_recovered_dialogues(historical.state.dialogue_turn.as_ref())
+            .await?;
+        if let Some(registry) = registry {
+            let controller = self.runtime.permission_controller();
+            let origins = registry.origins();
+            let defaults = registry.provider_defaults()?;
+            let policy = controller
+                .tool_config(&origins, &defaults, &[])
+                .map_err(|e| Error::config_with_private(e.public_reason(), e.to_string()))?;
+            self.runtime
+                .publish_catalog(registry, defaults, policy)
+                .map_err(|e| Error::config_with_private(e.public_reason(), e.to_string()))?;
+        }
+        // Attachment has not selected a new Journal head. Publish the live
+        // pending-epoch delta over the already-selected original below.
+        let refresh = route_refresh || model_changed;
         *self
             .navigation_epoch
             .lock()
@@ -542,7 +594,7 @@ impl SessionInner {
             .as_ref()
             .filter(|value| value.identity.depth == 1)
             .map(|value| value.focus.clone());
-        self.remember_durable_carrier_consumption(&recover)?;
+        self.remember_durable_carrier_consumption(&historical)?;
         self.state.replace(recover.state);
         if let Some(focus) = focus {
             self.state.install_focused_references(focus)?;
@@ -561,6 +613,9 @@ impl SessionInner {
             .lock()
             .unwrap_or_else(|error| error.into_inner()) = recover.cache_report;
         self.restored.store(true, Ordering::SeqCst);
+        if model_changed && selected_history {
+            self.commit_model_environment().await?;
+        }
         Ok(())
     }
 
@@ -618,6 +673,63 @@ impl SessionInner {
                 .any(|tool| tool.name == "expand" && tool.parameters.get("oneOf").is_some())
     }
 
+    fn validate_recovered_model_context(
+        &self,
+        recover: &Recover,
+        context: &Context,
+        prepared: Option<&crate::PreparedModelAdmission>,
+    ) -> Result<bool, Error> {
+        match prepared {
+            Some(prepared) => self.model_catalog_candidate(
+                &mut context.clone(),
+                prepared,
+                recover.continuation.is_some(),
+            ),
+            None => Ok(false),
+        }
+    }
+
+    fn live_recovery(
+        &self,
+        mut recover: Recover,
+        mut context: Context,
+        route_refresh: bool,
+        model_changed: bool,
+        prepared: Option<&crate::PreparedModelAdmission>,
+    ) -> Result<(Recover, Context), Error> {
+        if model_changed {
+            self.model_catalog_candidate(
+                &mut context,
+                prepared.expect("managed catalog changed"),
+                false,
+            )?;
+            // The selected immutable checkpoint retains the historical dialogue
+            // certificate; carrier consumption is remembered from that original.
+            if route_refresh {
+                recover.state.dialogue_turn = None;
+            }
+        }
+        if route_refresh {
+            self.refresh_live_recover(&recover, context)
+        } else {
+            recover.context = context.snapshot()?;
+            recover.validate()?;
+            Ok((recover, context))
+        }
+    }
+
+    async fn commit_model_environment(&self) -> Result<(), Error> {
+        let context = self
+            .context
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        // The recovered selection is acknowledged first. This is a separate
+        // internal checkpoint, never a rewrite of the selected historical node.
+        self.persist(&context, None).await?;
+        Ok(())
+    }
+
     fn refresh_live_recover(
         &self,
         original: &Recover,
@@ -627,9 +739,8 @@ impl SessionInner {
         // catalog. External/client tool definitions retain their exact authority;
         // the Context owner archives the old catalog for historical call checks.
         let installed = self.runtime.definitions();
-        let tools = original
-            .context
-            .tools
+        let tools = context
+            .frozen_tools()
             .iter()
             .map(|frozen| {
                 if self.runtime.origin(&frozen.name)
@@ -666,19 +777,33 @@ impl SessionInner {
     ) -> Result<(), Error> {
         self.recover_impl(recover, Some(tools)).await
     }
+    fn prepare_recovery_registry(
+        &self,
+        prepared: Option<&crate::PreparedModelAdmission>,
+        tools: Option<Vec<Arc<dyn crate::runtime::tool::Tool>>>,
+    ) -> Result<Option<Arc<crate::runtime::tool::ToolRegistry>>, Error> {
+        match prepared {
+            Some(prepared) => self.model_registry(prepared, tools).map(Some),
+            None => tools
+                .map(|tools| self.runtime.prepare_external_tools(tools))
+                .transpose(),
+        }
+    }
+
     async fn recover_impl(
         self: &Arc<Self>,
         recover: Recover,
         tools: Option<Vec<Arc<dyn crate::runtime::tool::Tool>>>,
     ) -> Result<(), Error> {
         // Reject malformed/incompatible requests before interrupting live work.
-        recover.validate()?;
-        if let Some(tools) = &tools {
-            let registry = self.runtime.prepare_external_tools(tools.clone())?;
-            self.validate_recover_catalog(&recover, &registry.definitions())?;
-        } else {
-            self.validate_recover(&recover)?;
-        }
+        let prepared = self.prepare_restore_model(&recover).await?;
+        let registry = self.prepare_recovery_registry(prepared.as_ref(), tools.clone())?;
+        let context = match &registry {
+            Some(registry) => self.validate_recover_catalog(&recover, &registry.definitions())?,
+            None => self.validate_recover(&recover)?,
+        };
+        let model_changed =
+            self.validate_recovered_model_context(&recover, &context, prepared.as_ref())?;
         let issued_mode_generation = self
             .configured_mode
             .lock()
@@ -687,9 +812,14 @@ impl SessionInner {
         if let Some(route) = &self.route {
             route.validate_restore(&recover).await?;
         }
-        if self.refresh_required(&recover) {
-            let context = Context::from_snapshot(recover.context.clone())?;
-            self.refresh_live_recover(&recover, context)?;
+        if self.refresh_required(&recover) || model_changed {
+            self.live_recovery(
+                recover.clone(),
+                context,
+                self.refresh_required(&recover),
+                model_changed,
+                prepared.as_ref(),
+            )?;
         }
         let operation = self.reserve_replacement().await?;
         let inner = self.clone();
@@ -712,9 +842,7 @@ impl SessionInner {
             };
             let _cancel = CancelOnDrop(token.clone());
             inner.ensure_open()?;
-            let registry = tools
-                .map(|tools| inner.runtime.prepare_external_tools(tools))
-                .transpose()?;
+            let registry = inner.prepare_recovery_registry(prepared.as_ref(), tools)?;
             let context = match &registry {
                 Some(registry) => {
                     inner.validate_recover_catalog(&recover, &registry.definitions())?
@@ -774,12 +902,20 @@ impl SessionInner {
             if let Some(route) = &inner.route {
                 route.validate_restore(&recover).await?;
             }
-            let (live_recover, context) = if inner.refresh_required(&recover) {
-                inner.refresh_live_recover(&recover, context)?
-            } else {
-                (recover.clone(), context)
-            };
+            let (live_recover, context) = inner.live_recovery(
+                recover.clone(),
+                context,
+                inner.refresh_required(&recover),
+                model_changed,
+                prepared.as_ref(),
+            )?;
             inner.flush_durable_carrier_consumption_locked().await?;
+            // Fence aliases BEFORE moving the durable selection. If movement
+            // fails or ACK is lost, conservatively require a reread on either head.
+            inner
+                .journal
+                .retire_file_versions(inner.state.processes().session_id())
+                .await?;
             inner.journal.recovered(recover.clone()).await?;
             inner.remember_durable_carrier_consumption(&recover)?;
             inner
@@ -827,8 +963,8 @@ impl SessionInner {
                             .map_err(|error| {
                                 Error::config_with_private(error.public_reason(), error.to_string())
                             })?;
-                        match controller.publish_tools(
-                            registry.origins(),
+                        match inner.runtime.publish_catalog(
+                            registry.clone(),
                             provider.clone(),
                             snapshot,
                         ) {
@@ -850,10 +986,6 @@ impl SessionInner {
                             "permission changed during recovered tool publication",
                         ));
                     }
-                    inner
-                        .state
-                        .install_permission(controller.observe(registry.origins()));
-                    inner.runtime.publish_registry(registry);
                 } else {
                     inner.install_policy_mode(effective_mode)?;
                 }
@@ -912,6 +1044,9 @@ impl SessionInner {
             inner.restored.store(true, Ordering::SeqCst);
             drop(_fence);
             drop(_communication);
+            if model_changed {
+                inner.commit_model_environment().await?;
+            }
             inner.load_references(&token).await?;
             inner
                 .boundary(Boundary::SessionRestored, None, &token)

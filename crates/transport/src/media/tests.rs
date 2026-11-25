@@ -5,7 +5,6 @@ use crate::{
 };
 use microcrab_protocol::{Message, Request, ToolCall, ToolDefinition};
 use serde_json::{Value, json};
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 fn image() -> InputPart {
     InputPart::Image {
@@ -123,9 +122,10 @@ fn native_tool_image_shapes_and_complete_batch_order_are_preserved() {
         json!({"type":"base64","media_type":"image/png","data":"AQID"})
     );
     let r = &bodies[1]["input"];
-    assert_eq!(r[2]["call_id"], "a");
+    assert_eq!(r[0]["role"], "developer");
+    assert_eq!(r[3]["call_id"], "a");
     assert_eq!(
-        r[2]["output"][2],
+        r[3]["output"][2],
         json!({"type":"input_image","image_url":"data:image/png;base64,AQID"})
     );
     let c = bodies[2]["messages"].as_array().unwrap();
@@ -160,6 +160,8 @@ fn native_tool_image_shapes_and_complete_batch_order_are_preserved() {
             changed["system"] = json!("changed");
         } else if changed.get("instructions").is_some() {
             changed["instructions"] = json!("changed");
+        } else if changed.get("input").is_some() {
+            changed["input"][0]["content"] = json!("changed");
         } else if changed.get("systemInstruction").is_some() {
             changed["systemInstruction"]["parts"][0]["text"] = json!("changed");
         } else {
@@ -182,7 +184,7 @@ fn empty_tool_parts_retain_legacy_wire_shapes() {
         json!({"type":"tool_result","tool_use_id":"a","content":"first"})
     );
     assert_eq!(
-        bodies[1]["input"][2],
+        bodies[1]["input"][3],
         json!({"type":"function_call_output","call_id":"a","output":"first"})
     );
     assert_eq!(bodies[2]["messages"].as_array().unwrap().len(), 5);
@@ -238,145 +240,9 @@ fn typed_fetch_evidence_is_exact_and_sanitized() {
         }
     }
 }
-struct Resolver {
-    calls: AtomicUsize,
-    cancel: bool,
-}
-#[async_trait::async_trait]
-impl ImageUrlResolver for Resolver {
-    async fn upload(
-        &self,
-        _: &str,
-        _: &[u8],
-        _: CancellationToken,
-    ) -> Result<Option<String>, Error> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
-        if self.cancel {
-            Err(Error::Cancelled)
-        } else {
-            Ok(Some("https://example.invalid/image?private=token".into()))
-        }
-    }
-}
-fn content() -> Content {
-    Content {
-        epoch: 1,
-        subagent: None,
-        system: "frozen".into(),
-        items: vec![
-            ContentItem::User {
-                parts: vec![image()],
-                source: None,
-                envelope: None,
-            },
-            ContentItem::Tool {
-                call_id: "a".into(),
-                content: "result".into(),
-                parts: vec![image(), image()],
-            },
-        ],
-        tools: vec![],
-        max_output_tokens: 32,
-        max_bytes: 65536,
-        turn_id: Some(1),
-        round: Some(1),
-    }
-}
-#[tokio::test]
-async fn projection_defaults_and_cache_preserve_canonical_data_and_user_images() {
-    let resolver = Arc::new(Resolver {
-        calls: AtomicUsize::new(0),
-        cancel: false,
-    });
-    let disabled = MediaProjection::new(resolver.clone(), false);
-    let canonical = content();
-    assert!(
-        disabled
-            .project_tool_images(&canonical, CancellationToken::new())
-            .await
-            .unwrap()
-            .is_none()
-    );
-    assert_eq!(resolver.calls.load(Ordering::SeqCst), 0);
-    let projection = MediaProjection::new(resolver.clone(), true);
-    for _ in 0..2 {
-        let projected = projection
-            .project_tool_images(&canonical, CancellationToken::new())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(projected.items[0], canonical.items[0]);
-        assert_eq!(projected.system, canonical.system);
-        assert!(
-            matches!(&projected.items[1], ContentItem::Tool { parts, .. } if matches!(&parts[0], InputPart::Image { source: ImageSource::Url { .. } }))
-        );
-    }
-    assert_eq!(resolver.calls.load(Ordering::SeqCst), 1);
-    assert!(
-        matches!(&canonical.items[1], ContentItem::Tool { parts, .. } if matches!(&parts[0], InputPart::Image { source: ImageSource::Data { .. } }))
-    );
-}
-#[tokio::test]
-async fn callback_cancellation_is_never_swallowed_or_cached() {
-    let resolver = Arc::new(Resolver {
-        calls: AtomicUsize::new(0),
-        cancel: true,
-    });
-    let projection = MediaProjection::new(resolver.clone(), true);
-    for _ in 0..2 {
-        assert!(matches!(
-            projection
-                .project_tool_images(&content(), CancellationToken::new())
-                .await,
-            Err(Error::Cancelled)
-        ));
-    }
-    assert_eq!(resolver.calls.load(Ordering::SeqCst), 2);
-}
+#[path = "hosting_tests.rs"]
+mod hosting_tests;
 
-#[test]
-fn hint_admission_requires_bounded_https_without_inline_credentials() {
-    for url in [
-        "http://example.invalid/a",
-        "https://user:secret@example.invalid/a",
-        "https://example.invalid/a#private",
-        "data:image/png;base64,AQID",
-        "not a URL",
-    ] {
-        assert!(!valid_hint(url));
-    }
-    assert!(!valid_hint(&format!(
-        "https://example.invalid/{}",
-        "x".repeat(8192)
-    )));
-    assert!(valid_hint("https://example.invalid/a?signature=private"));
-}
-#[tokio::test]
-async fn full_hint_cache_uses_data_without_evicting_stable_prefix() {
-    let resolver = Arc::new(Resolver {
-        calls: AtomicUsize::new(0),
-        cancel: false,
-    });
-    let projection = MediaProjection::new(resolver.clone(), true);
-    for n in 0u16..129 {
-        let mut canonical = content();
-        if let ContentItem::Tool { parts, .. } = &mut canonical.items[1] {
-            *parts = vec![InputPart::Image {
-                source: ImageSource::Data {
-                    media_type: "image/png".into(),
-                    data: n.to_be_bytes().to_vec(),
-                },
-            }];
-        }
-        let projected = projection
-            .project_tool_images(&canonical, CancellationToken::new())
-            .await
-            .unwrap();
-        assert_eq!(projected.is_some(), n < 128);
-    }
-    assert_eq!(resolver.calls.load(Ordering::SeqCst), 128);
-    assert_eq!(projection.cache.lock().await.len(), 128);
-}
 #[test]
 fn request_rewrite_rejects_malformed_tool_media_unions_and_retains_tools() {
     for body in bodies(&request()) {
@@ -386,7 +252,7 @@ fn request_rewrite_rejects_malformed_tool_media_unions_and_retains_tools() {
         assert!(crate::validate_request_rewrite(&authored, &changed.to_string(), 65536).is_err());
         let mut changed = body.clone();
         if changed.get("input").is_some() {
-            changed["input"][2]["output"][2] = json!({"type":"input_image"});
+            changed["input"][3]["output"][2] = json!({"type":"input_image"});
         } else if changed.get("contents").is_some() {
             changed["contents"][1]["parts"][0]["functionResponse"]["parts"][0] =
                 json!({"text":"wrong union"});

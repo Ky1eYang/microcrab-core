@@ -16,6 +16,60 @@ use microcrab_host_api::{
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use tokio::sync::{Semaphore, watch};
 
+#[tokio::test]
+async fn local_private_shell_pump_retains_exact_octets() {
+    let workspace = tempfile::tempdir().unwrap();
+    let host = Arc::new(
+        microcrab_host_local::LocalHost::new(workspace.path(), Default::default()).unwrap(),
+    );
+    let processes = ProcessRegistry::new("owner".into(), Some(host), Limits::default());
+    let executions = ExecutionRegistry::new(Limits::default());
+    let owner = executions.clone();
+    let process_owner = processes.clone();
+    let mut task = executions.start(
+        ExecutionSnapshot::new("owner".into(), "call".into(), "shell".into(), "agent".into(), None),
+        CancellationToken::new(), move |progress| async move {
+            // This native fixture keeps the exact scoped process controller until
+            // the execution owner is ready; the production guest reserves first.
+            let command = if cfg!(windows) {
+                "[Console]::OpenStandardOutput().Write([byte[]](255,0,254,128),0,4); [Console]::Error.Write('not captured')"
+            } else {
+                "printf '\\377\\000\\376\\200'; printf 'not captured' >&2"
+            };
+            let handle = process_owner.launch_private_shell("shell", "call", microcrab_host_api::PrivateShellRequest { command: command.into(), cwd: None }, CancellationToken::new()).await?;
+            assert!(!process_owner.owns_process(handle));
+            assert!(process_owner.projection().is_none());
+            assert!(process_owner.read_process_pipe(handle, false, 1024, CancellationToken::new()).await.is_err());
+            let mut controller = ProcessController::new(process_owner, "owner".into(), handle, false);
+            controller.private = true;
+            let controller = Arc::new(controller);
+            let (writer, output) = owner.open_private_output(progress.execution_id(), "application/octet-stream".into(), controller.clone())?;
+            pump_private(controller, writer).await?;
+            Ok(ToolOutput::Buffered(output))
+        }
+    ).unwrap();
+    let id = task.id;
+    task.activate().unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(15), task.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    task.detach();
+    assert_eq!(
+        executions
+            .private_output(id, "owner", "stdout", "application/octet-stream")
+            .unwrap()
+            .as_bytes(),
+        &[255, 0, 254, 128]
+    );
+    assert!(executions.read(id, 0, 1024).unwrap().chunks.is_empty());
+    executions
+        .release(id, CancellationToken::new())
+        .await
+        .unwrap();
+    processes.close().await.unwrap();
+}
+
 struct ControlledHost {
     terminal: AtomicBool,
     fail_cancel: AtomicBool,

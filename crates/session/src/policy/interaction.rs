@@ -3,6 +3,49 @@ use super::*;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tokio::time::Instant;
+use crate::observation::diagnostics::{PermissionDecisionSource as Source, SafeDiagnosticReason};
+
+/// The final denied interaction, not a provisional review suggestion.
+#[derive(Debug)]
+pub(super) struct Denial {
+    pub(super) source: Source,
+    pub(super) reason: SafeDiagnosticReason,
+}
+
+impl Denial {
+    pub(super) fn unavailable() -> Self {
+        Self::new(Source::Unavailable, "Permission interaction is unavailable.")
+    }
+
+    pub(super) fn invalid_reply() -> Self {
+        Self::new(Source::Interaction, "Permission interaction returned an invalid decision.")
+    }
+
+    pub(super) fn from_reply(answer: &AskReply, submitted: Option<&Decision>, state: &crate::State) -> Self {
+        match (answer.reason.as_str(), submitted) {
+            ("review_auto", Some(decision)) if decision.source == "review" && decision.action == answer.action => {
+                let safe = crate::runtime::execution::InvocationRedaction::from_snapshot(state.secret_snapshot())
+                    .ok().map(|redaction| redaction.redact_text(decision.reason.trim()));
+                match safe.as_deref().filter(|reason| !reason.is_empty()) {
+                    Some(reason) => Self::new(Source::ActionReview, &format!("Action Review denied the operation: {reason}")),
+                    None => Self::new(Source::ActionReview, "Action Review denied the operation."),
+                }
+            }
+            ("timeout", _) => Self::new(Source::Timeout, "Permission expired without an Allow decision."),
+            ("timeout_or_closed", _) => Self::new(Source::Interaction, "Permission was not granted before the interaction expired or closed."),
+            (_, Some(decision)) if decision.source == "timeout" && decision.action == answer.action && decision.reason == answer.reason => {
+                Self::new(Source::Timeout, "Permission expired without an Allow decision.")
+            }
+            ("executor_disconnected" | "session_closed", _) => Self::unavailable(),
+            ("user_once", _) => Self::new(Source::User, "The user denied the operation."),
+            _ => Self::new(Source::Interaction, "The permission interaction denied the operation."),
+        }
+    }
+
+    fn new(source: Source, reason: &str) -> Self {
+        Self { source, reason: SafeDiagnosticReason::new(reason) }
+    }
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AskAttribution {

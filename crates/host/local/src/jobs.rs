@@ -5,8 +5,8 @@ mod capture;
 use crate::{LocalHost, process};
 use capture::{Capture, Decoder, Stream};
 use microcrab_host_api::{
-    BoxStream, Bytes, ErrorCategory, HandleId, HostError, OpContext, ProcessApi, ShellApi,
-    ShellCaptureStatus, ShellOutput, ShellPosition, ShellRequest,
+    BoxStream, Bytes, ErrorCategory, HandleId, HostError, OpContext, PrivateShellRequest,
+    ProcessApi, ShellApi, ShellCaptureStatus, ShellOutput, ShellPosition, ShellRequest,
     process::{ExitStatus, ProcessHandle, ProcessSpec, ProcessState, ProcessStatus, Signal},
     types::Result,
 };
@@ -216,7 +216,7 @@ impl LocalHost {
         static NEXT_ID: AtomicU64 = AtomicU64::new(1);
         const MAX_SAFE_ID: u64 = (1 << 53) - 1;
         let id = NEXT_ID
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| {
                 (id <= MAX_SAFE_ID).then_some(id + 1)
             })
             .map_err(|_| HostError::known(ErrorCategory::Io, "process handle ids exhausted"))?;
@@ -539,6 +539,15 @@ fn check_capture_context(
 
 #[async_trait::async_trait]
 impl ShellApi for LocalHost {
+    async fn launch_private(
+        &self,
+        ctx: &OpContext,
+        request: PrivateShellRequest,
+    ) -> Result<ProcessHandle> {
+        let mut spec = ProcessApi::shell_spec(self, &request.command)?;
+        spec.cwd = request.cwd;
+        self.admit_process(ctx, spec, None).await
+    }
     async fn launch(&self, ctx: &OpContext, request: ShellRequest) -> Result<ProcessHandle> {
         let mut spec = ProcessApi::shell_spec(self, &request.command)?;
         spec.cwd = request.cwd;

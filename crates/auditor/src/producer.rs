@@ -84,11 +84,13 @@ impl ChannelAuditor {
             response_content_type: body.response_content_type,
             started_at_unix_ms: body.started_at_unix_ms,
             elapsed_ms: body.elapsed_ms,
+            response_completed_at_ms: body.response_completed_at_ms,
             first_token_ms: body.first_token_ms,
             generation_ms: body.generation_ms,
             timing_source: body.timing_source,
             outcome: body.outcome,
             usage: body.usage,
+            protected_tool_call_ids: body.protected_tool_call_ids,
         };
         let _ = sender.send(record);
     }

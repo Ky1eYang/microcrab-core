@@ -129,6 +129,7 @@ pub struct SessionBuilder {
     interaction: crate::state::communication::SessionInteraction,
     dialogue_reply_store: Option<DialogueReplyStoreFactory>,
     route: Option<Arc<dyn TurnRouting>>,
+    model_admission: Option<Arc<dyn crate::ModelAdmission>>,
     client: Arc<dyn Client>,
     auto_compaction: Option<(
         crate::context::AutoCompactionPolicy,
@@ -205,6 +206,7 @@ impl Session {
             dialogue_reply_store: None,
             interaction: crate::state::communication::SessionInteraction::Persistent,
             route: None,
+            model_admission: None,
             client,
             auto_compaction: None,
             review_client: None,
@@ -496,11 +498,15 @@ impl Session {
             .replace_markdown_references(kind, sources, limits)
             .await
     }
-    pub fn permission_inventory(
+    /// Observe actually applied Runtime permissions without starting model admission.
+    /// A successful list is a presentation snapshot, never an admission token.
+    pub fn permission_list(
         &self,
-    ) -> Result<serde_json::Value, crate::policy::PermissionError> {
-        self.inner.permission_inventory()
+        view: crate::policy::PermissionListView,
+    ) -> Result<crate::policy::PermissionList, crate::policy::PermissionListError> {
+        self.inner.permission_list(view)
     }
+
     pub fn replace_permissions(
         &self,
         expected_revision: u64,
@@ -827,7 +833,7 @@ impl Session {
         // behind an unrelated commit, cancellation must release foreground promptly.
         let mut reservation = tokio::select! {
             biased;
-            result = self.inner.reserve() => result?,
+            result = self.inner.reserve_model() => result?,
             _ = cancellation.cancelled() => return Err(Error::Cancelled),
         };
         reservation.submission_operation_id = submission_operation_id;
@@ -956,6 +962,12 @@ impl Session {
     pub async fn checkpoint_navigation(&self) -> Result<Recover, Error> {
         self.inner.navigation_checkpoint().await
     }
+    /// Explicitly acknowledge the current embedding catalog without admitting input.
+    /// Busy and unfinished mismatched Turns are not interrupted or discarded.
+    pub async fn reconcile_model_catalog(&self) -> Result<(), Error> {
+        self.inner.reconcile_model_catalog().await
+    }
+
     pub async fn recover_with_external_tools(
         &self,
         recover: crate::runtime::journal::Recover,
@@ -1064,6 +1076,9 @@ impl Session {
     /// move. Initialization loads live references and emits SessionRestored when
     /// the Session starts; legacy workspace bytes remain inert.
     pub async fn restore(mut builder: SessionBuilder, recover: Recover) -> Result<Self, Error> {
+        if let Some(owner) = &builder.model_admission {
+            crate::admission::model::reject_retired(owner.as_ref(), &recover)?;
+        }
         // Frozen Context is installed below; creation must never render a mutable
         // replacement SYSTEM or require Agent values no longer present in it.
         builder.prompt_config = recover.prompt_config.clone().unwrap_or_default();
@@ -1087,6 +1102,12 @@ impl Session {
     }
 }
 impl SessionBuilder {
+    /// Install the trusted admission owner for this persistent Interactive root.
+    pub fn model_admission(mut self, owner: Arc<dyn crate::ModelAdmission>) -> Self {
+        self.model_admission = Some(owner);
+        self
+    }
+
     pub fn interaction(
         mut self,
         interaction: crate::state::communication::SessionInteraction,
@@ -1273,6 +1294,19 @@ impl SessionBuilder {
         if let Some(communication) = &communication {
             communication.validate()?;
         }
+        if self.model_admission.is_some()
+            && (kind != SessionKind::Interactive
+                || self.processes_parent.is_some()
+                || !communication.as_ref().is_some_and(|owner| {
+                    owner.identity.depth == 0
+                        && owner.identity.interaction
+                            == crate::state::communication::SessionInteraction::Persistent
+                }))
+        {
+            return Err(Error::config(
+                "model admission owner requires a persistent Interactive root",
+            ));
+        }
         let dialogue_reply_store = self
             .dialogue_reply_store
             .zip(communication.as_ref().filter(|owner| {
@@ -1294,6 +1328,7 @@ impl SessionBuilder {
                 }),
                 client: self.client,
                 route: self.route,
+                model_admission: self.model_admission,
                 auto_compaction: self.auto_compaction,
                 round_limit_callback: self.round_limit_callback,
                 attachment_resolver: self.attachment_resolver,

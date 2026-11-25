@@ -216,7 +216,7 @@ impl SessionInner {
         identity: String,
         body: String,
     ) -> Result<QueuedReceipt, Error> {
-        self.enqueue_carrier(external_carrier(operation_id, identity, body)?)
+        self.enqueue_carrier(AcceptedCarrier::external(operation_id, identity, body)?)
             .await
     }
     pub(crate) async fn replay_legacy_external(
@@ -226,7 +226,7 @@ impl SessionInner {
         body: String,
     ) -> Result<QueuedReceipt, Error> {
         use crate::state::communication::inbox::{validate_body, validate_operation};
-        let carrier = external_carrier(operation_id, identity, body)?;
+        let carrier = AcceptedCarrier::external(operation_id, identity, body)?;
         validate_operation(&carrier.operation_id)?;
         validate_body(&carrier.body)?;
         let digest = DurableInbox::digest(&carrier)?;
@@ -246,7 +246,7 @@ impl SessionInner {
         body: String,
         incarnation: ExternalCredentialIncarnation,
     ) -> Result<ExternalDialogueReceipt, Error> {
-        let carrier = external_carrier(operation_id, identity.clone(), body)?;
+        let carrier = AcceptedCarrier::external(operation_id, identity.clone(), body)?;
         self.commit_carrier(carrier, Some(incarnation.clone()))
             .await?
             .authenticated_external_receipt(&identity, &incarnation)
@@ -558,23 +558,4 @@ impl SessionInner {
             .update(|snapshot| snapshot.communication = Some(communication));
         Ok(())
     }
-}
-
-fn external_carrier(
-    operation_id: String,
-    identity: String,
-    body: String,
-) -> Result<AcceptedCarrier, Error> {
-    let speaker = ExternalSpeaker {
-        identity: identity.clone(),
-    };
-    speaker.validate()?;
-    Ok(AcceptedCarrier {
-        operation_id,
-        ordinal: 0,
-        body,
-        source: UserSource::External { identity },
-        correspondent: None,
-        speaker: Some(speaker),
-    })
 }

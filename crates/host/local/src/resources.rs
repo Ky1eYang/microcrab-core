@@ -64,7 +64,7 @@ impl HandleTable {
                 ));
             }
             let id = NEXT_ID
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
                 .map_err(|_| {
                     HostError::known(ErrorCategory::Io, "primitive resource IDs exhausted")
                 })?;

@@ -7,7 +7,7 @@ use crate::observation::emit;
 use crate::{Client, ModelEvent, render_ast};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use futures_util::StreamExt;
-use microcrab_auditor::{Auditor, HookContext, HookPayload, Moment, VariableView};
+use microcrab_auditor::{Auditor, VariableView};
 use microcrab_protocol::{ImageSource, InputPart, Message, Request, Response, ToolCall, Usage};
 use serde_json::{Value, json};
 use std::time::Duration;
@@ -37,6 +37,20 @@ impl std::fmt::Debug for OpenAiCompatibleConfig {
 }
 
 /// Optional wire settings preserve existing connection configuration literals.
+pub(crate) fn validate_reasoning_effort(effort: Option<&str>) -> Result<(), Error> {
+    if effort.is_some_and(|effort| {
+        effort.is_empty()
+            || effort.len() > 64
+            || effort == "default"
+            || !effort
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    }) {
+        return Err(Error::config("invalid reasoning effort"));
+    }
+    Ok(())
+}
+
 /// Callers authorize capability support; transport validates only the token shape.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct OpenAiCompatibleRequestOptions {
@@ -44,17 +58,7 @@ pub struct OpenAiCompatibleRequestOptions {
 }
 impl OpenAiCompatibleRequestOptions {
     pub fn validate(&self) -> Result<(), Error> {
-        if self.reasoning_effort.as_ref().is_some_and(|effort| {
-            effort.is_empty()
-                || effort.len() > 64
-                || effort == "default"
-                || !effort
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
-        }) {
-            return Err(Error::config("invalid reasoning effort"));
-        }
-        Ok(())
+        validate_reasoning_effort(self.reasoning_effort.as_deref())
     }
 }
 
@@ -347,7 +351,10 @@ impl OpenAiCompatible {
                     "accepted gateway text completion without provider finish reason"
                 );
             }
-            decode_response(value, request, Some(usage_details), gateway_text_complete)?
+            let response =
+                decode_response(value, request, Some(usage_details), gateway_text_complete)?;
+            audit.normalized();
+            response
         } else if is_json {
             // Some compatible providers explicitly return JSON despite stream:true.
             // One aggregate text delta describes that fallback without implying SSE.
@@ -366,6 +373,7 @@ impl OpenAiCompatible {
                 .into_iter()
                 .collect::<Vec<_>>();
             let response = decode_response(value, request, None, false)?;
+            audit.normalized();
             for text in reasoning {
                 emit(&events, observation, ModelEvent::ReasoningDelta { text }).await?;
             }
@@ -432,6 +440,19 @@ impl Client for OpenAiCompatible {
         cancellation: CancellationToken,
         events: Option<tokio::sync::mpsc::Sender<ModelEvent>>,
     ) -> Result<Response, Error> {
+        self.stream_admitted_outcome(content, auditor, variables, cancellation, events)
+            .await
+            .map(|outcome| outcome.response)
+    }
+
+    async fn stream_admitted_outcome(
+        &self,
+        content: &Content,
+        auditor: &dyn Auditor,
+        variables: &dyn VariableView,
+        cancellation: CancellationToken,
+        events: Option<tokio::sync::mpsc::Sender<ModelEvent>>,
+    ) -> Result<crate::ResponseOutcome, Error> {
         let ast = render_ast(content)?;
         let request = serde_json::to_string(&self.adapt(&ast)?)?;
         if request.len() > content.max_bytes {
@@ -440,33 +461,16 @@ impl Client for OpenAiCompatible {
         let call_id = uuid::Uuid::new_v4().to_string();
         // This hook runs for every HTTP attempt, including retries, with the same
         // call identity later observed by the sent-body and terminal records.
-        let injection = tokio::select! {
-            biased;
-            _ = cancellation.cancelled() => return Err(Error::Cancelled),
-            result = auditor.intervene(
-                Moment::RequestPrepared,
-                HookContext {
-                    epoch: content.epoch,
-                    subagent: content.subagent.clone(),
-                    turn: content.turn_id,
-                    round: content.round,
-                    call_id: Some(call_id.clone()),
-                    request_body: Some(&request),
-                    max_request_bytes: Some(content.max_bytes),
-                    variables,
-                    payload: HookPayload::None,
-                },
-            ) => result?,
-        };
-        // Applying variable changes is the bound caller's responsibility. They
-        // affect the next projection; only an explicit body replaces this request.
-        let request = match injection.request_body {
-            Some(replacement) => {
-                crate::validate_request_rewrite(&request, &replacement, content.max_bytes)?;
-                replacement
-            }
-            None => request,
-        };
+        let request = crate::call::intervene_request(
+            auditor,
+            content,
+            variables,
+            &cancellation,
+            &call_id,
+            request,
+        )
+        .await?;
+
         if cancellation.is_cancelled() {
             return Err(Error::Cancelled);
         }
@@ -490,7 +494,7 @@ impl Client for OpenAiCompatible {
             },
         };
         let result = result.map_err(|error| audit.measured_error(error));
-        audit.finish(&result);
+        let attempt = audit.finish(&result);
         let finishing = observation.finish(&result);
         tokio::select! {
             biased;
@@ -498,7 +502,7 @@ impl Client for OpenAiCompatible {
             _ = cancellation.cancelled() => {},
         }
 
-        result
+        result.map(|response| crate::ResponseOutcome { response, attempt })
     }
 }
 
@@ -831,8 +835,7 @@ fn decode_usage(value: Option<&Value>) -> Result<Usage, Error> {
         }
         Ok(result)
     };
-    let reported_total;
-    match semantic {
+    let reported_total = match semantic {
         Semantic::OpenAi => {
             usage.input_tokens = count(&[&["prompt_tokens"]])?;
             usage.output_tokens = count(&[&["completion_tokens"]])?;
@@ -850,7 +853,7 @@ fn decode_usage(value: Option<&Value>) -> Result<Usage, Error> {
                 &["completion_tokens_details", "reasoning_tokens"],
                 &["reasoning_tokens"],
             ])?;
-            reported_total = count(&[&["total_tokens"]])?;
+            count(&[&["total_tokens"]])?
         }
         Semantic::InputAlias => {
             usage.input_tokens = count(&[&["input_tokens"]])?;
@@ -868,7 +871,7 @@ fn decode_usage(value: Option<&Value>) -> Result<Usage, Error> {
                 &["output_tokens_details", "reasoning_tokens"],
                 &["reasoning_tokens"],
             ])?;
-            reported_total = count(&[&["total_tokens"]])?;
+            count(&[&["total_tokens"]])?
         }
         Semantic::Anthropic => {
             usage.uncached_input_tokens = count(&[&["input_tokens"], &["uncached_input_tokens"]])?;
@@ -886,9 +889,9 @@ fn decode_usage(value: Option<&Value>) -> Result<Usage, Error> {
                 usage.cache_write_tokens,
             )?;
             // OpenAI total_tokens belongs to a different accounting schema.
-            reported_total = None;
+            None
         }
-    }
+    };
     if !matches!(semantic, Semantic::Anthropic) {
         let reported_uncached = match semantic {
             Semantic::OpenAi => {

@@ -167,7 +167,7 @@ async fn dedicated_review_is_revision_pinned_and_null_returns_to_main_without_mu
     let cancellation = CancellationToken::new();
     assert_eq!(
         controller
-            .resolve_ask(&policy, &request, &state, &issuer, &cancellation)
+            .resolve_ask(&policy, &request, None, &state, &issuer, &cancellation)
             .await
             .unwrap()
             .0,
@@ -182,7 +182,7 @@ async fn dedicated_review_is_revision_pinned_and_null_returns_to_main_without_mu
         .unwrap();
     assert!(matches!(
         controller
-            .resolve_ask(&policy, &request, &state, &issuer, &cancellation)
+            .resolve_ask(&policy, &request, None, &state, &issuer, &cancellation)
             .await,
         Err(PermissionError::StalePolicy)
     ));
@@ -192,7 +192,7 @@ async fn dedicated_review_is_revision_pinned_and_null_returns_to_main_without_mu
     };
     assert_eq!(
         controller
-            .resolve_ask(&next, &next_request, &state, &issuer, &cancellation)
+            .resolve_ask(&next, &next_request, None, &state, &issuer, &cancellation)
             .await
             .unwrap()
             .0,

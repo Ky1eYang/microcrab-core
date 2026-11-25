@@ -348,7 +348,7 @@ fn component_with_extra_import(
     };
     let text = format!(
         r#"(component
-      (import "microcrab:agent/host-info@0.8.0" (instance $host
+      (import "microcrab:agent/host-info@0.9.0" (instance $host
         (type $code (enum "absent" "unavailable" "rejected" "cancelled"))
         (export "communication-error-code" (type $code_public (eq $code)))
         (type $error (record (field "code" $code_public) (field "message" string)))
