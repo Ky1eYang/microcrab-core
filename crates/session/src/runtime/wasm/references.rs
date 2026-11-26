@@ -10,21 +10,12 @@ use crate::state::reference::{
 use crate::{Error, LimitKind};
 use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
-use wasmtime::component::{ComponentType, InstancePre, Linker, Lower, types::ComponentItem};
+use wasmtime::component::{Linker, types::ComponentItem};
 use wasmtime::{Engine, StoreContextMut};
 
 pub(super) const INTERFACE: &str = "microcrab:session/references@0.3.0";
 
 const MAX_STAGED_OBJECTS_PER_CALL: usize = 16;
-
-#[derive(ComponentType, Lower)]
-#[component(variant)]
-enum CreateResult {
-    #[component(name = "ok")]
-    Ok(String),
-    #[component(name = "err")]
-    Err(String),
-}
 
 #[derive(Clone)]
 struct StagedEntry {
@@ -190,18 +181,12 @@ pub(super) fn link(linker: &mut Linker<RuntimeState>) -> wasmtime::Result<()> {
         |store: StoreContextMut<'_, RuntimeState>,
          (title, media_type, data): (String, String, Vec<u8>)| {
             let Some(ingress) = store.data().references.clone() else {
-                return Ok((CreateResult::Err(
+                return Ok((Err(
                     "references capability is not bound for this invocation".into(),
                 ),));
             };
-            let result = match ingress.stage(title, media_type, data) {
-                Ok(id) => CreateResult::Ok(id),
-                Err(reason) => CreateResult::Err(reason),
-            };
-            Ok((result,))
+            Ok((ingress.stage(title, media_type, data),))
         },
     )?;
-    // Touch InstancePre import symbol only to keep wasmtime trait clean.
-    let _ = std::marker::PhantomData::<fn(&InstancePre<RuntimeState>)>;
     Ok(())
 }
