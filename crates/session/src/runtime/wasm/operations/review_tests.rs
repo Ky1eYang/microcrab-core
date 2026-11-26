@@ -92,7 +92,7 @@ fn store(
             tool_context: Some(context),
             operation_scope: Some(("write".into(), arguments)),
             web: None,
-            private_bytes: None,
+            references: None,
             guest_observation: None,
             confinement_diagnostic: None,
             operation_cancelled: false,

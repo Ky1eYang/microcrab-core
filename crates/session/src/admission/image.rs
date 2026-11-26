@@ -6,7 +6,7 @@ mod inspect;
 
 pub const MAX_IMAGE_BYTES: usize = 20 * 1024 * 1024;
 pub const MAX_IMAGES_PER_INPUT: usize = 20;
-pub const MAX_IMAGES_PER_TOOL_OUTPUT: usize = 1;
+pub const MAX_IMAGES_PER_TOOL_OUTPUT: usize = 16;
 
 /// Context stores JSON numeric byte vectors: each byte and comma uses at most four
 /// bytes. One image's fixed framing/MIME overhead is bounded by admitted MIME types.

@@ -97,7 +97,6 @@ async fn resolve(adapter: Arc<dyn SessionPermission>, action: Action) -> (Action
         .resolve_ask(
             &policy,
             &request,
-            None,
             &state,
             &issuer(),
             &CancellationToken::new(),
@@ -149,46 +148,6 @@ async fn settled_review_denial_reaches_model_diagnostic() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn redacted_image_review_cannot_auto_allow() {
-    let port = timed(200, Action::Allow, 0);
-    let owner = PermissionController::new(Arc::new(TimedAdapter(Some(port.clone()))));
-    let probe = review_probe(Action::Allow);
-    owner
-        .bind(probe.clone(), Arc::new(crate::NoopAuditor))
-        .unwrap();
-    owner
-        .bind_one_shot_executor(crate::Session::one_shot_executor())
-        .unwrap();
-    let snapshot = owner.snapshot().unwrap();
-    let context = invocation();
-    let mut request = request(
-        &owner,
-        &context,
-        json!({"image_url":"file:private-witness"}),
-    );
-    request.tool = "view_image".into();
-    let preview = crate::runtime::tool::view_image::ApprovalPreview {
-        owner: json!({"image_url":"file:///workspace/exact.png"}),
-        reviewer: json!({"image_url":"[local file URI redacted]"}),
-    };
-    let result = owner
-        .resolve_ask(
-            &snapshot,
-            &request,
-            Some(&preview),
-            &context.state,
-            &issuer(),
-            &context.cancellation,
-        )
-        .await
-        .unwrap();
-    assert_eq!(probe.calls.load(Ordering::SeqCst), 1);
-    assert_eq!(result.0, Action::Deny);
-    assert_eq!(port.review_calls.load(Ordering::SeqCst), 0);
-    assert!(port.settled.load(Ordering::SeqCst));
-}
-
-#[tokio::test(start_paused = true)]
 async fn review_ask_keeps_waiting_for_user_without_automatic_allow() {
     let port = timed(9, Action::Deny, 0);
     let (action, elapsed, denial) = resolve(Arc::new(TimedAdapter(Some(port.clone()))), Action::Ask).await;
@@ -220,7 +179,6 @@ async fn missing_executor_prevents_even_valid_reviewer_from_starting() {
             .resolve_ask(
                 &p,
                 &request(&owner, &context, json!({})),
-                None,
                 &context.state,
                 &issuer(),
                 &context.cancellation

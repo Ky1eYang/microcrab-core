@@ -80,11 +80,6 @@ impl State {
         endpoint.ensure_open()?;
         let (expected, references_revision, mut candidate, references, budget) = {
             let live = self.inner.lock().unwrap_or_else(|error| error.into_inner());
-            if values.keys().any(|name| live.bytes.owns(name)) {
-                return Err(Error::VariableForbidden(
-                    "Bytes variables require the typed Client endpoint".into(),
-                ));
-            }
             (
                 live.witness(),
                 live.references_revision,

@@ -1,16 +1,14 @@
 //! Shared snapshots, queued custom writes, and atomic Session hook commits.
-mod bytes;
 mod secrets;
-pub(crate) use bytes::RedirectDestination;
-pub use bytes::{
-    BytesVariableAvailability, BytesVariableKind, BytesVariableLifecycle, BytesVariableMetadata,
-    BytesWriteReceipt, PreparedBytesWrite,
-};
 pub use secrets::PreparedSecretWrite;
 #[cfg(test)]
 mod tests;
 use super::endpoint::VariableEndpoint;
-use super::reference::{self, ListedReference, ReferenceContent, References};
+use super::reference::{
+    self, CreateLibraryObject, InMemoryReferenceLibrary, LibraryObjectSummary,
+    LibraryRedirectDestination, ListedReference, LocalBlobOrigin, ReferenceContent,
+    ReferenceLibrary, References,
+};
 use super::{Limits, SessionState, Variables};
 use crate::admission::variables::is_reserved_key;
 pub(crate) use crate::admission::variables::{validate_change, validate_custom_key};
@@ -44,8 +42,6 @@ pub struct VariableInspection {
     pub values: Value,
     pub metadata: Value,
     pub descriptors: BTreeMap<String, VariableDescriptor>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub bytes: BTreeMap<String, BytesVariableMetadata>,
     pub witness: VariableWitness,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -72,8 +68,10 @@ enum Writer {
 #[derive(Clone)]
 struct LiveState {
     snapshot: SessionState,
-    bytes: bytes::ByteVariables,
-    image_host: Option<Arc<dyn microcrab_host_api::Host>>,
+    default_library: Arc<super::reference::InMemoryReferenceLibrary>,
+    library: Option<Arc<dyn super::reference::ReferenceLibrary>>,
+    library_projection: Option<super::reference::ReferenceProjection>,
+    host: Option<Arc<dyn microcrab_host_api::Host>>,
     #[cfg(feature = "wasm")]
     file_versions: Option<Arc<crate::runtime::wasm::FileVersionOwner>>,
     short_model_refs: bool,
@@ -106,6 +104,7 @@ fn inspection_metadata(live: &LiveState) -> Result<Value, Error> {
     // Historical custom metadata must not describe the live framework object.
     metadata.remove(crate::admission::variables::EXECUTION_CAPACITY_KEY);
     metadata.remove("permission");
+    metadata.remove("references");
     for name in ["agent_init", "agent_initialization_pending"] {
         metadata.insert(
             name.into(),
@@ -162,8 +161,10 @@ impl State {
                 permission: None,
                 permission_model_names: None,
                 snapshot,
-                bytes: Default::default(),
-                image_host: None,
+                default_library: Arc::new(InMemoryReferenceLibrary::default()),
+                library: None,
+                library_projection: None,
+                host: None,
                 #[cfg(feature = "wasm")]
                 file_versions: None,
                 short_model_refs: false,
@@ -234,11 +235,148 @@ impl State {
             .short_model_refs
     }
 
-    pub(crate) fn install_image_host(&self, host: Option<Arc<dyn microcrab_host_api::Host>>) {
+    pub(crate) fn install_host(&self, host: Option<Arc<dyn microcrab_host_api::Host>>) {
+        let default_library = {
+            let mut live = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+            live.host = host.clone();
+            live.default_library.clone()
+        };
+        default_library.set_host(host);
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn host(&self) -> Option<Arc<dyn microcrab_host_api::Host>> {
         self.inner
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .image_host = host;
+            .host
+            .clone()
+    }
+
+    pub fn install_reference_library(&self, library: Arc<dyn ReferenceLibrary>) {
+        self.inner
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .library = Some(library);
+    }
+
+    pub fn reference_library(&self) -> Arc<dyn ReferenceLibrary> {
+        let live = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        live.library
+            .clone()
+            .unwrap_or_else(|| live.default_library.clone())
+    }
+
+    pub(crate) async fn sync_library_projection(
+        &self,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<(), Error> {
+        let projection = self.reference_library().projections(cancel).await?;
+        self.inner
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .library_projection =
+            if projection.exact.is_none() && projection.short_model.is_none() {
+                None
+            } else {
+                Some(projection)
+            };
+        Ok(())
+    }
+
+    pub(crate) async fn refresh_library(
+        &self,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<(), Error> {
+        let library = self.reference_library();
+        library.refresh(cancel.clone()).await?;
+        let projection = library.projections(cancel).await?;
+        self.inner
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .library_projection =
+            if projection.exact.is_none() && projection.short_model.is_none() {
+                None
+            } else {
+                Some(projection)
+            };
+        Ok(())
+    }
+
+    pub(crate) async fn read_reference_async(
+        &self,
+        id: &str,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<ReferenceContent, Error> {
+        if let Some(content) = self.reference_library().read(id, cancel).await? {
+            return Ok(content);
+        }
+        reference::read_id(&self.snapshot().references, id)
+    }
+
+    pub(crate) fn prepare_library_redirect(
+        &self,
+        expected_mime: &str,
+        title: Option<&str>,
+    ) -> Result<LibraryRedirectDestination, Error> {
+        let expected_mime = reference::canonical_mime(expected_mime)?;
+        let title = match title {
+            Some(raw) => {
+                let trimmed = raw.trim();
+                if trimmed.is_empty()
+                    || trimmed.chars().count() > 256
+                    || trimmed.contains('\0')
+                {
+                    return Err(Error::config(
+                        "job redirect title must be 1..=256 non-NUL characters",
+                    ));
+                }
+                trimmed.to_owned()
+            }
+            None => "job stdout".to_owned(),
+        };
+        Ok(LibraryRedirectDestination {
+            expected_mime,
+            title,
+        })
+    }
+
+    pub(crate) async fn commit_library_redirect(
+        &self,
+        destination: LibraryRedirectDestination,
+        lease: crate::runtime::execution::PrivateOutputLease,
+        operation: crate::runtime::execution::ExecutionId,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<LibraryObjectSummary, Error> {
+        if lease.media_type() != destination.expected_mime {
+            return Err(Error::config("redirected output media type mismatch"));
+        }
+        let data = lease.as_bytes().to_vec();
+        let (media_type, _, _) =
+            reference::inspect_binary_for_storage(&destination.expected_mime, &data)?;
+        if media_type.starts_with("text/") && std::str::from_utf8(&data).is_err() {
+            return Err(Error::config(
+                "redirected stdout is not valid UTF-8 for declared text media type",
+            ));
+        }
+        let summary = self
+            .reference_library()
+            .add(
+                CreateLibraryObject::LocalBlob {
+                    id: None,
+                    title: destination.title,
+                    media_type,
+                    data,
+                    origin: LocalBlobOrigin::JobRedirect,
+                    origin_execution_id: Some(operation.0.to_string()),
+                },
+                cancel.clone(),
+            )
+            .await?;
+        let _ = self
+            .sync_library_projection(tokio_util::sync::CancellationToken::new())
+            .await;
+        Ok(summary)
     }
 
     pub(crate) fn install_inbox(&self, inbox: Weak<crate::admission::inbox::Inbox>) {
@@ -448,7 +586,7 @@ impl State {
             state.variables_revision = 0;
         }
         state.snapshot = snapshot;
-        state.bytes.clear();
+        state.library_projection = None;
         state.builtins.clear();
         state.reference_projection.clear();
         state.references_loaded = false;
@@ -726,7 +864,7 @@ impl State {
                         },
                     }
                 } else {
-                    let reference = live.snapshot.references.owns(name);
+                    let reference = live.snapshot.references.owns(name) || name == "references";
                     VariableDescriptor {
                         kind: if reference { "reference" } else { "framework" }.into(),
                         editable: false,
@@ -749,11 +887,6 @@ impl State {
             values,
             metadata,
             descriptors,
-            bytes: if self.actor == VariableRole::Client {
-                live.bytes.metadata()
-            } else {
-                BTreeMap::new()
-            },
             witness: live.witness(),
         })
     }
@@ -824,7 +957,6 @@ impl State {
     pub(crate) fn clear_ephemeral_variables(&self) {
         let mut live = self.inner.lock().unwrap_or_else(|error| error.into_inner());
         live.snapshot.variables.clear_ephemeral();
-        live.bytes.clear();
     }
     pub(super) fn wasm_extract(&self, key: &str) -> Result<Option<Value>, Error> {
         let Writer::Session(owner) = &self.writer else {
@@ -937,17 +1069,6 @@ impl State {
             return Err(Error::VariableConflict);
         }
         reject_owned_keys(&state.snapshot.references, &change)?;
-        if change
-            .set
-            .keys()
-            .chain(&change.remove)
-            .chain(change.scoped_set.iter().map(|entry| &entry.name))
-            .any(|name| state.bytes.owns(name))
-        {
-            return Err(Error::VariableForbidden(
-                "Bytes variables require the typed Client endpoint".into(),
-            ));
-        }
         let mut variables = state.snapshot.variables.clone();
         variables.change(&change, actor)?;
         crate::admission::variables::admit(
@@ -1062,11 +1183,6 @@ impl State {
             references.push(reference.clone());
         }
         candidate.snapshot.references = References::new(references)?;
-        if original.bytes.owns(reference.kind()) {
-            return Err(Error::config(
-                "reference kind conflicts with a live Bytes variable",
-            ));
-        }
         candidate
             .snapshot
             .references
@@ -1288,6 +1404,12 @@ fn current_projection(
                     .map(|value| (kind.clone(), value.clone()))
             }),
     );
+    values.remove("references");
+    if let Some(projection) = &live.library_projection
+        && let Some(value) = projection.value(short_model)
+    {
+        values.insert("references".into(), value.clone());
+    }
     for key in ["tool_tasks", "jobs", "subagents"] {
         values.remove(key);
     }

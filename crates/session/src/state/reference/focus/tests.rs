@@ -18,7 +18,7 @@ fn recorded_body_and_digest_restore_without_reopening_source() {
     let restored = FocusedReferences(serde_json::from_slice(&encoded).unwrap());
     validate_snapshots(&restored.0).unwrap();
     assert_eq!(
-        restored.read("section-a").unwrap().unwrap().body,
+        restored.read("section-a").unwrap().unwrap().as_text().unwrap(),
         "original\n完整"
     );
     assert!(restored.read("unselected").unwrap().is_none());
@@ -72,6 +72,9 @@ fn child_catalog_contains_only_snapshot_and_recovery_reinstalls_it() {
         serde_json::from_slice(&encoded).unwrap();
     let fresh = crate::State::new(crate::Limits::default());
     fresh.install_focused_references(recovered.focus).unwrap();
-    assert_eq!(fresh.read_reference("chosen").unwrap().body, "frozen");
+    assert_eq!(
+        fresh.read_reference("chosen").unwrap().as_text(),
+        Some("frozen")
+    );
     assert!(fresh.read_reference("other").is_err());
 }

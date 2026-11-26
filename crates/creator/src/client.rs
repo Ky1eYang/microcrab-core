@@ -246,25 +246,6 @@ fn retryable(error: &Error) -> bool {
 }
 #[async_trait::async_trait]
 impl Client for RetryingClient {
-    fn public_https_image_attempts(&self) -> u8 {
-        self.inner
-            .public_https_image_attempts()
-            .min(self.policy.attempts as u8)
-    }
-
-    async fn stream_public_https_image_attempt(
-        &self,
-        content: &Content,
-        auditor: &dyn Auditor,
-        variables: &dyn VariableView,
-        cancellation: CancellationToken,
-        events: Option<mpsc::Sender<ModelEvent>>,
-    ) -> Result<ResponseOutcome, Error> {
-        self.inner
-            .stream_public_https_image_attempt(content, auditor, variables, cancellation, events)
-            .await
-    }
-
     async fn complete(
         &self,
         content: &Content,

@@ -41,10 +41,9 @@ pub use session::{
     SettlementGuard, TurnRouting,
 };
 pub use state::{
-    BytesVariableAvailability, BytesVariableKind, BytesVariableLifecycle, BytesVariableMetadata,
-    BytesWriteReceipt, DynReference, ListedReference, PreparedBytesWrite, Reference,
-    ReferenceContent, ReferenceInfo, SessionState, State, VariableCommit, VariableDescriptor,
-    VariableInspection, VariableWitness,
+    DynReference, ListedReference, Reference, ReferenceContent, ReferenceInfo, ReferenceLibrary,
+    ReferencePayload, SessionState, State, VariableCommit, VariableDescriptor, VariableInspection,
+    VariableWitness,
 };
 
 pub use microcrab_agent_types::{AgentInfo, AgentMode, AgentRole, HostInfo, OsFamily};

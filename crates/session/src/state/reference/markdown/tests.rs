@@ -144,7 +144,7 @@ async fn short_markdown_refresh_patches_model_context_without_rewriting_owner_or
         Arc::new(microcrab_host_local::LocalHost::new(root.path(), Default::default()).unwrap());
     let refs = super::super::References::new(vec![
         super::super::DynReference::new(MarkdownReferences::new(
-            "references",
+            "docs",
             vec![ReferenceSource::HostPath {
                 path: "guide.md".into(),
             }],
@@ -159,7 +159,7 @@ async fn short_markdown_refresh_patches_model_context_without_rewriting_owner_or
     state.refresh(Boundary::SessionCreated).unwrap();
     let exact = state.view().unwrap();
     assert_eq!(
-        exact["references"][0]["content_digest"]
+        exact["docs"][0]["content_digest"]
             .as_str()
             .unwrap()
             .len(),
@@ -168,15 +168,15 @@ async fn short_markdown_refresh_patches_model_context_without_rewriting_owner_or
     assert_eq!(state.model_variables().unwrap(), exact);
     state.set_short_model_refs(true);
     let before = state.model_variables().unwrap();
-    assert!(before["references"][0].get("content_digest").is_none());
+    assert!(before["docs"][0].get("content_digest").is_none());
     assert_eq!(
-        before["references"][0]["revision"].as_str().unwrap().len(),
+        before["docs"][0]["revision"].as_str().unwrap().len(),
         16
     );
     assert_eq!(state.view().unwrap(), exact);
     assert_eq!(
-        state.inspection().unwrap().values["references"],
-        exact["references"]
+        state.inspection().unwrap().values["docs"],
+        exact["docs"]
     );
     let mut context = Context::new("system".into(), vec![], 65_536).unwrap();
     context.synchronize_state(&before).unwrap();
@@ -190,17 +190,20 @@ async fn short_markdown_refresh_patches_model_context_without_rewriting_owner_or
     state.refresh_reference_projection().unwrap();
     let after = state.model_variables().unwrap();
     assert_ne!(
-        before["references"][0]["revision"],
-        after["references"][0]["revision"]
+        before["docs"][0]["revision"],
+        after["docs"][0]["revision"]
     );
     assert_eq!(
-        before["references"][0]["subjects"],
-        after["references"][0]["subjects"]
+        before["docs"][0]["subjects"],
+        after["docs"][0]["subjects"]
     );
     assert_eq!(state.list_references().unwrap(), listed);
     assert_eq!(
-        state.read_reference(&listed[0].info.id).unwrap().body,
-        "# Guide\nBravo\n"
+        state
+            .read_reference(&listed[0].info.id)
+            .unwrap()
+            .as_text(),
+        Some("# Guide\nBravo\n")
     );
     context.synchronize_state(&after).unwrap();
     let items = context.content(128).unwrap().items;
@@ -210,7 +213,7 @@ async fn short_markdown_refresh_patches_model_context_without_rewriting_owner_or
     );
     assert!(
         matches!(items.last(), Some(ContentItem::State(StateFrame::StatePatch { set, .. }))
-        if set.get("references") == Some(&after["references"]))
+        if set.get("docs") == Some(&after["docs"]))
     );
 }
 
@@ -255,15 +258,19 @@ async fn local_paths_and_glob_deduplicate_parse_expand_and_refresh_atomically() 
     let listed = catalog.list().unwrap();
     assert_eq!(listed.len(), 3);
     let preamble = catalog.read(&listed[0].id).unwrap().unwrap();
-    assert_eq!(preamble.body, "前言🌊\n");
-    assert_eq!(projection[0]["char_length"], preamble.body.chars().count());
+    assert_eq!(preamble.as_text().unwrap(), "前言🌊\n");
+    assert_eq!(
+        projection[0]["char_length"],
+        preamble.as_text().unwrap().chars().count()
+    );
     assert!(catalog.read("unknown").unwrap().is_none());
     assert!(
         catalog
             .read(&listed[1].id)
             .unwrap()
             .unwrap()
-            .body
+            .as_text()
+            .unwrap()
             .starts_with("# Main")
     );
     assert!(
@@ -271,7 +278,8 @@ async fn local_paths_and_glob_deduplicate_parse_expand_and_refresh_atomically() 
             .read(&listed[2].id)
             .unwrap()
             .unwrap()
-            .body
+            .as_text()
+            .unwrap()
             .starts_with("## Detail")
     );
     let other = MarkdownReferences::new("memory", sources, Some(host));
@@ -312,7 +320,10 @@ async fn host_paging_respects_shipped_line_caps_and_rejects_document_overflow() 
     catalog.load().await.unwrap();
     let listed = catalog.list().unwrap();
     assert_eq!(listed.len(), 1);
-    assert_eq!(catalog.read(&listed[0].id).unwrap().unwrap().body, body);
+    assert_eq!(
+        catalog.read(&listed[0].id).unwrap().unwrap().as_text().unwrap(),
+        body
+    );
     let before = catalog.change().unwrap();
     std::fs::write(&path, format!("# Too big\n{}", "x\n".repeat(600_000))).unwrap();
     assert!(catalog.load().await.is_err());
@@ -373,10 +384,10 @@ async fn directory_url_loads_only_quoted_same_origin_direct_markdown_children() 
             catalog
                 .read(&entry.id)
                 .unwrap()
-                .filter(|content| content.body.contains("Hello"))
+                .filter(|content| content.as_text().unwrap().contains("Hello"))
         })
         .unwrap();
-    assert!(body.body.contains("é🌊"));
+    assert!(body.as_text().unwrap().contains("é🌊"));
     let snapshot = catalog.change().unwrap();
     server.set("/docs/one.md", 500, "failed");
     assert!(catalog.load().await.is_err());

@@ -74,35 +74,6 @@ impl From<Response> for ResponseOutcome {
 /// Object-safe model calls preserve the caller's auditor, variables and cancellation.
 #[async_trait]
 pub trait Client: Send + Sync + 'static {
-    /// Maximum attempts for a fresh HTTPS tool image, including the URL and
-    /// optional inline attempts. Zero means the route cannot do this safely.
-    fn public_https_image_attempts(&self) -> u8 {
-        0
-    }
-
-    /// A mutable router may return an immutable route for one authorized image.
-    fn pin_public_https_image_route(&self) -> Option<std::sync::Arc<dyn Client>> {
-        None
-    }
-
-    /// One actual provider attempt, with no retry policy wrapped around it.
-    async fn stream_public_https_image_attempt(
-        &self,
-        content: &Content,
-        auditor: &dyn Auditor,
-        variables: &dyn VariableView,
-        cancellation: CancellationToken,
-        events: Option<Sender<ModelEvent>>,
-    ) -> Result<ResponseOutcome, Error> {
-        if self.public_https_image_attempts() == 0 {
-            return Err(Error::config(
-                "selected provider does not support public HTTPS tool images",
-            ));
-        }
-        self.stream_admitted_outcome(content, auditor, variables, cancellation, events)
-            .await
-    }
-
     /// Session calls this only for items already admitted to Context, before the
     /// next provider request or immediately after an actual response/result append.
     /// The producer is the successful transport attempt, never a body/round guess.

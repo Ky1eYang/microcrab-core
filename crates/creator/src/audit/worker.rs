@@ -286,7 +286,6 @@ impl Auditor for NativeAuditor {
         let prepared_event = event == Moment::RequestPrepared;
         let has_sent_body = body.sent_request.is_some();
         let protected_tool_call_ids = body.protected_tool_call_ids;
-        let authored_image_arguments = body.authored_image_arguments;
         let tool_execution_id = body.tool_execution_id;
         let complete = body.outcome.is_some();
         let call = body.call_id.clone();
@@ -338,9 +337,6 @@ impl Auditor for NativeAuditor {
             if let Some(execution_id) = tool_execution_id {
                 value["tool_execution_id"] = serde_json::json!(execution_id);
             }
-            if event == Moment::ToolCall && authored_image_arguments {
-                value["authored_image_arguments"] = serde_json::json!(true);
-            }
             let anchor = self
                 .anchor
                 .lock()
@@ -349,9 +345,6 @@ impl Auditor for NativeAuditor {
                 .scopes
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
-            if event == Moment::ToolCall && authored_image_arguments {
-                value["producer_request_head"] = serde_json::json!(anchor.request_head);
-            }
             let key = serde_json::json!([
                 value["epoch"],
                 value["turn_id"],

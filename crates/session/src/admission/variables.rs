@@ -28,6 +28,7 @@ pub(crate) fn is_reserved_key(key: &str) -> bool {
             | "executions"
             | EXECUTION_CAPACITY_KEY
             | "tool_tasks"
+            | "references"
     )
 }
 

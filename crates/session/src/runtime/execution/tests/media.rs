@@ -58,7 +58,7 @@ async fn invalid_or_undeclared_native_media_and_excess_text_fail_explicitly() {
         (0, png(), 1, "ok"),
         (32, png(), 1, "ok"),
         (64, vec![1, 2, 3], 1, "ok"),
-        (64, png(), 2, "ok"),
+        (1024, png(), crate::admission::image::MAX_IMAGES_PER_TOOL_OUTPUT + 1, "ok"),
         (64, png(), 1, "excess text"),
     ] {
         let owner = ExecutionRegistry::new(Limits {

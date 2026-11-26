@@ -147,10 +147,7 @@ impl Reference for Catalog {
         Ok(vec![])
     }
     fn read(&self, id: &str) -> Result<Option<ReferenceContent>, Self::Error> {
-        Ok((id == "sample").then(|| ReferenceContent {
-            id: id.into(),
-            body: "actual reference body".into(),
-        }))
+        Ok((id == "sample").then(|| ReferenceContent::text(id, "actual reference body")))
     }
     fn change(&self) -> Result<Option<Value>, Self::Error> {
         Ok(Some(json!([{"id":"sample"}])))
@@ -179,9 +176,24 @@ async fn native_builtins_override_guest_defaults_but_user_rules_win_and_expand_r
         .build()
         .unwrap();
     assert!(session.state_view().unwrap().get("permission").is_none());
-    for name in ["delegate", "expand", "sleep"] {
+    for name in ["delegate", "sleep"] {
         assert_eq!(row(&session, name)["action"], "allow");
     }
+    let reference_row = row(&session, "reference");
+    assert_eq!(reference_row["kind"], "conditional");
+    let reference_policy: CompiledToolPolicy = serde_json::from_value(reference_row).unwrap();
+    assert_eq!(
+        evaluate_compiled(&reference_policy, &json!({"action":"expand","id":"sample"})).unwrap(),
+        Action::Allow
+    );
+    assert_eq!(
+        evaluate_compiled(
+            &reference_policy,
+            &json!({"action":"add","source":{"type":"https","url":"https://example.com"}})
+        )
+        .unwrap(),
+        Action::Ask
+    );
     let job = row(&session, "job");
     assert_eq!(job["kind"], "conditional");
     let job: CompiledToolPolicy = serde_json::from_value(job).unwrap();
@@ -209,9 +221,13 @@ async fn native_builtins_override_guest_defaults_but_user_rules_win_and_expand_r
             .is_empty(),
         "guest cannot declare defaults for native tool identities"
     );
-    model.call("expand-1", "expand", json!({"reference":"sample"}));
+    model.call(
+        "expand-1",
+        "reference",
+        json!({"action":"expand","id":"sample"}),
+    );
     session.submit("expand installed reference").await.unwrap();
-    assert!(session.messages().iter().any(|item| matches!(item, ContentItem::Tool { call_id, content, .. } if call_id == "expand-1" && content == "actual reference body")));
+    assert!(session.messages().iter().any(|item| matches!(item, ContentItem::Tool { call_id, content, .. } if call_id == "expand-1" && content.contains("actual reference body"))));
     edit(&session, vec![permission("sleep", Action::Deny)]);
     assert_eq!(row(&session, "sleep")["action"], "deny");
     let before = session.permission_controller().snapshot().unwrap();

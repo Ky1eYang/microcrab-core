@@ -30,7 +30,7 @@ pub fn check(kind: LimitKind, required: usize, budget: usize) -> Result<(), Erro
             | LimitKind::Processes
             | LimitKind::CachePoints
             | LimitKind::AttachmentCount
-            | LimitKind::PrivateVariableEntries
+            | LimitKind::LibraryStorageEntries
             | LimitKind::ImagePixels
             | LimitKind::ImageSide
             | LimitKind::InboxEntries

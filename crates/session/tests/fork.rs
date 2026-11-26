@@ -484,12 +484,9 @@ impl microcrab_session::Reference for StaticSkills {
         }])
     }
     fn read(&self, id: &str) -> Result<Option<microcrab_session::ReferenceContent>, Self::Error> {
-        Ok(
-            (id == "skill#fork").then(|| microcrab_session::ReferenceContent {
-                id: id.into(),
-                body: "Inherited reference body ✓".into(),
-            }),
-        )
+        Ok((id == "skill#fork").then(|| {
+            microcrab_session::ReferenceContent::text(id, "Inherited reference body ✓")
+        }))
     }
     fn change(&self) -> Result<Option<Value>, Self::Error> {
         Ok(Some(json!({"catalog": self.list()?})))
@@ -512,8 +509,8 @@ impl Client for ExpandInherited {
                 vec![ToolCall {
                     provider_metadata: None,
                     id: "fork-expand".into(),
-                    name: "expand".into(),
-                    arguments: json!({"reference":"skill#fork"}),
+                    name: "reference".into(),
+                    arguments: json!({"action":"expand","id":"skill#fork"}),
                 }]
             } else {
                 vec![]
@@ -527,9 +524,9 @@ async fn fork_without_reference_override_keeps_inherited_ids_expandable() {
     let runtime = || {
         Runtime::new(
             vec![ToolRegistration::Builtin(
-                microcrab_session::runtime::BuiltinTool::Expand,
+                microcrab_session::runtime::BuiltinTool::Reference,
             )],
-            Arc::new(AllowTools::new(["expand"])),
+            Arc::new(AllowTools::new(["reference"])),
         )
         .unwrap()
     };
@@ -559,8 +556,8 @@ async fn fork_without_reference_override_keeps_inherited_ids_expandable() {
             .state_handle()
             .read_reference("skill#fork")
             .unwrap()
-            .body,
-        "Inherited reference body ✓"
+            .as_text(),
+        Some("Inherited reference body ✓")
     );
     assert_eq!(target.state_handle().list_references().unwrap().len(), 1);
     target.submit("expand the inherited skill").await.unwrap();

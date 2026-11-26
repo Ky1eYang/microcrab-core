@@ -64,10 +64,7 @@ impl Reference for FocusedReferences {
             .0
             .iter()
             .find(|row| row.info.id == id)
-            .map(|row| ReferenceContent {
-                id: row.info.id.clone(),
-                body: row.body.clone(),
-            }))
+            .map(|row| ReferenceContent::text(row.info.id.clone(), row.body.clone())))
     }
     fn change(&self) -> Result<Option<Value>, Error> {
         Ok(Some(json!(

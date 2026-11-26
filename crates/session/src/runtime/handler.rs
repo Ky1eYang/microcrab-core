@@ -2,10 +2,7 @@
 use super::journal::RoundContinuation;
 use super::tool::{
     DialogueReplyOwner, DialogueReplyRegistration, ToolContext, ToolRegistration, ToolRegistry,
-    view_image,
 };
-
-mod image_media;
 pub(crate) mod permissions;
 use crate::ModelEvent;
 use crate::boundary::Boundary;
@@ -466,9 +463,9 @@ impl Runtime {
         let limits = state.snapshot().limits;
         limits.validate()?;
         super::execution::job::require_current_definition(context.frozen_tools())?;
-        view_image::require_current_definition(context.frozen_tools())?;
         let turn = cancellation.child_token();
         let _cancel = CancelOnDrop(turn.clone());
+        state.refresh_library(turn.clone()).await?;
         self.run_turn(
             state,
             context,
@@ -563,8 +560,6 @@ impl Runtime {
             .unwrap_or((1, 0, Usage::default()));
         let mut sending = true;
         let mut last_content = String::new();
-        let https = Arc::new(std::sync::Mutex::new(None));
-        let mut invalid_image = None;
         loop {
             if cancellation.is_cancelled() {
                 if prepared {
@@ -679,16 +674,11 @@ impl Runtime {
                     stop_reason,
                 });
             }
-            let pending_image = https
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .take();
-            let projecting_image = pending_image.is_some();
             if !prepared_request && let Err(error) = recorder.check_request(context) {
                 recorder
                     .record(
                         context,
-                        (!projecting_image).then(|| RoundContinuation {
+                        Some(RoundContinuation {
                             next_round: round,
                             unattended_rounds: unattended,
                             usage: usage.clone(),
@@ -711,11 +701,7 @@ impl Runtime {
             let mut content = context.content(limits.max_output_tokens)?;
             content.turn_id = state.snapshot().turn_id;
             content.round = Some(round as u64);
-            let usage_request = if projecting_image {
-                None
-            } else {
-                context.capture_usage_request(recorder.request_route(&content)?)?
-            };
+            let usage_request = context.capture_usage_request(recorder.request_route(&content)?)?;
             let usage_auditor = UsageRequestAuditor {
                 inner: auditor,
                 rewritten: std::sync::atomic::AtomicBool::new(false),
@@ -725,16 +711,10 @@ impl Runtime {
             // wait even when an embedding Client does not observe its token.
             // Only this model wait and pure response validation certify no admitted batch.
             let candidate: Result<_, Error> = async {
-                let outcome = if let Some(pending_image) = pending_image {
-                    image_media::run(context, &mut content, pending_image, state, client, &usage_auditor, recorder, &cancellation, events.clone(), RoundContinuation {
-                        next_round: round, unattended_rounds: unattended - 1, usage: usage.clone(), request_prepared: true, state_observation_pending: false,
-                    }).await?
-                } else {
-                    tokio::select! { biased;
-                        _ = cancellation.cancelled() => Err(microcrab_transport::Error::Cancelled),
-                        result = client.stream_admitted_outcome(&content, &usage_auditor, state, cancellation.clone(), events.clone()) => result,
-                    }.map_err(Error::from)?
-                };
+                let outcome = tokio::select! { biased;
+                    _ = cancellation.cancelled() => Err(microcrab_transport::Error::Cancelled),
+                    result = client.stream_admitted_outcome(&content, &usage_auditor, state, cancellation.clone(), events.clone()) => result,
+                }.map_err(Error::from)?;
                 let response = outcome.response;
                 if cancellation.is_cancelled() {
                     return Err(Error::Cancelled);
@@ -835,19 +815,18 @@ impl Runtime {
             let (response, attempt) = match candidate {
                 Ok(outcome) => outcome,
                 Err(error) => {
-                    if !projecting_image
-                        && (matches!(
-                            &error,
-                            Error::Cancelled
-                                | Error::ProviderStatus { .. }
-                                | Error::Transport
-                                | Error::TransportFailure(_)
-                                | Error::ProviderTimeout
-                                | Error::ProviderIdleTimeout(_)
-                                | Error::Provider(_)
-                                | Error::Protocol(_)
-                                | Error::Json(_)
-                        ) || matches!(&error, Error::Limit(limit) if limit.is_pre_effect()))
+                    if matches!(
+                        &error,
+                        Error::Cancelled
+                            | Error::ProviderStatus { .. }
+                            | Error::Transport
+                            | Error::TransportFailure(_)
+                            | Error::ProviderTimeout
+                            | Error::ProviderIdleTimeout(_)
+                            | Error::Provider(_)
+                            | Error::Protocol(_)
+                            | Error::Json(_)
+                    ) || matches!(&error, Error::Limit(limit) if limit.is_pre_effect())
                     {
                         recorder
                             .record(
@@ -867,9 +846,6 @@ impl Runtime {
                 }
             };
             if cancellation.is_cancelled() {
-                if projecting_image {
-                    return Err(Error::Cancelled);
-                }
                 recorder
                     .record(
                         context,
@@ -951,28 +927,16 @@ impl Runtime {
                     &cancellation,
                 )
                 .await?;
-                let malformed = self
-                    .execute_calls(
-                        state,
-                        context,
-                        &response,
-                        auditor,
-                        &cancellation,
-                        recorder,
-                        client,
-                        &https,
-                    )
-                    .await?;
-                invalid_image = match (invalid_image, malformed) {
-                    (Some((old, count)), Some(current)) if old == current => {
-                        Some((current, count + 1_u8))
-                    }
-                    (_, Some(current)) => Some((current, 1)),
-                    _ => None,
-                };
-                if invalid_image.as_ref().is_some_and(|(_, count)| *count >= 3) {
-                    stop_reason = TurnStopReason::RepeatedInvalidToolArguments;
-                }
+                self.execute_calls(
+                    state,
+                    context,
+                    &response,
+                    auditor,
+                    &cancellation,
+                    recorder,
+                    client,
+                )
+                .await?;
                 crate::observation::hooks::boundary(
                     auditor,
                     state,
@@ -991,28 +955,10 @@ impl Runtime {
             if let Some(control) = self.controls() {
                 control.apply_pending_mode()?;
             }
-            if stop_reason == TurnStopReason::RepeatedInvalidToolArguments {
-                recorder.record(context, None).await?;
-                return Ok(TurnOutcome {
-                    content: last_content,
-                    rounds: round,
-                    usage,
-                    stop_reason,
-                });
-            }
             let next_round = round.checked_add(1).ok_or_else(|| {
                 crate::budget::reject(crate::LimitKind::Arithmetic, "round ordinal overflow")
             })?;
-            let pending_archive = https
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .is_some();
-            if sending && pending_archive {
-                // Persist the settled receipt without certifying a provider retry:
-                // the fresh source is invocation-local and cannot be replayed.
-                recorder.record(context, None).await?;
-            }
-            if sending && !pending_archive {
+            if sending {
                 recorder
                     .record(
                         context,
@@ -1026,22 +972,20 @@ impl Runtime {
                     )
                     .await?;
             }
-            if !pending_archive {
-                recorder
-                    .compact_boundary(
-                        context,
-                        sending.then(|| RoundContinuation {
-                            next_round,
-                            unattended_rounds: unattended,
-                            usage: usage.clone(),
-                            request_prepared: false,
-                            state_observation_pending: false,
-                        }),
-                        !sending,
-                        &cancellation,
-                    )
-                    .await?;
-            }
+            recorder
+                .compact_boundary(
+                    context,
+                    sending.then(|| RoundContinuation {
+                        next_round,
+                        unattended_rounds: unattended,
+                        usage: usage.clone(),
+                        request_prepared: false,
+                        state_observation_pending: false,
+                    }),
+                    !sending,
+                    &cancellation,
+                )
+                .await?;
             round = next_round;
         }
     }
@@ -1059,9 +1003,7 @@ impl Runtime {
         cancellation: &CancellationToken,
         recorder: &impl RoundRecorder,
         client: &dyn Client,
-        https: &Arc<std::sync::Mutex<Option<view_image::PendingHttps>>>,
-    ) -> Result<Option<String>, Error> {
-        let mut malformed_image = None;
+    ) -> Result<(), Error> {
         let limits = state.snapshot().limits;
         let tool_registry = self.registry();
         // The assistant was appended before entering this batch; execution order
@@ -1109,20 +1051,8 @@ impl Runtime {
                     Instant::now(),
                 )
             });
-            let authored_image_arguments = (normalized.name == view_image::NAME
-                && tool_registry.origin(&normalized.name)
-                    == Some(super::tool::ToolOrigin::Builtin))
-            .then(|| normalized.arguments.clone());
-            let image_source = authored_image_arguments.as_ref().map(|arguments| {
-                view_image::bind_dispatch(arguments, state, limits.max_context_bytes).map(Arc::new)
-            });
-            if response.tool_calls.len() == 1
-                && let Some(Err(error)) = &image_source
-            {
-                malformed_image = image_media::malformed_key(&normalized.arguments, error);
-            }
             let mut expansion_error = None;
-            if prepared.is_none() && image_source.is_none() {
+            if prepared.is_none() {
                 let injection = crate::observation::hooks::intervene_recorded(
                     auditor,
                     state,
@@ -1150,11 +1080,14 @@ impl Runtime {
                 // Visible expansion is a derived copy. Context and the ToolCall audit
                 // retain the authored or hook-replaced placeholders.
                 if !tool_registry.uses_literal_sources(&normalized) {
-                    match super::tool::injection::expand_visible(
+                    match super::tool::injection::expand_dispatch(
                         &normalized.arguments,
-                        &state.injection_view(),
+                        state,
                         limits.max_context_bytes,
-                    ) {
+                        cancellation,
+                    )
+                    .await
+                    {
                         Ok((arguments, mask)) => {
                             if normalized.name == "job"
                                 && super::execution::job::is_redirect(&arguments)
@@ -1297,32 +1230,8 @@ impl Runtime {
                 mode,
             );
             let mut invocation = invocation;
-            let image_bound = image_source.is_some();
-            let image_error = match image_source {
-                Some(Ok(source)) => {
-                    if matches!(source.as_ref(), view_image::Source::Https(_))
-                        && client.public_https_image_attempts() > 0
-                    {
-                        invocation.image_model = client.pin_public_https_image_route();
-                        invocation.image_https = Some(https.clone());
-                    }
-                    if let Some(authored) = &authored_image_arguments {
-                        invocation.image_approval_preview =
-                            Some(view_image::approval_preview(authored, &source));
-                    }
-                    invocation.image_source = Some(source);
-                    None
-                }
-                Some(Err(error)) => Some(error),
-                None => None,
-            };
-            let action_error = image_error
-                .or(expansion_error)
-                .or_else(|| {
-                    (!image_bound)
-                        .then(|| tool_registry.clone().validate(call).err())
-                        .flatten()
-                })
+            let action_error = expansion_error
+                .or_else(|| tool_registry.clone().validate(call).err())
                 .or_else(|| {
                     if call.name == "job" {
                         crate::runtime::execution::job::validate(&call.arguments)
@@ -1364,43 +1273,10 @@ impl Runtime {
                 executions.admit_detached(descriptor, invocation.cancellation.clone())?;
             invocation.execution_id = Some(reserved);
             executions.mark(reserved, super::execution::ExecutionStatus::Waiting);
-            if let Some(arguments) = authored_image_arguments {
-                // A bound image is not a rewrite hook: publish only the safe
-                // authored evidence, correlated before permission or Host effects.
-                let snapshot = state.snapshot();
-                auditor.publish(
-                    Moment::ToolCall,
-                    AuditBody {
-                        epoch: snapshot.epoch_id,
-                        turn_id: snapshot.turn_id,
-                        round: snapshot.round_id,
-                        tool_call_id: Some(call.id.clone()),
-                        tool_execution_id: Some(reserved.0),
-                        started_at_unix_ms: clock.0,
-                        authored_image_arguments: true,
-                        tool_presentation: tool_registry.interaction_presentation(&call.name),
-                        payload: HookPayload::ToolCall {
-                            name: call.name.clone(),
-                            arguments,
-                        },
-                        ..Default::default()
-                    },
-                );
-            }
             recorder.record_task_admission(context).await?;
             let invocation_cancellation = invocation.cancellation.clone();
             let issuer = context.review_issuer(1024);
-            // The sealed policy/dispatch arguments preserve the exact bound
-            // source witness. They never replace Context, audit or descriptor data.
-            let image_policy_call =
-                invocation
-                    .image_source
-                    .as_ref()
-                    .map(|source| microcrab_protocol::ToolCall {
-                        arguments: source.policy_arguments(),
-                        ..call.clone()
-                    });
-            let dispatch_call = image_policy_call.as_ref().unwrap_or(call);
+            let dispatch_call = call;
             #[cfg(feature = "wasm")]
             let action_error = match action_error {
                 Some(error) => Some(error),
@@ -1706,7 +1582,7 @@ impl Runtime {
             executions.acknowledge_result_delivered(reserved);
             recorder.observe_context(context)?;
         }
-        Ok(malformed_image)
+        Ok(())
     }
 }
 

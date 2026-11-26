@@ -556,69 +556,6 @@ impl Context {
         Ok(())
     }
 
-    /// Retain the Server copy as an append-only framework carrier after the
-    /// original tool receipt. A projected URL never reaches this method.
-    pub(crate) fn append_retained_tool_image(
-        &mut self,
-        call_id: &str,
-        item: ContentItem,
-    ) -> Result<(), Error> {
-        self.require_settled()?;
-        let ContentItem::User {
-            parts,
-            source: Some(UserSource::Framework),
-            envelope: Some(CarrierEnvelopeVersion::RetainedToolImage { call_id: related }),
-        } = &item
-        else {
-            return Err(Error::protocol("invalid retained tool image carrier"));
-        };
-        let mut recent = self
-            .items
-            .iter()
-            .rev()
-            .take_while(|item| !matches!(item, ContentItem::Assistant { .. }));
-        let mut found = false;
-        for item in &mut recent {
-            match item {
-                ContentItem::User {
-                    envelope: Some(CarrierEnvelopeVersion::RetainedToolImage { call_id: existing }),
-                    ..
-                } if existing == call_id => {
-                    return Err(Error::protocol("retained tool image already settled"));
-                }
-                ContentItem::Tool {
-                    call_id: observed,
-                    content,
-                    ..
-                } if observed == call_id && is_pending_https_image(content) => found = true,
-                _ => {}
-            }
-        }
-        if related != call_id
-            || !matches!(
-                parts.as_slice(),
-                [
-                    InputPart::Text { .. },
-                    InputPart::Image {
-                        source: microcrab_protocol::ImageSource::Data { .. }
-                    }
-                ]
-            )
-            || !found
-        {
-            return Err(Error::protocol(
-                "retained tool image has no corresponding result",
-            ));
-        }
-        crate::admission::image::validate_tool_parts(&parts[1..])?;
-        self.items.push(item);
-        if let Err(error) = self.check_budget(&self.items) {
-            self.items.pop();
-            return Err(error);
-        }
-        Ok(())
-    }
-
     fn validate_content(&self, max_output_tokens: u32) -> Result<(), Error> {
         self.require_settled()?;
         if max_output_tokens == 0 {
@@ -848,10 +785,6 @@ impl Context {
         let bytes = measurement::budget_bytes(&self.system, items, &self.tools)?.len();
         crate::budget::check(crate::LimitKind::ContextBytes, bytes, self.max_bytes)
     }
-}
-
-pub(crate) fn is_pending_https_image(content: &str) -> bool {
-    content == r#"{"source_kind":"https","status":"awaiting_provider_and_archive"}"#
 }
 
 pub(crate) fn validate_response(
@@ -1120,9 +1053,9 @@ mod protocol_epoch_tests {
     }
 
     #[test]
-    fn recovery_refresh_preserves_frozen_expand_schema_and_checks_budget_atomically() {
-        let mut tool = crate::runtime::tool::expand::Expand::definition();
-        tool.parameters["oneOf"] = json!([{"required":["ids"]},{"required":["reference"]}]);
+    fn recovery_refresh_preserves_frozen_reference_schema_and_checks_budget_atomically() {
+        let mut tool = crate::runtime::tool::reference::Reference::definition();
+        tool.parameters["oneOf"] = json!([{"required":["action"]}]);
         let mut context = Context::new("system".into(), vec![tool], 65536).unwrap();
         context
             .admit_user(

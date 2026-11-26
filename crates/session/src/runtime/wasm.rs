@@ -11,7 +11,7 @@
 
 mod authority;
 mod capability;
-mod private_bytes;
+mod references;
 pub use capability::ComponentCapability;
 #[cfg(test)]
 mod cleanup_tests;
@@ -132,7 +132,7 @@ struct Compiled {
     host: Option<Arc<dyn Host>>,
     host_info_json: Result<String, String>,
     file_versions: bool,
-    private_bytes: bool,
+    references: bool,
     observes: bool,
     evidence_component: String,
     // Unique registered component/Host binding; code hashes are descriptive only.
@@ -312,7 +312,7 @@ fn load_agent(bytes: &[u8], limits: WasmLimits, host: Arc<dyn Host>) -> Result<W
                 None
             }
             "buffer" if matches!(&import.ty, ComponentItem::Resource(_)) => None,
-            private_bytes::INTERFACE if private_bytes::valid_import(&import.ty, &engine) => None,
+            references::INTERFACE if references::valid_import(&import.ty, &engine) => None,
             guest_observation::INTERFACE | guest_observation::BROWSER_INTERFACE
                 if guest_observation::valid_import(name, &import.ty, &engine) => None,
             HOST_INTERFACE
@@ -473,7 +473,7 @@ fn load_agent(bytes: &[u8], limits: WasmLimits, host: Arc<dyn Host>) -> Result<W
             value.checked_add(1)
         })
         .map_err(|_| Error::wasm("component admission identities exhausted"))?;
-    let private_bytes = component_type.imports(&engine).any(|(name, _)| name == private_bytes::INTERFACE);
+    let references = component_type.imports(&engine).any(|(name, _)| name == references::INTERFACE);
     let observes = component_type.imports(&engine).any(|(name, _)| {
         matches!(name, guest_observation::INTERFACE | guest_observation::BROWSER_INTERFACE)
     });
@@ -487,7 +487,7 @@ fn load_agent(bytes: &[u8], limits: WasmLimits, host: Arc<dyn Host>) -> Result<W
         host: Some(host),
         host_info_json,
         file_versions,
-        private_bytes,
+        references,
         observes,
         evidence_component,
         admission_identity: format!("wasm-instance:{admission_id}"),
@@ -517,9 +517,7 @@ fn load_agent(bytes: &[u8], limits: WasmLimits, host: Arc<dyn Host>) -> Result<W
             {
                 return Err(Error::wasm("connection handoff requires scoped Web Transport"));
             }
-            if bindings.web.is_some() && !compiled.has_capability(ComponentCapability::WebTransport)
-                || bindings.private_bytes.is_some() && !compiled.private_bytes
-            {
+            if bindings.web.is_some() && !compiled.has_capability(ComponentCapability::WebTransport) {
                 return Err(Error::wasm("tool capability bindings require the matching import"));
             }
             bindings.validate()?;
@@ -692,7 +690,7 @@ struct RuntimeState {
     operation_scope: Option<(String, Value)>,
     // Present only during the admitted invoke export, never init, describe or drive.
     web: Option<web_transport::Invocation>,
-    private_bytes: Option<private_bytes::Ingress>,
+    references: Option<references::Ingress>,
     guest_observation: Option<(Arc<guest_observation::Scope>, Phase)>,
     // Handles minted by the current authorized process execution only.
     borrowed_processes: HashSet<u64>,
@@ -869,7 +867,7 @@ impl Drop for InvocationScope<'_> {
         state.tool_context = None;
         state.operation_scope = None;
         state.web = None;
-        state.private_bytes = None;
+        state.references = None;
         state.guest_observation = None;
         state.process_grants.clear();
         state.admitted_process_scope = None;
@@ -968,7 +966,7 @@ impl Compiled {
                 tool_context: None,
                 operation_scope: None,
                 web: None,
-                private_bytes: None,
+                references: None,
                 guest_observation: self.observation_scope(Phase::Instantiate, None).map(|scope| (scope, Phase::Instantiate)),
                 borrowed_processes: HashSet::new(),
                 admitted_process_scope: None,
@@ -1017,6 +1015,9 @@ impl Compiled {
         if self.observes {
             guest_observation::link(&mut linker).map_err(|error| boundary.failure(error, Phase::Instantiate))?;
         }
+        if self.references {
+            references::link(&mut linker).map_err(|error| boundary.failure(error, Phase::Instantiate))?;
+        }
         if self.host.is_some() {
             linker
                 .instance("microcrab:host/types@0.1.0")
@@ -1037,9 +1038,6 @@ impl Compiled {
                 .map_err(|error| {
                     boundary.failure(error, crate::observation::wasm::Phase::Instantiate)
                 })?;
-            private_bytes::link(&mut linker).map_err(|error| {
-                boundary.failure(error, Phase::Instantiate)
-            })?;
             communication::add_typed_to_linker(&mut linker).map_err(|error| {
                 boundary.failure(error, crate::observation::wasm::Phase::Instantiate)
             })?;
@@ -1587,10 +1585,11 @@ impl WasmTool {
             None
         };
         self.bindings.bind_exact(&invocation, &effective_arguments)?;
-        let ingress = self.bindings.private_bytes.as_ref().map(|pointer| {
-            let name = pointer.bind(&invocation, &effective_arguments)?;
-            private_bytes::Ingress::new(&invocation, name)
-        }).transpose()?;
+        let ingress = if compiled.references {
+            Some(references::Ingress::new(&invocation, &cancellation).await?)
+        } else {
+            None
+        };
         let observation = compiled.observation_scope(Phase::Invoke, Some(&invocation));
         let start_after_adoption = invocation.state.is_attached();
         let driver_scope = driver::Scope::capture(&invocation, observation.clone());
@@ -1614,7 +1613,7 @@ impl WasmTool {
                         Some((name.clone(), effective_arguments)),
                         |bindings, store, boundary| {
                             store.data_mut().guest_observation = observation.map(|scope| (scope, Phase::Invoke));
-                            store.data_mut().private_bytes = ingress;
+                            store.data_mut().references = ingress.clone();
                             store.data_mut().web = web.map(|mut invocation| {
                                 invocation.enter();
                                 invocation
@@ -1654,13 +1653,13 @@ impl WasmTool {
                                 web_transport.guest_returned(success);
                             }
                             if success {
-                                staged_bytes = store.data_mut().private_bytes.as_mut().and_then(private_bytes::Ingress::take);
+                                staged_bytes = store.data_mut().references.as_mut().and_then(references::Ingress::take);
                             }
                             Ok(prepared)
                         },
                     )?;
                     if let Some(staged) = staged_bytes {
-                        let context = commit_context.as_ref().ok_or_else(|| Error::denied("private Bytes admission missing"))?;
+                        let context = commit_context.as_ref().ok_or_else(|| Error::denied("references admission missing"))?;
                         let commit_cancel = cancellation.child_token();
                         runtime.block_on(async {
                             let commit = staged.commit(context, &commit_cancel);

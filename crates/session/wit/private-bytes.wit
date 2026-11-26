@@ -1,7 +1,0 @@
-package microcrab:session@0.2.1;
-
-/// Write-only ingress for a bounded ephemeral image in the current root Session.
-/// The submitted name must be the exact destination of the admitted tool call.
-interface private-bytes {
-  create: func(name: string, media-type: string, data: list<u8>) -> result<_, string>;
-}

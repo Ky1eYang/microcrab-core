@@ -513,7 +513,7 @@ pub(super) mod tests {
             tool_context: invoked.then_some(invocation),
             operation_scope: invoked.then(|| ("read".into(), json!({"path": "allowed"}))),
             web: None,
-            private_bytes: None,
+            references: None,
             guest_observation: None,
             confinement_diagnostic: None,
             operation_cancelled: false,

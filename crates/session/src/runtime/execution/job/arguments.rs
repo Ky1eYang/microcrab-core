@@ -15,7 +15,7 @@ pub(crate) struct Arguments<'a> {
 pub(super) struct Redirect<'a> {
     pub(super) channel: &'a str,
     pub(super) expected_mime: &'a str,
-    pub(super) variable: &'a str,
+    pub(super) title: Option<&'a str>,
 }
 
 pub(crate) fn is_redirect(arguments: &Value) -> bool {
@@ -117,12 +117,10 @@ pub(crate) fn validate(arguments: &Value) -> Result<Arguments<'_>, Error> {
         let object = arguments
             .get("args")
             .and_then(Value::as_object)
-            .ok_or_else(|| {
-                Error::tool("job redirect requires channel, expected_mime and variable")
-            })?;
-        if object.len() != 3 {
+            .ok_or_else(|| Error::tool("job redirect requires channel and expected_mime"))?;
+        if object.len() < 2 || object.len() > 3 {
             return Err(Error::tool(
-                "job redirect requires only channel, expected_mime and variable",
+                "job redirect accepts only channel, expected_mime, and optional title",
             ));
         }
         let channel = object
@@ -135,15 +133,23 @@ pub(crate) fn validate(arguments: &Value) -> Result<Arguments<'_>, Error> {
             .and_then(Value::as_str)
             .filter(|mime| microcrab_agent_types::is_capture_mime(mime))
             .ok_or_else(|| Error::tool("job redirect requires a canonical concrete MIME type"))?;
-        let variable = object
-            .get("variable")
-            .and_then(Value::as_str)
-            .filter(|name| microcrab_protocol::valid_secret_key(name))
-            .ok_or_else(|| Error::tool("job redirect requires a literal Bytes variable name"))?;
+        let title = match object.get("title") {
+            Some(raw) => {
+                let text = raw
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty() && s.chars().count() <= 256 && !s.contains('\0'))
+                    .ok_or_else(|| {
+                        Error::tool("job redirect title must be 1..=256 non-NUL characters")
+                    })?;
+                Some(text)
+            }
+            None => None,
+        };
         Some(Redirect {
             channel,
             expected_mime,
-            variable,
+            title,
         })
     } else {
         None
@@ -156,7 +162,7 @@ pub(crate) fn validate(arguments: &Value) -> Result<Arguments<'_>, Error> {
         "read" => &["cursor", "max_bytes"],
         "wait" => &["revision"],
         "write" => &["data", "eof"],
-        super::REDIRECT => &["channel", "expected_mime", "variable"],
+        super::REDIRECT => &["channel", "expected_mime", "title"],
         _ => &[],
     };
     if object.keys().any(|key| !allowed.contains(&key.as_str())) {

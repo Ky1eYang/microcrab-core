@@ -414,7 +414,6 @@ impl SessionInner {
             .references
             .validate_variables(&recover.state.variables)?;
         crate::runtime::execution::job::require_current_definition(&recover.context.tools)?;
-        crate::runtime::tool::view_image::require_current_definition(&recover.context.tools)?;
         let managed = self
             .model_admission
             .as_ref()
@@ -431,10 +430,6 @@ impl SessionInner {
             managed.is_some_and(|tool| frozen == tool)
                 || definitions.iter().any(|installed| {
                     installed == frozen
-                        || (frozen.name == "expand"
-                            && self.runtime.origin(&frozen.name)
-                                == Some(crate::runtime::tool::ToolOrigin::Builtin)
-                            && Self::prior_expand_definition(frozen, installed))
                         || (frozen.name == "delegate"
                             && self.runtime.origin(&frozen.name)
                                 == Some(crate::runtime::tool::ToolOrigin::Builtin)
@@ -651,26 +646,10 @@ impl SessionInner {
         &previous == frozen
     }
 
-    fn prior_expand_definition(
-        frozen: &microcrab_protocol::ToolDefinition,
-        installed: &microcrab_protocol::ToolDefinition,
-    ) -> bool {
-        let mut previous = installed.clone();
-        previous.parameters["oneOf"] = serde_json::json!([
-            {"required":["ids"]}, {"required":["reference"]}
-        ]);
-        frozen == &previous
-    }
-
-    fn refresh_required(&self, recover: &Recover) -> bool {
+    fn refresh_required(&self, _recover: &Recover) -> bool {
         self.route
             .as_ref()
             .is_some_and(|route| route.refresh_context_on_restore())
-            || recover
-                .context
-                .tools
-                .iter()
-                .any(|tool| tool.name == "expand" && tool.parameters.get("oneOf").is_some())
     }
 
     fn validate_recovered_model_context(

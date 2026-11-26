@@ -78,6 +78,10 @@ impl<Stamp> Default for Cache<Stamp> {
 /// witnesses matches a previously verified node or the callback succeeds.
 /// Progress on a budget-limited read is reusable, but never returned as proof.
 impl<Stamp: Eq> Cache<Stamp> {
+    pub(super) fn clear(&mut self) {
+        self.0.clear();
+    }
+
     pub(super) fn walk(
         &mut self,
         head: String,

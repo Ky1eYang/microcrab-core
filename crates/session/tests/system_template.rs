@@ -168,13 +168,12 @@ fn arbitrary_structured_agent_values_render_exactly_without_stringification_or_a
 
 fn assert_variable_injection_hint_is_rendered(rendered: &str) {
     assert_eq!(rendered.matches("**variable-injection**").count(), 1);
-    assert_eq!(rendered.matches("**private-bytes**").count(), 1);
+    assert_eq!(rendered.matches("**references**").count(), 1);
     for guidance in [
-        "If the producer advertises private byte capture",
-        "Never use job read for private bytes",
+        "Personal Content Library",
+        "never use job read for private binary output",
         "Release the source Job after redirect is confirmed",
-        r#"{"image_url":"{{var:base64:preview}}"}"#,
-        "Do not repeat the same invalid arguments",
+        "Dashboard -> 个人内容库",
     ] {
         assert!(rendered.contains(guidance), "{guidance}");
     }
@@ -186,9 +185,13 @@ fn assert_variable_injection_hint_is_rendered(rendered: &str) {
         "{{var:number:KEY:/a/b}}",
         "{{var:boolean:KEY}}",
         "{{secret:KEY}}",
-        "{{var:base64:KEY}}",
-        "{{var:base64:@<selector>}}",
-        "{{var:base64:preview}}",
+        "{{ref:ID}}",
+        "{{ref:ID:/a/b}}",
+        "{{ref:text:ID}}",
+        "{{ref:base64:ID}}",
+        "{{ref:data_url:ID}}",
+        "{{ref:json:ID}}",
+        "{{ref:string|number|boolean:ID:/a/b}}",
     ] {
         assert_eq!(rendered.matches(placeholder).count(), 1, "{placeholder}");
         without_grammar = without_grammar.replace(placeholder, "");

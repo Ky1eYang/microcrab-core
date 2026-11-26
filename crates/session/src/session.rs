@@ -498,6 +498,9 @@ impl Session {
             .replace_markdown_references(kind, sources, limits)
             .await
     }
+    pub async fn refresh_reference_library(&self) -> Result<(), Error> {
+        self.inner.refresh_reference_library().await
+    }
     /// Observe actually applied Runtime permissions without starting model admission.
     /// A successful list is a presentation snapshot, never an admission token.
     pub fn permission_list(

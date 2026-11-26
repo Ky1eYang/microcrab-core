@@ -121,4 +121,36 @@ impl SessionInner {
         self.ensure_open()?;
         self.state.replace_reference(reference)
     }
+
+    pub(crate) async fn refresh_reference_library(self: &Arc<Self>) -> Result<(), Error> {
+        self.ensure_open()?;
+        let _foreground = self
+            .foreground
+            .clone()
+            .try_lock_owned()
+            .map_err(|_| Error::Busy)?;
+        let _operation = self
+            .operation
+            .clone()
+            .try_lock_owned()
+            .map_err(|_| Error::Busy)?;
+        self.ensure_open()?;
+        let token = CancellationToken::new();
+        self.register_command_token(&token)?;
+        let _active = TurnGuard {
+            inner: self.clone(),
+            clear: false,
+        };
+        let _cancel = CancelOnDrop(token.clone());
+        tokio::select! { biased;
+            _ = token.cancelled() => return Err(Error::Cancelled),
+            result = tokio::time::timeout(
+                std::time::Duration::from_millis(self.state().limits.lifecycle_timeout_ms),
+                self.state.refresh_library(token.clone()),
+            ) => result.map_err(|_| Error::lifecycle("reference loading deadline"))??,
+        }
+        let _fence = self.endpoint.fence().await?;
+        self.ensure_open()?;
+        Ok(())
+    }
 }

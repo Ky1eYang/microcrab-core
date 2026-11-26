@@ -52,7 +52,7 @@ pub(super) fn allows_ordinary_import(name: &str, item: &ComponentItem, engine: &
                     || (matches!(name, "create" | "append" | "mark-truncated" | "finish" | "attach-guest")
                         && matches!(export.ty, ComponentItem::ComponentFunc(_)))))
         }
-        super::private_bytes::INTERFACE => super::private_bytes::valid_import(item, engine),
+        super::references::INTERFACE => super::references::valid_import(item, engine),
         super::guest_observation::INTERFACE | super::guest_observation::BROWSER_INTERFACE => {
             super::guest_observation::valid_import(name, item, engine)
         }

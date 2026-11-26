@@ -9,10 +9,12 @@ pub(crate) mod wasm;
 
 pub use crate::budget::Limits;
 pub use access::{
-    BytesVariableAvailability, BytesVariableKind, BytesVariableLifecycle, BytesVariableMetadata,
-    BytesWriteReceipt, PreparedBytesWrite, PreparedSecretWrite, State, VariableCommit,
-    VariableDescriptor, VariableInspection, VariableWitness,
+    PreparedSecretWrite, State, VariableCommit, VariableDescriptor, VariableInspection,
+    VariableWitness,
 };
-pub use reference::{DynReference, ListedReference, Reference, ReferenceContent, ReferenceInfo};
+pub use reference::{
+    DynReference, ListedReference, Reference, ReferenceContent, ReferenceInfo, ReferenceLibrary,
+    ReferencePayload,
+};
 pub use session::SessionState;
 pub use variables::Variables;

@@ -46,7 +46,6 @@ impl ArgumentPointer {
 #[serde(default, deny_unknown_fields)]
 pub(super) struct ToolBindings {
     pub(super) web: Option<WebBinding>,
-    pub(super) private_bytes: Option<ArgumentPointer>,
     pub(super) exact_arguments: Vec<ArgumentPointer>,
 }
 
@@ -71,9 +70,6 @@ impl ToolBindings {
             return Err(Error::wasm("too many exact capability argument bindings"));
         }
         for pointer in &self.exact_arguments {
-            pointer.validate()?;
-        }
-        if let Some(pointer) = &self.private_bytes {
             pointer.validate()?;
         }
         if let Some(web) = &self.web {

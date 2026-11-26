@@ -67,7 +67,7 @@ pub enum AuditOutcome {
 pub enum ToolPresentation {
     CodingFile,
     MessageReceipt,
-    ViewImage,
+    Reference,
 }
 
 /// Content supplied by the producer. The auditor adds sequence and the request diff.
@@ -86,8 +86,6 @@ pub struct AuditBody {
     pub tool_call_id: Option<String>,
     /// Exact runtime reservation for this tool observation, not the provider call ID.
     pub tool_execution_id: Option<u64>,
-    /// The producer supplied an explicitly sanitized authored image argument projection.
-    pub authored_image_arguments: bool,
     /// Live presentation metadata; not part of the canonical provider record.
     pub tool_presentation: Option<ToolPresentation>,
     pub payload: HookPayload,

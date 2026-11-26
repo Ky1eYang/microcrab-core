@@ -155,7 +155,7 @@ impl NativeChildFactory {
         };
         registrations.extend(external.into_iter().map(ToolRegistration::External));
         registrations.extend([
-            ToolRegistration::Builtin(BuiltinTool::Expand),
+            ToolRegistration::Builtin(BuiltinTool::Reference),
             ToolRegistration::Builtin(BuiltinTool::Job),
             ToolRegistration::Builtin(BuiltinTool::Sleep),
             ToolRegistration::Builtin(BuiltinTool::SwitchMode),

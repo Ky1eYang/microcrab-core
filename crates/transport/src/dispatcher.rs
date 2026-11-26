@@ -95,14 +95,6 @@ impl TransportClient {
 
 #[async_trait::async_trait]
 impl Client for TransportClient {
-    fn public_https_image_attempts(&self) -> u8 {
-        if matches!(self, Self::OpenAiCompatible(_) | Self::OpenAiResponses(_)) {
-            2
-        } else {
-            0
-        }
-    }
-
     async fn complete(
         &self,
         content: &Content,

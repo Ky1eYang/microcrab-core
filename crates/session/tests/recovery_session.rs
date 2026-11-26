@@ -284,97 +284,43 @@ impl Journal for ExactRecoveryJournal {
 }
 
 #[tokio::test]
-async fn recovery_rebuilds_old_expand_catalog_without_changing_external_tool_authority() {
-    fn runtime_with_expand(effects: Arc<AtomicUsize>) -> Runtime {
+async fn recovery_preserves_builtin_reference_catalog() {
+    let effects = Arc::new(AtomicUsize::new(0));
+    let runtime = || {
         Runtime::new(
             vec![
-                ToolRegistration::Builtin(microcrab_session::runtime::BuiltinTool::Expand),
+                ToolRegistration::Builtin(microcrab_session::runtime::BuiltinTool::Reference),
                 ToolRegistration::External(Arc::new(Effect {
-                    calls: effects,
+                    calls: effects.clone(),
                     path: None,
                 })),
             ],
-            Arc::new(AllowTools::new(["effect", "expand"])),
+            Arc::new(AllowTools::new(["effect", "reference"])),
         )
         .unwrap()
-    }
-    let effects = Arc::new(AtomicUsize::new(0));
+    };
     let source = Session::builder(
         Script::new(vec![Ok(request_effect()), Ok(answer("done"))]),
-        runtime_with_expand(effects.clone()),
+        runtime(),
     )
     .build()
     .unwrap();
     source.submit("effect once").await.unwrap();
-    let mut historical = source.checkpoint().await.unwrap();
-    let expand = historical
-        .context
-        .tools
-        .iter_mut()
-        .find(|tool| tool.name == "expand")
-        .unwrap();
-    expand.parameters["oneOf"] = json!([{"required":["ids"]},{"required":["reference"]}]);
+    let historical = source.checkpoint().await.unwrap();
     historical.validate().unwrap();
-    let frozen = serde_json::to_vec(&historical).unwrap();
     let session_id = source.process_control().session_id().to_owned();
     source.close().await.unwrap();
-    for initial in [false, true] {
-        let builder = Session::builder(Script::new(vec![]), runtime_with_expand(effects.clone()))
-            .session_id(session_id.clone());
-        let session = if initial {
-            Session::restore(builder, historical.clone()).await.unwrap()
-        } else {
-            // Replacement must belong to the selected Session, not a freshly
-            // minted independent communication identity.
-            let session = Session::restore(builder, historical.clone()).await.unwrap();
-            session.recover(historical.clone()).await.unwrap();
-            session
-        };
-        let live = session.context_snapshot().unwrap();
-        assert_eq!(live.epoch, historical.context.epoch + 1);
-        assert!(!live.pending_epoch);
-        assert!(
-            live.tools
-                .iter()
-                .find(|tool| tool.name == "expand")
-                .unwrap()
-                .parameters
-                .get("oneOf")
-                .is_none()
-        );
-        assert_eq!(
-            live.historical_tools.get(&historical.context.epoch),
-            Some(&historical.context.tools)
-        );
-        assert_eq!(
-            live.tools.iter().find(|tool| tool.name == "effect"),
-            historical
-                .context
-                .tools
-                .iter()
-                .find(|tool| tool.name == "effect")
-        );
-        live.validate().unwrap();
-        assert_eq!(effects.load(Ordering::SeqCst), 1);
-        assert_eq!(serde_json::to_vec(&historical).unwrap(), frozen);
-        session.close().await.unwrap();
-    }
-    let mut unsupported = historical;
-    unsupported
-        .context
-        .tools
-        .iter_mut()
-        .find(|tool| tool.name == "expand")
-        .unwrap()
-        .parameters["oneOf"] = json!([{"required":["ids"]}]);
-    assert!(
-        Session::restore(
-            Session::builder(Script::new(vec![]), runtime_with_expand(effects)),
-            unsupported
-        )
-        .await
-        .is_err()
-    );
+    let restored = Session::restore(
+        Session::builder(Script::new(vec![]), runtime()).session_id(session_id),
+        historical.clone(),
+    )
+    .await
+    .unwrap();
+    let live = restored.context_snapshot().unwrap();
+    assert_eq!(live.tools, historical.context.tools);
+    live.validate().unwrap();
+    assert_eq!(effects.load(Ordering::SeqCst), 1);
+    restored.close().await.unwrap();
 }
 
 #[tokio::test]

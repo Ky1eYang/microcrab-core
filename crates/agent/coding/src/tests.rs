@@ -92,7 +92,7 @@ fn host_shell_cannot_shadow_tools_or_advertise_invalid_identity() {
         "job",
         "delegate",
         "sleep",
-        "expand",
+        "reference",
         "",
         "/bin/custom",
         "two words",

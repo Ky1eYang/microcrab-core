@@ -56,7 +56,10 @@ impl crate::inner::SessionInner {
                         ));
                     }
                     let content = self.state.read_reference(&section_id)?;
-                    FocusSnapshot::capture(row.info.clone(), content.body)
+                    let body = content.as_text().ok_or_else(|| {
+                        Error::config("focused section reference must be UTF-8 text")
+                    })?;
+                    FocusSnapshot::capture(row.info.clone(), body.to_owned())
                 }
                 FocusSelection::File { path } => {
                     if path.is_empty() || path.len() > 4096 || path.contains('\0') {

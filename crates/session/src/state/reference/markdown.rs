@@ -464,10 +464,7 @@ impl Reference for MarkdownReferences {
             .unwrap_or_else(|e| e.into_inner())
             .bodies
             .get(id)
-            .map(|body| ReferenceContent {
-                id: id.into(),
-                body: body.clone(),
-            }))
+            .map(|body| ReferenceContent::text(id, body.clone())))
     }
     fn change(&self) -> Result<Option<Value>, Error> {
         let catalog = self.catalog.read().unwrap_or_else(|e| e.into_inner());

@@ -118,85 +118,79 @@ fn context_with(tools: Vec<ToolDefinition>) -> Context {
 }
 
 #[test]
-fn expand_advertises_portable_properties_without_root_selector_union() {
-    let schema = BuiltinTool::Expand.definition().parameters;
-    assert!(schema.get("oneOf").is_none());
+fn reference_advertises_multi_action_schema() {
+    let schema = BuiltinTool::Reference.definition().parameters;
     assert_eq!(schema["additionalProperties"], false);
-    assert_eq!(schema["properties"]["ids"]["minItems"], 1);
-    assert_eq!(schema["properties"]["ids"]["maxItems"], 128);
-    assert_eq!(schema["properties"]["ids"]["uniqueItems"], true);
-    assert_eq!(schema["properties"]["reference"]["minLength"], 1);
+    assert_eq!(
+        schema["properties"]["action"]["enum"],
+        json!(["expand", "add", "update", "remove", "refresh"])
+    );
     let validator = jsonschema::validator_for(&schema).unwrap();
-    for arguments in [json!({"ids":["section"]}), json!({"reference":"section"})] {
-        assert!(validator.is_valid(&arguments));
+    for arguments in [
+        json!({"action":"expand","id":"section"}),
+        json!({"action":"expand","id":["a","b"]}),
+        json!({"action":"refresh"}),
+        json!({"action":"add","source":{"type":"literal","content":"hi"}}),
+    ] {
+        assert!(validator.is_valid(&arguments), "{arguments}");
     }
     for arguments in [
-        json!({"ids":[]}),
-        json!({"ids":["a","a"]}),
-        json!({"reference":null}),
-        json!({"reference":""}),
+        json!({}),
+        json!({"action":"expand","id":[]}),
+        json!({"action":"expand","id":["a","a"]}),
         json!({"extra":true}),
     ] {
-        assert!(!validator.is_valid(&arguments));
+        assert!(!validator.is_valid(&arguments), "{arguments}");
     }
 }
 
 #[tokio::test]
-async fn expand_selector_xor_is_a_concrete_pre_effect_diagnostic() {
+async fn reference_validation_returns_concrete_pre_effect_diagnostic() {
     use microcrab_session::observation::diagnostics::{
         DiagnosticCode, DiagnosticLayer, DiagnosticPhase, EffectKnowledge,
     };
-    for arguments in [
-        json!({}),
-        json!({"ids":["unknown"],"reference":"also-unknown"}),
-    ] {
-        let runtime = Runtime::new(
-            vec![ToolRegistration::Builtin(BuiltinTool::Expand)],
-            Arc::new(AllowTools::new(["expand"])),
-        )
+    let runtime = Runtime::new(
+        vec![ToolRegistration::Builtin(BuiltinTool::Reference)],
+        Arc::new(AllowTools::new(["reference"])),
+    )
+    .unwrap();
+    let client = Arc::new(Once {
+        response: std::sync::Mutex::new(vec![
+            Response {
+                provider_metadata: None,
+                content: String::new(),
+                tool_calls: vec![ToolCall {
+                    provider_metadata: None,
+                    id: "reference-invalid".into(),
+                    name: "reference".into(),
+                    arguments: json!({"action":"expand"}),
+                }],
+                usage: Usage::default(),
+            },
+            Response {
+                provider_metadata: None,
+                content: "done".into(),
+                tool_calls: vec![],
+                usage: Usage::default(),
+            },
+        ]),
+    });
+    let session = microcrab_session::Session::builder_arc(client, runtime)
+        .build()
         .unwrap();
-        let client = Arc::new(Once {
-            response: std::sync::Mutex::new(vec![
-                Response {
-                    provider_metadata: None,
-                    content: String::new(),
-                    tool_calls: vec![ToolCall {
-                        provider_metadata: None,
-                        id: "expand-invalid".into(),
-                        name: "expand".into(),
-                        arguments,
-                    }],
-                    usage: Usage::default(),
-                },
-                Response {
-                    provider_metadata: None,
-                    content: "done".into(),
-                    tool_calls: vec![],
-                    usage: Usage::default(),
-                },
-            ]),
-        });
-        let session = microcrab_session::Session::builder_arc(client, runtime)
-            .build()
-            .unwrap();
-        session.submit("expand selector validation").await.unwrap();
-        let rows = session.execution_snapshots();
-        assert_eq!(rows.len(), 1);
-        let diagnostic = rows[0].diagnostic.as_ref().unwrap();
-        assert_eq!(diagnostic.code, DiagnosticCode::InvalidArgument);
-        assert_eq!(diagnostic.layer, DiagnosticLayer::Runtime);
-        assert_eq!(diagnostic.phase, DiagnosticPhase::Validation);
-        assert_eq!(diagnostic.effects, EffectKnowledge::NotStarted);
-        assert_eq!(
-            diagnostic.reason.as_ref().unwrap().as_str(),
-            "expand requires exactly one of ids or reference"
-        );
-        assert!(rows[0].output.is_none());
-        assert!(session.messages().iter().any(|item| matches!(item,
-            ContentItem::Tool { call_id, content, .. } if call_id == "expand-invalid" && content == &diagnostic.result_json()
-        )));
-        session.close().await.unwrap();
-    }
+    session.submit("reference validation").await.unwrap();
+    let rows = session.execution_snapshots();
+    assert_eq!(rows.len(), 1);
+    let diagnostic = rows[0].diagnostic.as_ref().unwrap();
+    assert_eq!(diagnostic.code, DiagnosticCode::InvalidArgument);
+    assert_eq!(diagnostic.layer, DiagnosticLayer::Runtime);
+    assert_eq!(diagnostic.phase, DiagnosticPhase::Validation);
+    assert_eq!(diagnostic.effects, EffectKnowledge::NotStarted);
+    assert!(rows[0].output.is_none());
+    assert!(session.messages().iter().any(|item| matches!(item,
+        ContentItem::Tool { call_id, content, .. } if call_id == "reference-invalid" && content == &diagnostic.result_json()
+    )));
+    session.close().await.unwrap();
 }
 
 #[test]
@@ -211,7 +205,7 @@ fn builtin_catalog_is_only_the_defined_tools() {
         .into_iter()
         .map(|tool| tool.name)
         .collect();
-    assert_eq!(names, ["delegate", "expand", "job", "sleep", "switch_mode"]);
+    assert_eq!(names, ["delegate", "job", "reference", "sleep", "switch_mode"]);
     for name in &names {
         assert_eq!(runtime.origin(name), Some(ToolOrigin::Builtin));
         assert!(BuiltinTool::from_name(name).is_some());
@@ -301,6 +295,7 @@ async fn invalid_delegate_schema_records_failed_call_without_dispatch() {
         limit_owner: None,
         evidence_id: None,
         retryable: None,
+        decision_source: None,
         wasm_failure: None,
     };
     for arguments in [

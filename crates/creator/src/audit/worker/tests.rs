@@ -169,11 +169,10 @@ async fn protected_attempts_link_metadata_and_authored_stage_without_retaining_w
                         round: Some(1),
                         tool_call_id: Some("image-call".into()),
                         tool_execution_id: Some(5),
-                        authored_image_arguments: true,
                         started_at_unix_ms: Some(105),
                         payload: HookPayload::ToolCall {
-                            name: "view_image".into(),
-                            arguments: serde_json::json!({"image_url":false}),
+                            name: "reference".into(),
+                            arguments: serde_json::json!({"action":"expand","ids":["ref_1"]}),
                         },
                         ..Default::default()
                     },
@@ -217,168 +216,9 @@ async fn protected_attempts_link_metadata_and_authored_stage_without_retaining_w
         assert!(
             attempt.tools.is_none() && attempt.sent_request.is_none() && attempt.delta.is_none()
         );
-        let result = AuditQuery {
-            tool_call_id: Some("image-call".into()),
-            call_id: None,
-            ..schema.clone()
-        };
-        let continuation = query(&result);
-        assert_eq!(continuation.attempts.len(), 1);
-        assert_eq!(continuation.attempts[0].request_hash, identities[1]);
-        let authored = AuditQuery {
-            turn: Some(8),
-            round: Some(1),
-            ..result
-        };
-        assert_eq!(
-            query(&authored).authored_tool_arguments,
-            Some(serde_json::json!({"image_url":false}))
-        );
-        assert!(
-            super::super::query(&source, &authored)
-                .unwrap()
-                .authored_tool_arguments
-                .is_none()
-        );
         let recorder = Recorder::open_source(source, options).unwrap();
         let bytes = serde_json::to_string(&recorder.rows().unwrap()).unwrap();
         assert!(!bytes.contains("must never persist"));
-    }
-}
-
-#[tokio::test]
-async fn ordinary_attempt_links_authored_arguments_by_exact_normalized_tool_call() {
-    use super::super::AuditQuery;
-    use microcrab_protocol::{Response, ToolCall};
-    use serde_json::json;
-
-    let directory = tempfile::tempdir().unwrap();
-    let history = "b".repeat(64);
-    let anchor = Arc::new(Mutex::new(AuditAnchor {
-        history_head: Some(history.clone()),
-        ..Default::default()
-    }));
-    let auditor = NativeAuditor::open(directory.path(), anchor.clone(), RecorderOptions::default())
-        .await
-        .unwrap();
-    let request = prepare(&auditor, "ordinary", 2, None).await;
-    auditor.publish(
-        Moment::RequestPrepared,
-        AuditBody {
-            epoch: 2,
-            turn_id: Some(1),
-            round: Some(1),
-            call_id: Some("ordinary".into()),
-            sent_request: Some(WIRE.into()),
-            ..Default::default()
-        },
-    );
-    assert_eq!(anchor.lock().unwrap().request_head.as_ref(), Some(&request));
-    let authored = json!({"image_url":"file:///fixture/$IMAGE.png"});
-    auditor.publish(
-        Moment::RoundCompleted,
-        AuditBody {
-            epoch: 2,
-            turn_id: Some(1),
-            round: Some(1),
-            call_id: Some("ordinary".into()),
-            outcome: Some(AuditOutcome::Accepted),
-            response: Some("data: {\"text\":\"raw-only\"}\n\n".into()),
-            response_content_type: Some("text/event-stream".into()),
-            response_complete: Some(true),
-            response_status: Some(200),
-            payload: HookPayload::RoundCompleted {
-                response: Some(Response {
-                    content: "not-a-call".into(),
-                    tool_calls: [
-                        ("normalized-id", "view_image"),
-                        ("duplicate-id", "view_image"),
-                        ("duplicate-id", "other_tool"),
-                        ("wrong-name", "other_tool"),
-                    ]
-                    .into_iter()
-                    .map(|(id, name)| ToolCall {
-                        id: id.into(),
-                        name: name.into(),
-                        arguments: authored.clone(),
-                        provider_metadata: None,
-                    })
-                    .collect(),
-                    usage: Default::default(),
-                    provider_metadata: None,
-                }),
-                status: Some(200),
-                usage: None,
-            },
-            ..Default::default()
-        },
-    );
-    for (index, id) in [
-        "normalized-id",
-        "normalized",
-        "raw-only",
-        "not-a-call",
-        "duplicate-id",
-        "wrong-name",
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        auditor.publish(
-            Moment::ToolCall,
-            AuditBody {
-                epoch: 2,
-                turn_id: Some(1),
-                round: Some(1),
-                tool_call_id: Some(id.into()),
-                tool_execution_id: Some(index as u64 + 1),
-                authored_image_arguments: true,
-                payload: HookPayload::ToolCall {
-                    name: "view_image".into(),
-                    arguments: authored.clone(),
-                },
-                ..Default::default()
-            },
-        );
-    }
-    auditor.close().await.unwrap();
-    let selector = |id: &str| AuditQuery {
-        epoch: 2,
-        turn: Some(1),
-        round: Some(1),
-        tool_call_id: Some(id.into()),
-        request_hash: None,
-        call_id: None,
-        history_head: None,
-        subagent: None,
-    };
-    let query = |id, head: Option<&str>| {
-        super::super::query_selected_with_ancestry(
-            directory.path(),
-            &selector(id),
-            head,
-            Some(&history),
-            std::slice::from_ref(&history),
-        )
-        .unwrap()
-        .authored_tool_arguments
-    };
-    assert_eq!(query("normalized-id", Some(&request)), Some(authored));
-    assert_eq!(query("normalized-id", None), None);
-    assert_eq!(
-        super::super::query(directory.path(), &selector("normalized-id"))
-            .unwrap()
-            .authored_tool_arguments,
-        None
-    );
-    for id in [
-        "normalized",
-        "raw-only",
-        "not-a-call",
-        "duplicate-id",
-        "wrong-name",
-    ] {
-        assert_eq!(query(id, Some(&request)), None, "{id}");
     }
 }
 

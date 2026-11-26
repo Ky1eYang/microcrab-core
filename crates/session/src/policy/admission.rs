@@ -450,7 +450,6 @@ impl PermissionController {
                 let resolution = owner.resolve_ask(
                     snapshot,
                     &owned,
-                    invocation.image_approval_preview.as_ref(),
                     &invocation.state,
                     issuer,
                     cancellation,

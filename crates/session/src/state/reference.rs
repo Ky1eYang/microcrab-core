@@ -9,7 +9,16 @@
 //! `change` run without the state lock so a kind cannot deadlock on `State`.
 
 pub mod focus;
+pub mod library;
 pub mod markdown;
+pub use library::{
+    CreateLibraryObject, DEFAULT_MAX_OBJECT_BYTES, DEFAULT_MAX_USER_BYTES,
+    DEFAULT_MAX_USER_ENTRIES, InMemoryReferenceLibrary, LibraryObjectSummary, LibraryQuota,
+    LibraryRedirectDestination, LibrarySource, LocalBlobOrigin, ReferenceLibrary,
+    ShortcutTarget, UpdateLibraryObject, canonical_mime, content_from_bytes,
+    detect_mime_from_bytes, inspect_binary_for_storage, normalize_shortcut,
+    resolve_shortcut_content, valid_library_id,
+};
 pub use markdown::{MarkdownReferences, ReferenceLimits, ReferenceSource};
 
 use crate::Error;
@@ -28,11 +37,64 @@ pub struct ReferenceInfo {
     pub description: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReferencePayload {
+    Text(String),
+    Binary {
+        data: Vec<u8>,
+        width: Option<u32>,
+        height: Option<u32>,
+    },
+}
+
 /// Body returned for one owned id. Absence is `Ok(None)`, not an error.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReferenceContent {
     pub id: String,
-    pub body: String,
+    pub media_type: String,
+    pub payload: ReferencePayload,
+}
+
+impl ReferenceContent {
+    pub fn text(id: impl Into<String>, body: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            media_type: "text/plain".into(),
+            payload: ReferencePayload::Text(body.into()),
+        }
+    }
+
+    pub fn binary(
+        id: impl Into<String>,
+        media_type: impl Into<String>,
+        data: Vec<u8>,
+        width: Option<u32>,
+        height: Option<u32>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            media_type: media_type.into(),
+            payload: ReferencePayload::Binary {
+                data,
+                width,
+                height,
+            },
+        }
+    }
+
+    pub fn as_text(&self) -> Option<&str> {
+        match &self.payload {
+            ReferencePayload::Text(text) => Some(text.as_str()),
+            ReferencePayload::Binary { .. } => None,
+        }
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        match &self.payload {
+            ReferencePayload::Text(text) => text.as_bytes(),
+            ReferencePayload::Binary { data, .. } => data.as_slice(),
+        }
+    }
 }
 
 /// A reference kind installed into [`super::SessionState`].
@@ -355,10 +417,7 @@ mod tests {
 
         fn read(&self, id: &str) -> Result<Option<ReferenceContent>, Self::Error> {
             if id == "skill#demo" {
-                Ok(Some(ReferenceContent {
-                    id: id.into(),
-                    body: "skill body".into(),
-                }))
+                Ok(Some(ReferenceContent::text(id, "skill body")))
             } else {
                 Ok(None)
             }
@@ -440,10 +499,10 @@ mod tests {
             if self.failure == Failure::Read {
                 return Err(SampleError);
             }
-            Ok(self.ids.contains(&id).then(|| ReferenceContent {
-                id: self.body_id.unwrap_or(id).into(),
-                body: "private body".into(),
-            }))
+            Ok(self
+                .ids
+                .contains(&id)
+                .then(|| ReferenceContent::text(self.body_id.unwrap_or(id), "private body")))
         }
 
         fn change(&self) -> Result<Option<Value>, Self::Error> {
@@ -545,10 +604,7 @@ mod tests {
         ]);
         assert_eq!(
             read_id(&references, "plain").unwrap(),
-            ReferenceContent {
-                id: "plain".into(),
-                body: "private body".into(),
-            }
+            ReferenceContent::text("plain", "private body")
         );
     }
 
@@ -619,12 +675,12 @@ mod tests {
         assert!(decoded.references.iter().next().is_none());
         assert!(list_all(&decoded.references).unwrap().is_empty());
         assert_eq!(
-            read_id(&snapshot.references, "skill#demo").unwrap().body,
-            "skill body"
+            read_id(&snapshot.references, "skill#demo").unwrap().as_text(),
+            Some("skill body")
         );
         assert_eq!(
-            read_id(&cloned.references, "skill#demo").unwrap().body,
-            "skill body"
+            read_id(&cloned.references, "skill#demo").unwrap().as_text(),
+            Some("skill body")
         );
     }
 
@@ -660,8 +716,8 @@ mod tests {
         );
         assert_eq!(changes.load(Ordering::SeqCst), 1);
         assert_eq!(
-            state.read_reference("skill#demo").unwrap().body,
-            "skill body"
+            state.read_reference("skill#demo").unwrap().as_text(),
+            Some("skill body")
         );
         assert_eq!(state.list_references().unwrap()[0].kind, "skills");
         let mut set = Map::new();

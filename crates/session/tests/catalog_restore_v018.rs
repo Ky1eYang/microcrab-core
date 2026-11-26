@@ -30,8 +30,8 @@ impl Client for Answer {
                 vec![ToolCall {
                     provider_metadata: None,
                     id: "hidden".into(),
-                    name: "expand".into(),
-                    arguments: json!({"reference":"not-installed-in-this-epoch"}),
+                    name: "reference".into(),
+                    arguments: json!({"action":"expand","id":"not-installed-in-this-epoch"}),
                 }]
             } else {
                 vec![]
@@ -236,7 +236,7 @@ async fn current_job_descriptor_restores_exactly() {
 fn runtime(expand: bool) -> Runtime {
     let mut tools = vec![ToolRegistration::Builtin(BuiltinTool::Sleep)];
     if expand {
-        tools.push(ToolRegistration::Builtin(BuiltinTool::Expand));
+        tools.push(ToolRegistration::Builtin(BuiltinTool::Reference));
         tools.push(ToolRegistration::Builtin(BuiltinTool::Delegate));
     }
     Runtime::new(tools, Arc::new(DenyAll))
@@ -277,8 +277,8 @@ async fn old_frozen_catalog_restores_and_adopts_new_builtin_only_on_explicit_upd
     let microcrab_session::policy::PermissionList::Current { current } = list else {
         unreachable!("the requested view was Current");
     };
-    assert!(current.tools.iter().any(|tool| tool.name == "expand"));
-    assert!(!has_model_permission(&restored, "expand"));
+    assert!(current.tools.iter().any(|tool| tool.name == "reference"));
+    assert!(!has_model_permission(&restored, "reference"));
     assert!(!has_model_permission(&restored, "delegate"));
     assert!(
         restored
@@ -293,17 +293,17 @@ async fn old_frozen_catalog_restores_and_adopts_new_builtin_only_on_explicit_upd
         recover.context.tools
     );
     assert_eq!(restored.context_snapshot().unwrap().epoch, epoch);
-    assert!(!has_model_permission(&restored, "expand"));
+    assert!(!has_model_permission(&restored, "reference"));
     assert!(!has_model_permission(&restored, "delegate"));
     restored
         .submit("materialize explicitly updated epoch")
         .await
         .unwrap();
     let next = restored.context_snapshot().unwrap();
-    assert!(next.tools.iter().any(|tool| tool.name == "expand"));
+    assert!(next.tools.iter().any(|tool| tool.name == "reference"));
     assert!(!next.pending_epoch);
     assert_eq!(next.epoch, epoch + 1);
-    assert!(has_model_permission(&restored, "expand"));
+    assert!(has_model_permission(&restored, "reference"));
     assert!(has_model_permission(&restored, "delegate"));
     assert_eq!(
         restored.state_view().unwrap()["delegatable_agents"][0]["name"],
@@ -315,7 +315,7 @@ async fn old_frozen_catalog_restores_and_adopts_new_builtin_only_on_explicit_upd
             .context
             .tools
             .iter()
-            .any(|tool| tool.name == "expand")
+            .any(|tool| tool.name == "reference")
     );
     restored.close().await.unwrap();
     old.close().await.unwrap();

@@ -10,8 +10,8 @@ pub enum LimitKind {
     ContextBytes,
     InputBytes,
     CustomVariableBytes,
-    PrivateVariableBytes,
-    PrivateVariableEntries,
+    LibraryStorageBytes,
+    LibraryStorageEntries,
     RecoveryBytes,
     ExecutionInspection,
     PluginRewrite,
@@ -52,8 +52,8 @@ impl LimitKind {
             Self::ContextBytes => "context_bytes",
             Self::InputBytes => "input_bytes",
             Self::CustomVariableBytes => "custom_variable_bytes",
-            Self::PrivateVariableBytes => "private_variable_bytes",
-            Self::PrivateVariableEntries => "private_variable_entries",
+            Self::LibraryStorageBytes => "library_storage_bytes",
+            Self::LibraryStorageEntries => "library_storage_entries",
             Self::RecoveryBytes => "recovery_bytes",
             Self::ExecutionInspection => "execution_inspection",
             Self::PluginRewrite => "plugin_rewrite",
@@ -151,8 +151,12 @@ impl LimitError {
             LimitKind::ContextBytes => "Context byte budget exceeded",
             LimitKind::InputBytes => "Input byte budget exceeded",
             LimitKind::CustomVariableBytes => "Custom variable byte budget exceeded",
-            LimitKind::PrivateVariableBytes => "Private variable byte budget exceeded",
-            LimitKind::PrivateVariableEntries => "Private variable capacity exceeded",
+            LimitKind::LibraryStorageBytes => {
+                "Personal Content Library storage quota exceeded; delete unused items in Dashboard -> 个人内容库"
+            }
+            LimitKind::LibraryStorageEntries => {
+                "Personal Content Library entry capacity exceeded; delete unused items in Dashboard -> 个人内容库"
+            }
             LimitKind::RecoveryBytes => "Recovery byte budget exceeded",
             LimitKind::ExecutionInspection => "Execution inspection byte budget exceeded",
             LimitKind::PluginRewrite => "Plugin request rewrite byte budget exceeded",

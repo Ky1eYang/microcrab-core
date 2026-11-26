@@ -89,7 +89,7 @@ impl SessionInner {
             context.frozen_tools(),
         ));
         if interactive_root {
-            state.install_image_host(parts.host.clone());
+            state.install_host(parts.host.clone());
         }
         state.install_catalog(parts.catalog.clone(), parts.is_main);
         state.install_agent_metadata(parts.agent.clone());

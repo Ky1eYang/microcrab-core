@@ -4,6 +4,8 @@ use super::{
     PolicySnapshot,
 };
 use crate::runtime::handler::permissions::AppliedCatalog;
+#[cfg(test)]
+use crate::runtime::ToolOrigin;
 use serde_json::{Value, json};
 use std::sync::{Arc, RwLock, Weak};
 

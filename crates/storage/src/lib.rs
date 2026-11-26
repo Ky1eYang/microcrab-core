@@ -8,6 +8,7 @@ pub mod directory;
 pub mod display;
 pub mod execution;
 pub mod history;
+pub mod library;
 #[cfg(feature = "storage-sqlite")]
 mod sqlite;
 
@@ -16,6 +17,11 @@ pub use directory::FileDirectory;
 #[cfg(feature = "storage-sqlite")]
 pub use directory::SqliteDirectory;
 pub use directory::{Directory, ModelSelection, OperationRecord, RECORD_VERSION, SessionRecord};
+#[cfg(feature = "storage-file")]
+pub use library::FilePersonalLibrary;
+#[cfg(feature = "storage-sqlite")]
+pub use library::SqlitePersonalLibrary;
+pub use library::{LibraryLimits, LibraryObjectRecord, PersonalLibrary};
 
 pub use history::{AuditAnchor, CreatorJournal, JournalCursor, Travel};
 

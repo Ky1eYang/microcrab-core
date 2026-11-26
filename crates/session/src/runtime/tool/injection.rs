@@ -1,11 +1,17 @@
-//! Pre-permission expansion of model-visible custom variables.
+//! Pre-permission expansion of model-visible custom variables and mounted References.
 //! Inserted values are literal data. This pass never reads Secret plaintext.
-use crate::Error;
+use crate::state::reference::{ReferenceContent, ReferencePayload};
 use crate::state::variables::{InjectionKey, InjectionView};
+use crate::{Error, LimitKind};
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde_json::{Map, Value};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::future::Future;
+use std::pin::Pin;
+use tokio_util::sync::CancellationToken;
 
 const MAX_RESOLVED_ARGUMENT_BYTES: usize = 1024 * 1024;
+const MAX_REF_ARGUMENT_BYTES: usize = microcrab_permission::MAX_ARGUMENT_BYTES;
 const MAX_ARGUMENT_DEPTH: usize = 128;
 const MAX_POINTER_BYTES: usize = 512;
 const MAX_POINTER_SEGMENTS: usize = 32;
@@ -55,6 +61,10 @@ enum Conversion {
     String,
     Number,
     Boolean,
+    Text,
+    Base64,
+    DataUrl,
+    Json,
 }
 impl Conversion {
     fn name(self) -> &'static str {
@@ -63,45 +73,141 @@ impl Conversion {
             Self::String => "string",
             Self::Number => "number",
             Self::Boolean => "boolean",
+            Self::Text => "text",
+            Self::Base64 => "base64",
+            Self::DataUrl => "data_url",
+            Self::Json => "json",
         }
     }
+
+    fn embeddable(self) -> bool {
+        !matches!(self, Self::Native | Self::Json)
+    }
+}
+
+enum PlaceholderKind<'a> {
+    Var {
+        key: &'a str,
+    },
+    Ref {
+        id: &'a str,
+    },
 }
 
 struct Placeholder<'a> {
     end: usize,
-    key: &'a str,
+    kind: PlaceholderKind<'a>,
     pointer: &'a str,
     conversion: Conversion,
 }
 
-/// Expand `{{var:...}}` placeholders once. The returned mask marks inserted data so
-/// the later Secret pass cannot treat that data as another template.
+impl<'a> Placeholder<'a> {
+    fn key_or_id(&self) -> &'a str {
+        match self.kind {
+            PlaceholderKind::Var { key } => key,
+            PlaceholderKind::Ref { id } => id,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Budget {
+    max_bytes: usize,
+    limit_kind: Option<LimitKind>,
+}
+
+impl Budget {
+    fn error(self, required: usize) -> Error {
+        if let Some(kind) = self.limit_kind {
+            crate::budget::check(kind, required.max(self.max_bytes.saturating_add(1)), self.max_bytes)
+                .unwrap_err()
+        } else {
+            budget_error()
+        }
+    }
+}
+
+/// Expand `{{var:...}}` placeholders synchronously. Used by unit tests and pure variable callers.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn expand_visible(
     arguments: &Value,
     view: &InjectionView,
     max_context_bytes: usize,
 ) -> Result<(Value, LiteralMask), Error> {
-    if !has_visible_reference(arguments) {
+    if !has_prefix(arguments, "{{var:") {
         return Ok((arguments.clone(), LiteralMask::default()));
     }
-    let max_bytes = max_context_bytes.min(MAX_RESOLVED_ARGUMENT_BYTES);
-    if serde_json::to_vec(arguments)?.len() > max_bytes {
-        return Err(budget_error());
+    let budget = Budget {
+        max_bytes: max_context_bytes.min(MAX_RESOLVED_ARGUMENT_BYTES),
+        limit_kind: None,
+    };
+    let initial_len = serde_json::to_vec(arguments)?.len();
+    if initial_len > budget.max_bytes {
+        return Err(budget.error(initial_len));
     }
     let mut mask = LiteralMask::default();
-    let mut remaining = max_bytes;
-    let expanded = visit(arguments, view, &mut mask, &mut remaining, max_bytes, "", 0)?;
-    if serde_json::to_vec(&expanded)?.len() > max_bytes {
-        return Err(budget_error());
+    let mut remaining = budget.max_bytes;
+    let expanded = visit_sync(arguments, view, &mut mask, &mut remaining, budget, "", 0)?;
+    let final_len = serde_json::to_vec(&expanded)?.len();
+    if final_len > budget.max_bytes {
+        return Err(budget.error(final_len));
     }
     Ok((expanded, mask))
 }
 
-fn has_visible_reference(value: &Value) -> bool {
+/// Expand `{{var:...}}` and `{{ref:...}}` placeholders once before permission/dispatch.
+/// Inserted data is marked in `LiteralMask` and never re-scanned for Secret placeholders.
+pub(crate) async fn expand_dispatch(
+    arguments: &Value,
+    state: &crate::State,
+    max_context_bytes: usize,
+    cancel: &CancellationToken,
+) -> Result<(Value, LiteralMask), Error> {
+    let has_ref = has_prefix(arguments, "{{ref:");
+    let has_var = has_prefix(arguments, "{{var:");
+    if !has_ref && !has_var {
+        return Ok((arguments.clone(), LiteralMask::default()));
+    }
+    if !has_ref {
+        return expand_visible(arguments, &state.injection_view(), max_context_bytes);
+    }
+    let budget = Budget {
+        max_bytes: max_context_bytes.min(MAX_REF_ARGUMENT_BYTES),
+        limit_kind: Some(LimitKind::ToolArguments),
+    };
+    let initial_len = serde_json::to_vec(arguments)?.len();
+    if initial_len > budget.max_bytes {
+        return Err(budget.error(initial_len));
+    }
+    let view = state.injection_view();
+    let mut cache: HashMap<String, ReferenceContent> = HashMap::new();
+    let mut mask = LiteralMask::default();
+    let mut remaining = budget.max_bytes;
+    let expanded = visit_async(
+        arguments,
+        &view,
+        state,
+        &mut cache,
+        cancel,
+        &mut mask,
+        &mut remaining,
+        budget,
+        "",
+        0,
+    )
+    .await?;
+    let final_len = serde_json::to_vec(&expanded)?.len();
+    if final_len > budget.max_bytes {
+        return Err(budget.error(final_len));
+    }
+    Ok((expanded, mask))
+}
+
+fn has_prefix(value: &Value, needle: &str) -> bool {
     let mut pending = vec![value];
     while let Some(value) = pending.pop() {
         match value {
-            Value::String(text) if text.contains("{{var:") => return true,
+            Value::String(text) if text.contains(needle) => return true,
             Value::Array(items) => pending.extend(items),
             Value::Object(fields) => pending.extend(fields.values()),
             _ => {}
@@ -110,29 +216,29 @@ fn has_visible_reference(value: &Value) -> bool {
     false
 }
 
-fn visit(
+fn visit_sync(
     value: &Value,
     view: &InjectionView,
     mask: &mut LiteralMask,
     remaining: &mut usize,
-    max_bytes: usize,
+    budget: Budget,
     pointer: &str,
     depth: usize,
 ) -> Result<Value, Error> {
     if depth > MAX_ARGUMENT_DEPTH {
-        return Err(budget_error());
+        return Err(budget.error(budget.max_bytes.saturating_add(1)));
     }
     match value {
-        Value::String(text) => expand_string(text, view, mask, remaining, max_bytes, pointer),
+        Value::String(text) => expand_string_sync(text, view, mask, remaining, budget, pointer),
         Value::Array(items) => {
             let mut expanded = Vec::with_capacity(items.len());
             for (index, item) in items.iter().enumerate() {
-                expanded.push(visit(
+                expanded.push(visit_sync(
                     item,
                     view,
                     mask,
                     remaining,
-                    max_bytes,
+                    budget,
                     &join(pointer, &index.to_string()),
                     depth + 1,
                 )?);
@@ -144,12 +250,12 @@ fn visit(
             for (key, item) in fields {
                 expanded.insert(
                     key.clone(),
-                    visit(
+                    visit_sync(
                         item,
                         view,
                         mask,
                         remaining,
-                        max_bytes,
+                        budget,
                         &join(pointer, &escape_pointer(key)),
                         depth + 1,
                     )?,
@@ -161,61 +267,206 @@ fn visit(
     }
 }
 
-fn expand_string(
+#[expect(clippy::too_many_arguments)]
+fn visit_async<'a>(
+    value: &'a Value,
+    view: &'a InjectionView,
+    state: &'a crate::State,
+    cache: &'a mut HashMap<String, ReferenceContent>,
+    cancel: &'a CancellationToken,
+    mask: &'a mut LiteralMask,
+    remaining: &'a mut usize,
+    budget: Budget,
+    pointer: &'a str,
+    depth: usize,
+) -> Pin<Box<dyn Future<Output = Result<Value, Error>> + Send + 'a>> {
+    Box::pin(async move {
+        if depth > MAX_ARGUMENT_DEPTH {
+            return Err(budget.error(budget.max_bytes.saturating_add(1)));
+        }
+        match value {
+            Value::String(text) => {
+                expand_string_async(text, view, state, cache, cancel, mask, remaining, budget, pointer)
+                    .await
+            }
+            Value::Array(items) => {
+                let mut expanded = Vec::with_capacity(items.len());
+                for (index, item) in items.iter().enumerate() {
+                    let child_ptr = join(pointer, &index.to_string());
+                    expanded.push(
+                        visit_async(
+                            item,
+                            view,
+                            state,
+                            cache,
+                            cancel,
+                            mask,
+                            remaining,
+                            budget,
+                            &child_ptr,
+                            depth + 1,
+                        )
+                        .await?,
+                    );
+                }
+                Ok(Value::Array(expanded))
+            }
+            Value::Object(fields) => {
+                let mut expanded = Map::new();
+                for (key, item) in fields {
+                    let child_ptr = join(pointer, &escape_pointer(key));
+                    expanded.insert(
+                        key.clone(),
+                        visit_async(
+                            item,
+                            view,
+                            state,
+                            cache,
+                            cancel,
+                            mask,
+                            remaining,
+                            budget,
+                            &child_ptr,
+                            depth + 1,
+                        )
+                        .await?,
+                    );
+                }
+                Ok(Value::Object(expanded))
+            }
+            _ => Ok(value.clone()),
+        }
+    })
+}
+
+fn expand_string_sync(
     text: &str,
     view: &InjectionView,
     mask: &mut LiteralMask,
     remaining: &mut usize,
-    max_bytes: usize,
+    budget: Budget,
     pointer: &str,
 ) -> Result<Value, Error> {
-    let found = placeholders(text)?;
+    let found = placeholders(text, false)?;
     if found.is_empty() {
-        charge(remaining, text.len())?;
+        charge(remaining, text.len(), budget)?;
         return Ok(Value::String(text.to_owned()));
     }
     if found.len() == 1 && found[0].0 == 0 && found[0].1.end == text.len() {
         let placeholder = &found[0].1;
-        let value = converted_value(view, placeholder)?;
+        let value = converted_var_value(view, placeholder)?;
         mask.insert_node(pointer);
-        charge(remaining, serde_json::to_vec(&value)?.len())?;
+        charge(remaining, serde_json::to_vec(&value)?.len(), budget)?;
         return Ok(value);
     }
     let mut result = String::new();
     let mut consumed = 0;
     for (start, placeholder) in found {
-        if placeholder.conversion == Conversion::Native {
+        if !placeholder.conversion.embeddable() {
             return Err(Error::tool_dynamic(format!(
                 "placeholder {} must be the entire value or use an explicit string, number, or boolean conversion",
                 display_ref(&placeholder)
             )));
         }
-        append(&mut result, &text[consumed..start], max_bytes)?;
-        let converted = converted_value(view, &placeholder)?;
+        append(&mut result, &text[consumed..start], budget)?;
+        let converted = converted_var_value(view, &placeholder)?;
         let inserted = embed_text(&converted, &placeholder)?;
         let range = (result.len(), result.len() + inserted.len());
-        append(&mut result, &inserted, max_bytes)?;
+        append(&mut result, &inserted, budget)?;
         mask.insert_range(pointer, range);
         consumed = start + placeholder.end;
     }
-    append(&mut result, &text[consumed..], max_bytes)?;
-    charge(remaining, result.len())?;
+    append(&mut result, &text[consumed..], budget)?;
+    charge(remaining, result.len(), budget)?;
     Ok(Value::String(result))
 }
 
-fn placeholders(text: &str) -> Result<Vec<(usize, Placeholder<'_>)>, Error> {
+#[expect(clippy::too_many_arguments)]
+async fn expand_string_async(
+    text: &str,
+    view: &InjectionView,
+    state: &crate::State,
+    cache: &mut HashMap<String, ReferenceContent>,
+    cancel: &CancellationToken,
+    mask: &mut LiteralMask,
+    remaining: &mut usize,
+    budget: Budget,
+    pointer: &str,
+) -> Result<Value, Error> {
+    let found = placeholders(text, true)?;
+    if found.is_empty() {
+        charge(remaining, text.len(), budget)?;
+        return Ok(Value::String(text.to_owned()));
+    }
+    if found.len() == 1 && found[0].0 == 0 && found[0].1.end == text.len() {
+        let placeholder = &found[0].1;
+        let value = match placeholder.kind {
+            PlaceholderKind::Var { .. } => converted_var_value(view, placeholder)?,
+            PlaceholderKind::Ref { id } => {
+                converted_ref_value(state, cache, cancel, id, placeholder).await?
+            }
+        };
+        mask.insert_node(pointer);
+        charge(remaining, serde_json::to_vec(&value)?.len(), budget)?;
+        return Ok(value);
+    }
+    let mut result = String::new();
+    let mut consumed = 0;
+    for (start, placeholder) in found {
+        if !placeholder.conversion.embeddable() {
+            return Err(Error::tool_dynamic(format!(
+                "placeholder {} must be the entire value or use an explicit string, number, boolean, text, base64, or data_url conversion",
+                display_ref(&placeholder)
+            )));
+        }
+        append(&mut result, &text[consumed..start], budget)?;
+        let converted = match placeholder.kind {
+            PlaceholderKind::Var { .. } => converted_var_value(view, &placeholder)?,
+            PlaceholderKind::Ref { id } => {
+                converted_ref_value(state, cache, cancel, id, &placeholder).await?
+            }
+        };
+        let inserted = embed_text(&converted, &placeholder)?;
+        let range = (result.len(), result.len() + inserted.len());
+        append(&mut result, &inserted, budget)?;
+        mask.insert_range(pointer, range);
+        consumed = start + placeholder.end;
+    }
+    append(&mut result, &text[consumed..], budget)?;
+    charge(remaining, result.len(), budget)?;
+    Ok(Value::String(result))
+}
+
+fn placeholders(text: &str, include_refs: bool) -> Result<Vec<(usize, Placeholder<'_>)>, Error> {
     let mut found = Vec::new();
     let mut offset = 0;
-    while let Some(relative) = text[offset..].find("{{var:") {
-        let start = offset + relative;
-        let placeholder = parse_placeholder(&text[start..]).map_err(|_| invalid_placeholder())?;
+    while offset < text.len() {
+        let next_var = text[offset..].find("{{var:").map(|rel| (offset + rel, true));
+        let next_ref = include_refs
+            .then(|| text[offset..].find("{{ref:").map(|rel| (offset + rel, false)))
+            .flatten();
+        let next = match (next_var, next_ref) {
+            (Some(v), Some(r)) => Some(if v.0 <= r.0 { v } else { r }),
+            (Some(v), None) => Some(v),
+            (None, Some(r)) => Some(r),
+            (None, None) => None,
+        };
+        let Some((start, is_var)) = next else {
+            break;
+        };
+        let placeholder = if is_var {
+            parse_var_placeholder(&text[start..]).map_err(|_| invalid_placeholder())?
+        } else {
+            parse_ref_placeholder(&text[start..]).map_err(|_| invalid_ref_placeholder())?
+        };
+        let end = start + placeholder.end;
         found.push((start, placeholder));
-        offset = start + found.last().expect("just pushed").1.end;
+        offset = end;
     }
     Ok(found)
 }
 
-fn parse_placeholder(text: &str) -> Result<Placeholder<'_>, ()> {
+fn parse_var_placeholder(text: &str) -> Result<Placeholder<'_>, ()> {
     let body = text.strip_prefix("{{var:").ok_or(())?;
     let window = body.len().min(MAX_PLACEHOLDER_BYTES);
     let end = body.as_bytes()[..window]
@@ -223,7 +474,7 @@ fn parse_placeholder(text: &str) -> Result<Placeholder<'_>, ()> {
         .position(|pair| pair == b"}}")
         .ok_or(())?;
     let inner = &body[..end];
-    let (conversion, rest) = conversion_prefix(inner);
+    let (conversion, rest) = var_conversion_prefix(inner);
     let key_len = key_prefix_len(rest);
     let key = &rest[..key_len];
     if !microcrab_protocol::valid_secret_key(key) {
@@ -239,7 +490,41 @@ fn parse_placeholder(text: &str) -> Result<Placeholder<'_>, ()> {
     }
     Ok(Placeholder {
         end: "{{var:".len() + end + 2,
-        key,
+        kind: PlaceholderKind::Var { key },
+        pointer,
+        conversion,
+    })
+}
+
+fn parse_ref_placeholder(text: &str) -> Result<Placeholder<'_>, ()> {
+    let body = text.strip_prefix("{{ref:").ok_or(())?;
+    let window = body.len().min(MAX_PLACEHOLDER_BYTES);
+    let end = body.as_bytes()[..window]
+        .windows(2)
+        .position(|pair| pair == b"}}")
+        .ok_or(())?;
+    let inner = &body[..end];
+    let (conversion, rest) = ref_conversion_prefix(inner);
+    let (id, pointer) = if let Some(idx) = rest.rfind(":/") {
+        (&rest[..idx], &rest[idx + 1..])
+    } else {
+        (rest, "")
+    };
+    if id.is_empty()
+        || id.len() > 256
+        || id.bytes().any(|b| b.is_ascii_whitespace() || matches!(b, b'{' | b'}' | b'\0'))
+    {
+        return Err(());
+    }
+    if !pointer.is_empty() {
+        if matches!(conversion, Conversion::Base64 | Conversion::DataUrl) {
+            return Err(());
+        }
+        validate_pointer_syntax(pointer)?;
+    }
+    Ok(Placeholder {
+        end: "{{ref:".len() + end + 2,
+        kind: PlaceholderKind::Ref { id },
         pointer,
         conversion,
     })
@@ -264,7 +549,7 @@ fn key_prefix_len(text: &str) -> usize {
     len
 }
 
-fn conversion_prefix(text: &str) -> (Conversion, &str) {
+fn var_conversion_prefix(text: &str) -> (Conversion, &str) {
     for (name, conversion) in [
         ("string:", Conversion::String),
         ("number:", Conversion::Number),
@@ -272,6 +557,25 @@ fn conversion_prefix(text: &str) -> (Conversion, &str) {
     ] {
         if let Some(rest) = text.strip_prefix(name)
             && microcrab_protocol::valid_secret_key(rest.split(':').next().unwrap_or(""))
+        {
+            return (conversion, rest);
+        }
+    }
+    (Conversion::Native, text)
+}
+
+fn ref_conversion_prefix(text: &str) -> (Conversion, &str) {
+    for (name, conversion) in [
+        ("text:", Conversion::Text),
+        ("base64:", Conversion::Base64),
+        ("data_url:", Conversion::DataUrl),
+        ("json:", Conversion::Json),
+        ("string:", Conversion::String),
+        ("number:", Conversion::Number),
+        ("boolean:", Conversion::Boolean),
+    ] {
+        if let Some(rest) = text.strip_prefix(name)
+            && !rest.is_empty()
         {
             return (conversion, rest);
         }
@@ -293,30 +597,99 @@ fn validate_pointer_syntax(pointer: &str) -> Result<(), ()> {
     Ok(())
 }
 
-fn converted_value(view: &InjectionView, placeholder: &Placeholder<'_>) -> Result<Value, Error> {
-    let value = match view.lookup(placeholder.key) {
+fn converted_var_value(view: &InjectionView, placeholder: &Placeholder<'_>) -> Result<Value, Error> {
+    let key = placeholder.key_or_id();
+    let value = match view.lookup(key) {
         InjectionKey::Visible(value) => value,
         InjectionKey::Invisible => {
             return Err(Error::tool_dynamic(format!(
                 "variable {} is not model-visible and cannot be injected",
-                placeholder.key
+                key
             )));
         }
         InjectionKey::Secret => {
             return Err(Error::tool_dynamic(format!(
                 "variable {} is secret; use {{{{secret:{}}}}} and do not read its value",
-                placeholder.key, placeholder.key
+                key, key
             )));
         }
         InjectionKey::Missing => {
-            return Err(Error::tool_dynamic(format!(
-                "unknown variable {}",
-                placeholder.key
-            )));
+            return Err(Error::tool_dynamic(format!("unknown variable {}", key)));
         }
     };
     let selected = select_pointer(value, placeholder)?;
     convert(selected, placeholder)
+}
+
+async fn converted_ref_value(
+    state: &crate::State,
+    cache: &mut HashMap<String, ReferenceContent>,
+    cancel: &CancellationToken,
+    id: &str,
+    placeholder: &Placeholder<'_>,
+) -> Result<Value, Error> {
+    if !cache.contains_key(id) {
+        let content = state.read_reference_async(id, cancel.clone()).await?;
+        cache.insert(id.to_owned(), content);
+    }
+    let content = cache.get(id).expect("just inserted or already present");
+    match placeholder.conversion {
+        Conversion::Base64 => Ok(Value::String(STANDARD.encode(content.as_bytes()))),
+        Conversion::DataUrl => Ok(Value::String(format!(
+            "data:{};base64,{}",
+            content.media_type,
+            STANDARD.encode(content.as_bytes())
+        ))),
+        Conversion::Text => {
+            let ReferencePayload::Text(text) = &content.payload else {
+                return Err(Error::tool_dynamic(format!(
+                    "reference {} is binary ({}); use {{{{ref:base64:{}}}}} or {{{{ref:data_url:{}}}}}",
+                    id, content.media_type, id, id
+                )));
+            };
+            if placeholder.pointer.is_empty() {
+                Ok(Value::String(text.clone()))
+            } else {
+                let parsed: Value = serde_json::from_str(text).map_err(|_| {
+                    Error::tool_dynamic(format!(
+                        "reference {} must contain valid JSON when using a pointer",
+                        id
+                    ))
+                })?;
+                let selected = select_pointer(&parsed, placeholder)?;
+                Ok(Value::String(string_form(selected)))
+            }
+        }
+        Conversion::Json => {
+            let ReferencePayload::Text(text) = &content.payload else {
+                return Err(Error::tool_dynamic(format!(
+                    "reference {} is binary ({}); json conversion requires text/JSON content",
+                    id, content.media_type
+                )));
+            };
+            let parsed: Value = serde_json::from_str(text).map_err(|_| {
+                Error::tool_dynamic(format!("reference {} does not contain valid JSON", id))
+            })?;
+            Ok(select_pointer(&parsed, placeholder)?.clone())
+        }
+        Conversion::Native | Conversion::String | Conversion::Number | Conversion::Boolean => {
+            let ReferencePayload::Text(text) = &content.payload else {
+                return Err(Error::tool_dynamic(format!(
+                    "reference {} is binary ({}); use {{{{ref:base64:{}}}}} or {{{{ref:data_url:{}}}}}",
+                    id, content.media_type, id, id
+                )));
+            };
+            if !placeholder.pointer.is_empty() || content.media_type == "application/json" {
+                let parsed: Value = serde_json::from_str(text).map_err(|_| {
+                    Error::tool_dynamic(format!("reference {} does not contain valid JSON", id))
+                })?;
+                let selected = select_pointer(&parsed, placeholder)?;
+                convert(selected, placeholder)
+            } else {
+                convert(&Value::String(text.clone()), placeholder)
+            }
+        }
+    }
 }
 
 fn select_pointer<'a>(value: &'a Value, placeholder: &Placeholder<'_>) -> Result<&'a Value, Error> {
@@ -365,16 +738,24 @@ fn array_index(token: &str, len: usize) -> Result<usize, IndexError> {
 
 fn convert(value: &Value, placeholder: &Placeholder<'_>) -> Result<Value, Error> {
     match placeholder.conversion {
-        Conversion::Native => Ok(value.clone()),
-        Conversion::String => Ok(Value::String(string_form(value))),
+        Conversion::Native | Conversion::Json => Ok(value.clone()),
+        Conversion::String | Conversion::Text => Ok(Value::String(string_form(value))),
         Conversion::Number => number_value(value, placeholder).map(Value::Number),
         Conversion::Boolean => boolean_value(value, placeholder).map(Value::Bool),
+        Conversion::Base64 | Conversion::DataUrl => Ok(value.clone()),
     }
 }
 
 fn embed_text(value: &Value, placeholder: &Placeholder<'_>) -> Result<String, Error> {
     match value {
-        Value::String(text) if placeholder.conversion == Conversion::String => Ok(text.clone()),
+        Value::String(text)
+            if matches!(
+                placeholder.conversion,
+                Conversion::String | Conversion::Text | Conversion::Base64 | Conversion::DataUrl
+            ) =>
+        {
+            Ok(text.clone())
+        }
         Value::Number(number) if placeholder.conversion == Conversion::Number => {
             Ok(number.to_string())
         }
@@ -447,28 +828,30 @@ fn join(parent: &str, segment: &str) -> String {
     format!("{parent}/{segment}")
 }
 
-fn append(result: &mut String, text: &str, max_bytes: usize) -> Result<(), Error> {
-    if result
-        .len()
-        .checked_add(text.len())
-        .is_none_or(|bytes| bytes > max_bytes)
-    {
-        return Err(budget_error());
+fn append(result: &mut String, text: &str, budget: Budget) -> Result<(), Error> {
+    let Some(needed) = result.len().checked_add(text.len()) else {
+        return Err(budget.error(usize::MAX));
+    };
+    if needed > budget.max_bytes {
+        return Err(budget.error(needed));
     }
     result.push_str(text);
     Ok(())
 }
 
-fn charge(remaining: &mut usize, bytes: usize) -> Result<(), Error> {
-    *remaining = remaining.checked_sub(bytes).ok_or_else(budget_error)?;
+fn charge(remaining: &mut usize, bytes: usize, budget: Budget) -> Result<(), Error> {
+    if bytes > *remaining {
+        return Err(budget.error(budget.max_bytes.saturating_sub(*remaining).saturating_add(bytes)));
+    }
+    *remaining -= bytes;
     Ok(())
 }
 
 fn display_ref(placeholder: &Placeholder<'_>) -> String {
     if placeholder.pointer.is_empty() {
-        placeholder.key.to_owned()
+        placeholder.key_or_id().to_owned()
     } else {
-        format!("{}{}", placeholder.key, placeholder.pointer)
+        format!("{}{}", placeholder.key_or_id(), placeholder.pointer)
     }
 }
 
@@ -486,14 +869,17 @@ fn json_type(value: &Value) -> &'static str {
 fn absent(placeholder: &Placeholder<'_>) -> Error {
     Error::tool_dynamic(format!(
         "path {} is absent in {}",
-        placeholder.pointer, placeholder.key
+        placeholder.pointer,
+        placeholder.key_or_id()
     ))
 }
 
 fn type_error(placeholder: &Placeholder<'_>, actual: &str) -> Error {
     Error::tool_dynamic(format!(
         "path {} in {} expects an object or array, found {}",
-        placeholder.pointer, placeholder.key, actual
+        placeholder.pointer,
+        placeholder.key_or_id(),
+        actual
     ))
 }
 
@@ -512,6 +898,12 @@ fn invalid_placeholder() -> Error {
     )
 }
 
+fn invalid_ref_placeholder() -> Error {
+    Error::tool(
+        "reference placeholder is unclosed or invalid; use {{ref:ID}}, {{ref:ID:/pointer}}, {{ref:text:ID}}, {{ref:base64:ID}}, {{ref:data_url:ID}}, {{ref:json:ID}}, or {{ref:string|number|boolean:ID:/pointer}}",
+    )
+}
+
 fn budget_error() -> Error {
     Error::tool("resolved variable arguments exceed the invocation argument byte or depth budget")
 }
@@ -520,6 +912,7 @@ fn budget_error() -> Error {
 mod tests {
     use super::*;
     use crate::Limits;
+    use crate::state::reference::{CreateLibraryObject, LocalBlobOrigin};
     use std::sync::atomic::AtomicBool;
 
     fn view_with(visible: Value, invisible: &[&str], secret: &[&str]) -> InjectionView {
@@ -704,5 +1097,83 @@ mod tests {
         assert!(matches!(view.lookup("missing"), InjectionKey::Missing));
         let rendered = format!("{view:?}");
         assert!(!rendered.contains("PRIVATE"));
+    }
+
+    #[tokio::test]
+    async fn ref_injection_supports_conversions_and_16mb_limit_error() {
+        let state = crate::State::new(Limits::default());
+        let cancel = CancellationToken::new();
+        let library = state.reference_library();
+        let json_ref = library
+            .add(
+                CreateLibraryObject::LocalBlob {
+                    id: None,
+                    title: "cfg".into(),
+                    media_type: "application/json".into(),
+                    data: br#"{"name":"ada","count":3,"secret":"{{secret:tok}}"}"#.to_vec(),
+                    origin: LocalBlobOrigin::Upload,
+                    origin_execution_id: None,
+                },
+                cancel.clone(),
+            )
+            .await
+            .unwrap();
+        let bin_ref = library
+            .add(
+                CreateLibraryObject::LocalBlob {
+                    id: None,
+                    title: "blob".into(),
+                    media_type: "application/octet-stream".into(),
+                    data: vec![1, 2, 3],
+                    origin: LocalBlobOrigin::Upload,
+                    origin_execution_id: None,
+                },
+                cancel.clone(),
+            )
+            .await
+            .unwrap();
+        let input = serde_json::json!({
+            "cfg": format!("{{{{ref:{}}}}}", json_ref.id),
+            "name": format!("{{{{ref:{}:/name}}}}", json_ref.id),
+            "count": format!("pre {{{{ref:number:{}:/count}}}}", json_ref.id),
+            "b64": format!("{{{{ref:base64:{}}}}}", bin_ref.id),
+            "url": format!("pre {{{{ref:data_url:{}}}}}", bin_ref.id),
+        });
+        let (out, mask) = expand_dispatch(&input, &state, 64 * 1024 * 1024, &cancel)
+            .await
+            .unwrap();
+        assert_eq!(out["cfg"]["count"], 3);
+        assert_eq!(out["name"], "ada");
+        assert_eq!(out["count"], "pre 3");
+        assert_eq!(out["b64"], "AQID");
+        assert_eq!(out["url"], "pre data:application/octet-stream;base64,AQID");
+        assert!(mask.covers("/cfg/secret"));
+
+        let huge_ref = library
+            .add(
+                CreateLibraryObject::LocalBlob {
+                    id: None,
+                    title: "huge".into(),
+                    media_type: "application/octet-stream".into(),
+                    data: vec![7; 13 * 1024 * 1024],
+                    origin: LocalBlobOrigin::Upload,
+                    origin_execution_id: None,
+                },
+                cancel.clone(),
+            )
+            .await
+            .unwrap();
+        let err = expand_dispatch(
+            &serde_json::json!({"payload": format!("{{{{ref:base64:{}}}}}", huge_ref.id)}),
+            &state,
+            64 * 1024 * 1024,
+            &cancel,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            Error::Limit(limit) if limit.kind == LimitKind::ToolArguments
+        ));
     }
 }

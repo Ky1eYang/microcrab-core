@@ -15,7 +15,7 @@ pub(crate) fn shell_name(host: &HostInfo) -> Option<&str> {
         !matches!(
             *name,
             "read"
-                | "view_image"
+                | "reference"
                 | "write"
                 | "edit"
                 | "patch"
@@ -26,7 +26,6 @@ pub(crate) fn shell_name(host: &HostInfo) -> Option<&str> {
                 | "job"
                 | "delegate"
                 | "sleep"
-                | "expand"
         )
     })
 }

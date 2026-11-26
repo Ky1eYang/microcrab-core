@@ -37,7 +37,7 @@ impl Client for Model {
                 vec![ToolCall {
                     provider_metadata: None,
                     id: "expand-batch".into(),
-                    name: "expand".into(),
+                    name: "reference".into(),
                     arguments,
                 }]
             })
@@ -67,7 +67,7 @@ async fn configured_host_sources_disclose_expand_and_patch_after_explicit_refres
         Runtime::new(builtin_tools().into(), Arc::new(DenyAll)).unwrap(),
     )
     .markdown_references(
-        "references",
+        "docs",
         vec![ReferenceSource::HostPath {
             path: "SKILL.md".into(),
         }],
@@ -82,7 +82,7 @@ async fn configured_host_sources_disclose_expand_and_patch_after_explicit_refres
         .iter()
         .map(|entry| entry.info.id.clone())
         .collect::<Vec<_>>();
-    *model.calls.lock().unwrap() = Some(json!({"ids":ids}));
+    *model.calls.lock().unwrap() = Some(json!({"action":"expand","id":ids}));
     session
         .submit("Expand all disclosed sections")
         .await
@@ -95,7 +95,8 @@ async fn configured_host_sources_disclose_expand_and_patch_after_explicit_refres
             _ => None,
         })
         .unwrap();
-    let expanded: Vec<Value> = serde_json::from_str(&output).unwrap();
+    let envelope: Value = serde_json::from_str(&output).unwrap();
+    let expanded = envelope["items"].as_array().unwrap();
     assert_eq!(expanded.len(), 3);
     let joined = expanded
         .iter()
@@ -103,15 +104,9 @@ async fn configured_host_sources_disclose_expand_and_patch_after_explicit_refres
         .collect::<String>();
     assert!(joined.starts_with("Intro 中文\n# Guide"));
     assert_eq!(joined.matches("Deep text").count(), 1);
-    for row in &expanded {
-        assert_eq!(
-            row["char_length"].as_u64().unwrap() as usize,
-            row["content"].as_str().unwrap().chars().count()
-        );
-    }
     assert!(session.messages().iter().any(|item| match item {
         ContentItem::State(StateFrame::StateSnapshot { state }) =>
-            state["references"][0]["subjects"][0]["subjects"][0]["important"] == "Keep it",
+            state["docs"][0]["subjects"][0]["subjects"][0]["important"] == "Keep it",
         _ => false,
     }));
     let prefix = session.messages();
@@ -130,7 +125,7 @@ async fn configured_host_sources_disclose_expand_and_patch_after_explicit_refres
     assert!(session.messages().iter().any(|item| {
         match item {
             ContentItem::State(StateFrame::StatePatch { set, .. }) => set
-                .get("references")
+                .get("docs")
                 .is_some_and(|rows| rows[0]["subjects"][0]["title"] == "Changed"),
             _ => false,
         }
@@ -152,7 +147,7 @@ async fn default_h2_compact_catalog_uses_short_ids_and_expands_exact_sections() 
     )
     .host(host)
     .markdown_references(
-        "references",
+        "docs",
         vec![ReferenceSource::HostPath {
             path: "AGENTS.md".into(),
         }],
@@ -161,7 +156,7 @@ async fn default_h2_compact_catalog_uses_short_ids_and_expands_exact_sections() 
     .unwrap();
     session.start().await.unwrap();
     let view = session.state_view().unwrap();
-    let document = &view["references"][0];
+    let document = &view["docs"][0];
     assert!(document.get("id").is_none());
     assert!(document.get("title").is_none());
     assert!(document.get("char_length").is_none());
@@ -179,7 +174,7 @@ async fn default_h2_compact_catalog_uses_short_ids_and_expands_exact_sections() 
         assert_eq!(entry.info.id.len(), 27);
     }
     *model.calls.lock().unwrap() =
-        Some(json!({"ids":listed.iter().map(|row| &row.info.id).collect::<Vec<_>>()}));
+        Some(json!({"action":"expand","id":listed.iter().map(|row| &row.info.id).collect::<Vec<_>>()}));
     session
         .submit("Expand the disclosed catalog")
         .await
@@ -192,7 +187,8 @@ async fn default_h2_compact_catalog_uses_short_ids_and_expands_exact_sections() 
             _ => None,
         })
         .unwrap();
-    let sections: Vec<Value> = serde_json::from_str(&output).unwrap();
+    let envelope: Value = serde_json::from_str(&output).unwrap();
+    let sections = envelope["items"].as_array().unwrap();
     assert_eq!(
         sections
             .iter()
@@ -213,8 +209,9 @@ async fn default_h2_compact_catalog_uses_short_ids_and_expands_exact_sections() 
             .unwrap()
             .iter()
             .any(|request| request.items.iter().any(|item| match item {
-                ContentItem::State(StateFrame::StateSnapshot { state }) =>
-                    state["references"][0] == *document,
+                ContentItem::State(StateFrame::StateSnapshot { state }) => {
+                    state["docs"][0] == *document
+                }
                 _ => false,
             }))
     );
@@ -238,7 +235,7 @@ async fn same_length_body_refresh_changes_digest_and_patch_without_rewriting_fro
     )
     .host(host)
     .markdown_references(
-        "references",
+        "docs",
         vec![ReferenceSource::HostPath {
             path: "guide.md".into(),
         }],
@@ -247,13 +244,13 @@ async fn same_length_body_refresh_changes_digest_and_patch_without_rewriting_fro
     .unwrap();
     session.start().await.unwrap();
     session.submit("Read initial catalog").await.unwrap();
-    let before = session.state_view().unwrap()["references"].clone();
+    let before = session.state_view().unwrap()["docs"].clone();
     let listed = session.state_handle().list_references().unwrap();
     let prefix = session.messages();
     let request = model.requests.lock().unwrap()[0].clone();
     std::fs::write(&path, changed).unwrap();
     session.refresh_references().await.unwrap();
-    let after = session.state_view().unwrap()["references"].clone();
+    let after = session.state_view().unwrap()["docs"].clone();
     assert_eq!(session.state_handle().list_references().unwrap(), listed);
     assert_eq!(listed.len(), 1, "empty preamble is not an expansion choice");
     assert!(before[0].get("id").is_none());
@@ -266,8 +263,8 @@ async fn same_length_body_refresh_changes_digest_and_patch_without_rewriting_fro
             .state_handle()
             .read_reference(&listed[0].info.id)
             .unwrap()
-            .body,
-        changed
+            .as_text(),
+        Some(changed)
     );
     assert_eq!(
         serde_json::to_value(session.messages()).unwrap(),
@@ -275,8 +272,9 @@ async fn same_length_body_refresh_changes_digest_and_patch_without_rewriting_fro
     );
     session.submit("Observe refreshed content").await.unwrap();
     assert!(session.messages().iter().any(|item| match item {
-        ContentItem::State(StateFrame::StatePatch { set, .. }) =>
-            set.get("references") == Some(&after),
+        ContentItem::State(StateFrame::StatePatch { set, .. }) => {
+            set.get("docs") == Some(&after)
+        }
         _ => false,
     }));
     assert_eq!(

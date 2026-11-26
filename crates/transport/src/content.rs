@@ -64,10 +64,6 @@ pub enum CarrierEnvelopeVersion {
     ExternalDialogue {
         alias: String,
     },
-    /// Append-only media settlement related to an already admitted tool result.
-    RetainedToolImage {
-        call_id: String,
-    },
 }
 
 /// Bounded literal text in a trusted, frozen envelope. This type is not an

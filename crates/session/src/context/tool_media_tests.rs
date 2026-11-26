@@ -81,7 +81,7 @@ fn invalid_tool_media_never_mutates_pending_history_and_restore_rejects_route_hi
                 url: "https://example.invalid/routehint".into(),
             },
         }],
-        vec![image(), image()],
+        vec![image(); crate::admission::image::MAX_IMAGES_PER_TOOL_OUTPUT + 1],
         vec![InputPart::Image {
             source: ImageSource::Data {
                 media_type: "image/png".into(),

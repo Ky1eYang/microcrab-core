@@ -158,7 +158,6 @@ impl ToolRegistry {
                 {
                     None
                 }
-                Implementation::Builtin(BuiltinTool::ViewImage, _) if !interactive_root => None,
                 Implementation::DialogueReply(_) if !reply_eligible => None,
                 implementation => Some(implementation.registration()),
             })
@@ -270,7 +269,9 @@ impl ToolRegistry {
         use microcrab_auditor::ToolPresentation;
         let entry = self.entries.get(name)?;
         match &entry.implementation {
-            Implementation::Builtin(BuiltinTool::ViewImage, _) => Some(ToolPresentation::ViewImage),
+            Implementation::Builtin(BuiltinTool::Reference, _) => {
+                Some(ToolPresentation::Reference)
+            }
             Implementation::Builtin(BuiltinTool::SendMessage | BuiltinTool::Escalate, _) => {
                 Some(ToolPresentation::MessageReceipt)
             }
@@ -385,23 +386,8 @@ impl ToolRegistry {
         } else {
             entry.secret_delivery
         };
-        let image_witness = invocation
-            .image_source
-            .as_ref()
-            .map(|source| source.policy_arguments());
         secret::resolve(call, invocation, delivery, |resolved| {
-            if let Some(expected) = image_witness {
-                if !matches!(
-                    &entry.implementation,
-                    Implementation::Builtin(BuiltinTool::ViewImage, _)
-                ) || expected != resolved.arguments
-                {
-                    return Err(Error::denied("approved image source differs from dispatch"));
-                }
-                Ok(())
-            } else {
-                self.validate_inner(resolved, false)
-            }
+            self.validate_inner(resolved, false)
         })
     }
     #[cfg(feature = "wasm")]
@@ -427,9 +413,8 @@ impl ToolRegistry {
             return true;
         }
         self.origin(&call.name) == Some(ToolOrigin::Builtin)
-            && (call.name == super::view_image::NAME
-                || (call.name == "job"
-                    && crate::runtime::execution::job::is_redirect(&call.arguments)))
+            && call.name == "job"
+            && crate::runtime::execution::job::is_redirect(&call.arguments)
     }
     pub(crate) fn convert_text_arguments(&self, call: &mut ToolCall) -> usize {
         self.entries.get(&call.name).map_or(0, |entry| {
@@ -465,8 +450,8 @@ impl ToolRegistry {
             return Err(Error::Diagnostic(diagnostic));
         }
         match &entry.implementation {
-            Implementation::Builtin(BuiltinTool::Expand, _) => {
-                super::expand::validate_selectors(&call.arguments)?
+            Implementation::Builtin(BuiltinTool::Reference, _) => {
+                super::reference::validate(&call.arguments)?
             }
             Implementation::DialogueReply(_) => {
                 DialogueReplyRequest::decode(&call.arguments)?;

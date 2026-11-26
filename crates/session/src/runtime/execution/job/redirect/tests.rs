@@ -22,7 +22,7 @@ fn setup() -> (
 ) {
     let limits = Limits {
         max_execution_buffers: 1,
-        max_tool_image_bytes: 1, // This is not a private Bytes quota.
+        max_tool_image_bytes: 1, // This is not a Personal Content Library quota.
         ..Default::default()
     };
     let (state, endpoint) = State::new(limits.clone()).bind_writer(
@@ -73,7 +73,7 @@ async fn source(state: &State) -> Result<ExecutionId, Error> {
 }
 
 fn redirect(source: ExecutionId) -> Value {
-    json!({"id":format!("owner/{}", source.0),"action":"redirect","args":{"channel":"stdout","expected_mime":MIME,"variable":"binary"}})
+    json!({"id":format!("owner/{}", source.0),"action":"redirect","args":{"channel":"stdout","expected_mime":MIME,"title":"captured binary"}})
 }
 
 async fn bind(context: &mut ToolContext, arguments: &Value) -> ExecutionId {
@@ -135,12 +135,11 @@ async fn bind(context: &mut ToolContext, arguments: &Value) -> ExecutionId {
 }
 
 #[tokio::test]
-async fn admitted_redirect_shares_allocation_and_source_release_is_independent() {
+async fn admitted_redirect_mounts_library_reference_and_source_release_is_independent() {
     let (state, _endpoint, mut context) = setup();
     let id = source(&state).await.unwrap();
     let owner = state.executions();
     let lease = owner.private_output(id, "owner", "stdout", MIME).unwrap();
-    let pointer = lease.as_bytes().as_ptr();
     drop(lease);
     assert!(owner.private_output(id, "other", "stdout", MIME).is_err());
     assert!(
@@ -152,9 +151,9 @@ async fn admitted_redirect_shares_allocation_and_source_release_is_independent()
     assert!(page.chunks.is_empty());
     assert_eq!(page.private_stdout.unwrap().media_type, MIME);
     let arguments = redirect(id);
-    let operation = bind(&mut context, &arguments).await;
+    let _operation = bind(&mut context, &arguments).await;
     let mut altered = arguments.clone();
-    altered["args"]["variable"] = json!("other");
+    altered["args"]["expected_mime"] = json!("image/png");
     assert!(
         super::super::Job
             .execute(altered, context.clone())
@@ -172,113 +171,58 @@ async fn admitted_redirect_shares_allocation_and_source_release_is_independent()
     assert!(!output.content.contains("PRIVATE_NOT_PUBLIC"));
     let receipt: Value = serde_json::from_str(&output.content).unwrap();
     assert_eq!(receipt["source_released"], false);
-    assert_eq!(
-        receipt["variable"]["redirect_execution_id"],
-        operation.0.to_string()
-    );
-    let inspection = state.inspection().unwrap();
-    let metadata = &inspection.bytes["binary"];
-    assert_eq!(serde_json::to_value(metadata).unwrap(), receipt["variable"]);
-    assert!(inspection.values.get("binary").is_none());
-    assert!(
-        super::super::Job
-            .execute(arguments.clone(), context.clone())
-            .await
-            .is_err()
-    );
-    assert!(super::super::bind_redirect_destination(&arguments, &mut context).is_err());
+    assert_eq!(receipt["reference"]["title"], "captured binary");
+    assert_eq!(receipt["reference"]["media_type"], MIME);
+    let ref_id = receipt["reference"]["id"].as_str().unwrap().to_owned();
     owner.release(id, CancellationToken::new()).await.unwrap();
     assert!(owner.private_output(id, "owner", "stdout", MIME).is_err());
-    state
-        .with_image_bytes(&metadata.selector, |mime, bytes| {
-            assert_eq!(mime, MIME);
-            assert_eq!(bytes, RAW);
-            assert_eq!(bytes.as_ptr(), pointer);
-            Ok(())
-        })
-        .unwrap();
-    assert!(
-        source(&state).await.is_err(),
-        "variable still owns the original allocation charge"
-    );
-    state
-        .remove_bytes_checked("binary", inspection.witness)
+    let stored = state
+        .reference_library()
+        .read(&ref_id, CancellationToken::new())
         .await
+        .unwrap()
         .unwrap();
-    assert!(
-        source(&state).await.is_ok(),
-        "last owner deletion refunds source allocation"
-    );
+    assert_eq!(stored.media_type, MIME);
+    assert_eq!(stored.as_bytes(), RAW);
     owner.close().await.unwrap();
 }
 
 #[tokio::test]
-async fn admission_pins_revision_and_incarnation_and_dropped_fence_cannot_write() {
-    let (state, endpoint, mut context) = setup();
-    let id = source(&state).await.unwrap();
-    let registry = state.executions();
-    let arguments = redirect(id);
-    bind(&mut context, &arguments).await;
-    state.inject("changed", json!(true)).await.unwrap();
-    assert!(matches!(
-        super::super::Job
-            .execute(arguments.clone(), context.clone())
-            .await,
-        Err(Error::VariableConflict)
+async fn library_quota_limit_blocks_overflow_without_lru() {
+    let limits = Limits {
+        max_execution_buffers: 1,
+        ..Default::default()
+    };
+    let state = State::new(limits);
+    let library = Arc::new(crate::state::reference::InMemoryReferenceLibrary::new(
+        1024,
+        2,
+        1024,
+        None,
     ));
-    assert!(state.inspection().unwrap().bytes.is_empty());
-
-    let destination = state.prepare_redirect_destination("binary").unwrap();
-    let lease = registry
-        .private_output(id, "owner", "stdout", MIME)
-        .unwrap();
-    let (foreign, _foreign_endpoint, _) = setup();
-    let signal = CancellationToken::new();
-    assert!(matches!(
-        foreign
-            .commit_redirect(destination.clone(), lease.clone(), ExecutionId(1), &signal)
-            .await,
-        Err(Error::VariableConflict)
-    ));
-    let fence = endpoint.fence().await.unwrap();
-    let mut commit = Box::pin(state.commit_redirect(destination, lease, ExecutionId(1), &signal));
-    assert!(futures_util::poll!(&mut commit).is_pending());
-    drop(commit);
-    drop(fence);
-    let fence = endpoint.fence().await.unwrap();
-    assert!(state.inspection().unwrap().bytes.is_empty());
-    drop(fence);
-    registry.close().await.unwrap();
-}
-
-#[tokio::test]
-async fn shared_redirects_still_charge_the_private_entry_quota() {
-    let (state, _endpoint, _) = setup();
+    state.install_reference_library(library);
     let registry = state.executions();
     let id = source(&state).await.unwrap();
-    let lease = registry
-        .private_output(id, "owner", "stdout", MIME)
-        .unwrap();
+    let lease = registry.private_output(id, "owner", "stdout", MIME).unwrap();
     let signal = CancellationToken::new();
-    for index in 0..64 {
-        let destination = state
-            .prepare_redirect_destination(&format!("binary_{index}"))
+    for index in 0..2 {
+        let dest = state
+            .prepare_library_redirect(MIME, Some(&format!("item_{index}")))
             .unwrap();
         state
-            .commit_redirect(destination, lease.clone(), ExecutionId(index + 10), &signal)
+            .commit_library_redirect(dest, lease.clone(), ExecutionId(index + 10), &signal)
             .await
             .unwrap();
     }
-    let free_name = state
-        .prepare_redirect_destination("binary_overflow")
+    let overflow = state
+        .prepare_library_redirect(MIME, Some("overflow"))
         .unwrap();
     assert!(matches!(
-        state.commit_redirect(free_name, lease, ExecutionId(100), &signal).await,
-        Err(Error::Limit(limit)) if limit.kind == LimitKind::PrivateVariableEntries
+        state
+            .commit_library_redirect(overflow, lease, ExecutionId(100), &signal)
+            .await,
+        Err(Error::Limit(limit)) if limit.kind == LimitKind::LibraryStorageEntries
     ));
-    let observed = state.inspection().unwrap();
-    assert_eq!(observed.bytes.len(), 64);
-    assert!(!observed.bytes.contains_key("binary_overflow"));
     registry.close().await.unwrap();
 }
 
@@ -293,37 +237,16 @@ async fn redirect_reserves_its_full_receipt_budget_before_publication() {
         super::super::Job.execute(arguments, context).await,
         Err(Error::Limit(limit)) if limit.kind == LimitKind::ToolOutput
     ));
-    assert!(state.inspection().unwrap().bytes.is_empty());
-    state.executions().close().await.unwrap();
-}
-
-#[test]
-fn maximum_receipt_fits_pre_effect_reservation() {
-    use crate::state::access::{
-        BytesVariableAvailability, BytesVariableKind, BytesVariableLifecycle,
-    };
-    let receipt = Receipt {
-        action: REDIRECT,
-        source_released: false,
-        variable: BytesVariableMetadata {
-            name: "n".repeat(128),
-            kind: BytesVariableKind::Bytes,
-            media_type: format!("a/{}", "a".repeat(125)),
-            byte_length: u64::MAX,
-            lifecycle: BytesVariableLifecycle::Ephemeral,
-            availability: BytesVariableAvailability::Available,
-            revision: u64::MAX.to_string(),
-            selector: format!("bytes_{}_{:016x}", "f".repeat(32), u64::MAX),
-            redirect_execution_id: Some(u64::MAX.to_string()),
-        },
-    };
-    assert!(microcrab_agent_types::is_capture_mime(
-        &receipt.variable.media_type
-    ));
-    assert_eq!(
-        serde_json::to_string(&receipt).unwrap().len(),
-        MAX_RECEIPT_BYTES
+    assert!(
+        state
+            .reference_library()
+            .projections(CancellationToken::new())
+            .await
+            .unwrap()
+            .exact
+            .is_none()
     );
+    state.executions().close().await.unwrap();
 }
 
 #[test]
@@ -342,8 +265,8 @@ fn literal_scalar_only_and_uncertain_ack_is_not_retryable() {
             "/args/expected_mime",
             json!(format!("a/{}", "a".repeat(126))),
         ),
-        ("/args/variable", json!("{{secret:name}}")),
-        ("/args/variable", json!("{{var:name}}")),
+        ("/args/title", json!("")),
+        ("/args/title", json!("   ")),
     ] {
         let mut call = good.clone();
         *call.pointer_mut(path).unwrap() = invalid;

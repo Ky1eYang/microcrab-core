@@ -575,7 +575,6 @@ impl PermissionController {
         &self,
         snapshot: &PolicySnapshot,
         request: &PermissionRequest,
-        preview: Option<&crate::runtime::tool::view_image::ApprovalPreview>,
         state: &crate::State,
         issuer: &crate::context::Content,
         cancellation: &CancellationToken,
@@ -609,11 +608,7 @@ impl PermissionController {
         };
         // Opening the lease-backed interaction precedes review. No executor can
         // therefore be bypassed by even a valid automatic reviewer Allow.
-        let owner_request = preview.map(|preview| PermissionRequest {
-            arguments: preview.owner.clone(),
-            ..request.clone()
-        });
-        let owner_request = owner_request.as_ref().unwrap_or(request);
+        let owner_request = request;
         let interaction = match self
             .adapter
             .open_interaction(owner_request, &attribution)
@@ -648,7 +643,7 @@ impl PermissionController {
                     state,
                     issuer,
                     request,
-                    preview.map(|preview| &preview.reviewer),
+                    None,
                     &review_cancellation,
                 )
                 .await
@@ -682,9 +677,6 @@ impl PermissionController {
                     let received_at=tokio::time::Instant::now();
                     if let Ok(result) = result
                         && result.action != Action::Ask
-                        // A redacted source preview cannot support an informed
-                        // automatic Allow. An explicit policy or owner can still allow.
-                        && (preview.is_none() || result.action != Action::Allow)
                         && received_at < initial_deadline
                     {
                         validate_review_result(&result, request).map_err(|e| PermissionError::InvalidConfiguration(e.to_string()))?;

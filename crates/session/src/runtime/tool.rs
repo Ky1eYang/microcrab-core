@@ -4,13 +4,12 @@ mod catalog;
 mod context;
 pub mod delegate;
 mod dialogue_reply;
-pub mod expand;
 pub(crate) mod injection;
 mod messaging;
+pub mod reference;
 pub(crate) mod secret;
 pub mod sleep;
 pub(crate) mod switch_mode;
-pub(crate) mod view_image;
 pub use authorization::{AllowTools, DenyAll};
 pub(crate) use catalog::ToolRegistry;
 pub use dialogue_reply::{
@@ -50,12 +49,8 @@ pub struct ToolContext {
     pub execution_progress: Option<super::execution::ExecutionProgress>,
     resolved_arguments: Option<Arc<secret::ResolvedArguments>>,
     pub(crate) literal_mask: injection::LiteralMask,
-    pub(crate) redirect_destination: Option<crate::state::access::RedirectDestination>,
+    pub(crate) redirect_destination: Option<crate::state::reference::LibraryRedirectDestination>,
     pub(crate) file_version_policy_arguments: Option<Arc<Value>>,
-    pub(crate) image_source: Option<Arc<view_image::Source>>,
-    pub(crate) image_approval_preview: Option<view_image::ApprovalPreview>,
-    pub(crate) image_https: Option<Arc<std::sync::Mutex<Option<view_image::PendingHttps>>>>,
-    pub(crate) image_model: Option<Arc<dyn crate::Client>>,
     redaction: super::execution::InvocationRedaction,
     cache_scope: Option<super::cache::Scope>,
     cache_collector: Arc<super::cache::Collector>,
@@ -136,11 +131,10 @@ pub enum BuiltinTool {
     Delegate,
     Job,
     Sleep,
-    Expand,
+    Reference,
     SwitchMode,
     SendMessage,
     Escalate,
-    ViewImage,
 }
 
 impl BuiltinTool {
@@ -149,11 +143,10 @@ impl BuiltinTool {
             "delegate" => Some(Self::Delegate),
             "job" => Some(Self::Job),
             "sleep" => Some(Self::Sleep),
-            "expand" => Some(Self::Expand),
+            reference::NAME => Some(Self::Reference),
             "switch_mode" => Some(Self::SwitchMode),
             "send_message" => Some(Self::SendMessage),
             "escalate" => Some(Self::Escalate),
-            view_image::NAME => Some(Self::ViewImage),
             _ => None,
         }
     }
@@ -163,11 +156,10 @@ impl BuiltinTool {
             Self::Delegate => delegate::Delegate.definition(),
             Self::Job => super::execution::job::Job.definition(),
             Self::Sleep => sleep::Sleep.definition(),
-            Self::Expand => expand::Expand.definition(),
+            Self::Reference => reference::Reference::definition(),
             Self::SwitchMode => switch_mode::SwitchMode::definition(),
             Self::SendMessage => messaging::SendMessage.definition(),
             Self::Escalate => messaging::Escalate.definition(),
-            Self::ViewImage => view_image::ViewImage.definition(),
         }
     }
 
@@ -176,11 +168,10 @@ impl BuiltinTool {
             Self::Delegate => Arc::new(delegate::Delegate),
             Self::Job => Arc::new(super::execution::job::Job),
             Self::Sleep => Arc::new(sleep::Sleep),
-            Self::Expand => Arc::new(expand::Expand),
+            Self::Reference => Arc::new(reference::Reference),
             Self::SwitchMode => Arc::new(switch_mode::SwitchMode),
             Self::SendMessage => Arc::new(messaging::SendMessage),
             Self::Escalate => Arc::new(messaging::Escalate),
-            Self::ViewImage => Arc::new(view_image::ViewImage),
         }
     }
 }
@@ -220,8 +211,8 @@ pub(crate) fn short_model_refs(definitions: &[ToolDefinition]) -> bool {
 pub fn builtin_tools() -> [ToolRegistration; 5] {
     [
         ToolRegistration::Builtin(BuiltinTool::Delegate),
-        ToolRegistration::Builtin(BuiltinTool::Expand),
         ToolRegistration::Builtin(BuiltinTool::Job),
+        ToolRegistration::Builtin(BuiltinTool::Reference),
         ToolRegistration::Builtin(BuiltinTool::Sleep),
         ToolRegistration::Builtin(BuiltinTool::SwitchMode),
     ]

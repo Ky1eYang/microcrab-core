@@ -18,7 +18,7 @@ fn shell_tool(host: &HostInfo) -> Result<Option<(&str, &'static str)>, String> {
         .filter(|name| {
             !matches!(
                 *name,
-                "job" | "delegate" | "sleep" | "expand" | "switch_mode" | "view_image"
+                "job" | "delegate" | "sleep" | "reference" | "switch_mode"
             )
         })
         .ok_or("Host shell must provide a portable, nonreserved tool name")?;
@@ -515,7 +515,7 @@ mod tests {
             "job",
             "delegate",
             "sleep",
-            "expand",
+            "reference",
         ] {
             let mut host = host(OsFamily::Other);
             host.shell = shell.into();
