@@ -145,6 +145,7 @@ fn client(
         api_key: None,
         timeout_ms: idle_ms,
         max_response_bytes: 65536,
+        headers: Default::default(),
     })
     .unwrap()
     .with_observer(observer)

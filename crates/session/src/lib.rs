@@ -41,8 +41,10 @@ pub use session::{
     SettlementGuard, TurnRouting,
 };
 pub use state::{
-    DynReference, ListedReference, Reference, ReferenceContent, ReferenceInfo, ReferenceLibrary,
-    ReferencePayload, SessionState, State, VariableCommit, VariableDescriptor, VariableInspection,
+    CompositeReference, DynReference, ListedReference, Reference, ReferenceCapabilities,
+    ReferenceContent, ReferenceEntry, ReferenceError, ReferenceErrorKind, ReferenceInfo,
+    ReferenceNodeKind, ReferencePatch, ReferencePayload, ReferenceProjection, ReferenceQuota,
+    ReferenceWrite, SessionState, State, VariableCommit, VariableDescriptor, VariableInspection,
     VariableWitness,
 };
 

@@ -467,29 +467,45 @@ async fn fork_rejects_an_admitted_foreground_turn() {
 }
 
 struct StaticSkills;
+#[async_trait]
 impl microcrab_session::Reference for StaticSkills {
-    type Error = std::convert::Infallible;
     fn kind(&self) -> &str {
         "skills"
     }
-    fn load(&self) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send {
-        std::future::ready(Ok(()))
+    fn capabilities(&self) -> microcrab_session::ReferenceCapabilities {
+        microcrab_session::ReferenceCapabilities::read_only()
     }
-    fn list(&self) -> Result<Vec<microcrab_session::ReferenceInfo>, Self::Error> {
-        Ok(vec![microcrab_session::ReferenceInfo {
+    async fn load(&self, _cancel: CancellationToken) -> Result<(), microcrab_session::ReferenceError> {
+        Ok(())
+    }
+    fn list(&self) -> Result<Vec<microcrab_session::ReferenceEntry>, microcrab_session::ReferenceError> {
+        Ok(vec![microcrab_session::ReferenceEntry {
             id: "skill#fork".into(),
+            node_kind: microcrab_session::ReferenceNodeKind::File,
+            parent_id: None,
             title: "Fork skill".into(),
-            location: "fixture/skill.md".into(),
-            description: "inherited catalog fixture".into(),
+            location: Some("fixture/skill.md".into()),
+            description: Some("inherited catalog fixture".into()),
+            media_type: Some("text/markdown".into()),
+            revision: "rev1".into(),
+            writable: false,
+            metadata: None,
         }])
     }
-    fn read(&self, id: &str) -> Result<Option<microcrab_session::ReferenceContent>, Self::Error> {
+    fn projections(&self) -> Result<microcrab_session::ReferenceProjection, microcrab_session::ReferenceError> {
+        Ok(microcrab_session::ReferenceProjection {
+            exact: Some(json!({"catalog": self.list()?})),
+            short_model: None,
+        })
+    }
+    async fn expand(
+        &self,
+        id: &str,
+        _cancel: CancellationToken,
+    ) -> Result<Option<microcrab_session::ReferenceContent>, microcrab_session::ReferenceError> {
         Ok((id == "skill#fork").then(|| {
             microcrab_session::ReferenceContent::text(id, "Inherited reference body ✓")
         }))
-    }
-    fn change(&self) -> Result<Option<Value>, Self::Error> {
-        Ok(Some(json!({"catalog": self.list()?})))
     }
 }
 struct ExpandInherited(AtomicUsize);
@@ -554,7 +570,8 @@ async fn fork_without_reference_override_keeps_inherited_ids_expandable() {
     assert_eq!(
         target
             .state_handle()
-            .read_reference("skill#fork")
+            .expand_reference("skill#fork", CancellationToken::new())
+            .await
             .unwrap()
             .as_text(),
         Some("Inherited reference body ✓")

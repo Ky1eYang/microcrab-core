@@ -89,6 +89,7 @@ impl Decoder {
             .map(|usage| super::decode_usage(Some(usage)))
             .transpose()?;
         if !self.content.is_empty()
+            && self.refusal.is_empty()
             && self.calls.is_empty()
             && !self.unrecognized_delta
             && measured
@@ -158,17 +159,16 @@ impl Decoder {
             .get("delta")
             .and_then(Value::as_object)
             .ok_or_else(|| Error::protocol("missing SSE delta"))?;
-        self.unrecognized_delta |= delta.keys().any(|key| {
-            !matches!(
-                key.as_str(),
-                "role" | "content" | "reasoning_content" | "reasoning" | "tool_calls"
-            )
-        });
+        self.unrecognized_delta |= delta
+            .iter()
+            .any(|(key, value)| !is_recognized_delta_field(key, value));
         if let Some(role) = delta.get("role").filter(|v| !v.is_null())
             && role.as_str() != Some("assistant")
         {
             return Err(Error::protocol("invalid SSE role"));
         }
+        // Compatible relays (e.g. vLLM/OneAPI proxies) may emit empty-string
+        // `finish_reason: ""` on intermediate chunks before the terminal reason.
         let reason = choice
             .get("finish_reason")
             .filter(|value| !value.is_null())
@@ -177,7 +177,8 @@ impl Decoder {
                     .as_str()
                     .ok_or_else(|| Error::protocol("invalid finish reason"))
             })
-            .transpose()?;
+            .transpose()?
+            .filter(|value| !value.is_empty());
         // Validate both aliases even when the other supplies display text. A
         // malformed wrapper must not become harmless merely because we finished.
         for key in ["content", "reasoning_content", "reasoning", "refusal"] {
@@ -194,10 +195,15 @@ impl Decoder {
             return Err(Error::protocol("invalid SSE tool calls"));
         }
         if let Some(finish) = &self.finish {
-            if reason.is_some_and(|reason| reason != finish) {
-                return Err(Error::protocol("conflicting SSE finish reason"));
+            if let Some(next_reason) = reason.filter(|r| *r != finish) {
+                return Err(Error::Protocol(
+                    format!(
+                        "conflicting SSE finish reason: prior={finish:?}, next={next_reason:?}"
+                    )
+                    .into(),
+                ));
             }
-            if ["content", "reasoning_content", "reasoning"]
+            if ["content", "reasoning_content", "reasoning", "refusal"]
                 .iter()
                 .any(|key| {
                     delta
@@ -210,16 +216,26 @@ impl Decoder {
                     .and_then(Value::as_array)
                     .is_some_and(|calls| !calls.is_empty())
             {
-                return Err(Error::protocol("content after SSE finish reason"));
+                let preview = serde_json::to_string(delta).unwrap_or_default();
+                return Err(Error::Protocol(
+                    format!(
+                        "content after SSE finish reason {finish:?}: delta={}",
+                        microcrab_protocol::diagnostic::sanitize(&preview, 256)
+                    )
+                    .into(),
+                ));
             }
-            if delta.keys().any(|key| {
-                !matches!(
-                    key.as_str(),
-                    "role" | "content" | "reasoning_content" | "reasoning" | "tool_calls"
-                )
-            }) {
-                return Err(Error::protocol(
-                    "unexpected SSE delta field after finish reason",
+            if let Some((unexpected_key, _)) = delta
+                .iter()
+                .find(|(key, value)| !is_recognized_delta_field(key, value))
+            {
+                let preview = serde_json::to_string(delta).unwrap_or_default();
+                return Err(Error::Protocol(
+                    format!(
+                        "unexpected SSE delta field after finish reason {finish:?}: key={unexpected_key:?}, delta={}",
+                        microcrab_protocol::diagnostic::sanitize(&preview, 256)
+                    )
+                    .into(),
                 ));
             }
             // Cumulative usage was retained above. Redundant terminal wrappers
@@ -360,6 +376,27 @@ fn optional_text(value: Option<&Value>) -> Result<Option<String>, Error> {
                 .ok_or_else(|| Error::protocol("invalid SSE string field"))
         })
         .transpose()
+}
+
+fn is_recognized_delta_field(key: &str, value: &Value) -> bool {
+    match key {
+        "role" | "content" | "reasoning_content" | "reasoning" | "tool_calls" => true,
+        "refusal" => value.is_null() || value.as_str().is_some_and(str::is_empty),
+        "extra_fields" => {
+            value.is_null() || value.as_object().is_some_and(serde_json::Map::is_empty)
+        }
+        "function_call" => value.is_null() || is_empty_function_call(value),
+        _ => false,
+    }
+}
+
+fn is_empty_function_call(value: &Value) -> bool {
+    value.as_object().is_some_and(|object| {
+        object.iter().all(|(key, val)| {
+            matches!(key.as_str(), "name" | "arguments")
+                && (val.is_null() || val.as_str().is_some_and(str::is_empty))
+        })
+    })
 }
 
 #[cfg(test)]
@@ -1059,5 +1096,68 @@ mod tests {
         let mut decoder = Decoder::default();
         let err = decoder.push(wire.as_bytes(), false).unwrap_err();
         assert!(err.to_string().contains("unsupported SSE tool type"));
+    }
+
+    #[test]
+    fn empty_string_finish_reason_and_empty_compat_fields_are_accepted() {
+        let wire = concat!(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\",\"extra_fields\":null,\"refusal\":\"\"},\"finish_reason\":\"\"}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Checking \",\"extra_fields\":null,\"refusal\":\"\"},\"finish_reason\":\"\"}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"browser__snapshot\",\"arguments\":\"{}\"}}],\"extra_fields\":null,\"refusal\":\"\"},\"finish_reason\":\"\"}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\",\"function_call\":{\"name\":\"\",\"arguments\":\"\"},\"extra_fields\":null,\"refusal\":\"\"},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":25,\"total_tokens\":125}}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let mut decoder = Decoder::default();
+        let mut events = decoder.push(wire.as_bytes(), false).unwrap();
+        events.extend(decoder.push(&[], true).unwrap());
+        assert_eq!(
+            events,
+            vec![
+                ModelEvent::TextDelta {
+                    text: "Checking ".into()
+                },
+                ModelEvent::ToolCallDelta {
+                    index: 0,
+                    id: Some("call_1".into()),
+                    name: Some("browser__snapshot".into()),
+                    arguments: "{}".into(),
+                }
+            ]
+        );
+        let (value, snapshots, gateway_text_complete) = decoder.into_value().unwrap();
+        assert!(!gateway_text_complete);
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(value["choices"][0]["finish_reason"], "tool_calls");
+        assert_eq!(value["choices"][0]["message"]["content"], "Checking ");
+        assert_eq!(value["choices"][0]["message"]["tool_calls"][0]["id"], "call_1");
+    }
+
+    #[test]
+    fn post_finish_non_empty_content_and_unexpected_delta_include_diagnostics() {
+        let content_after = concat!(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"refusal\":\"blocked\"},\"finish_reason\":\"stop\"}]}\n\n",
+        );
+        let err = Decoder::default()
+            .push(content_after.as_bytes(), false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("content after SSE finish reason \"stop\""), "{err}");
+        assert!(err.contains("delta="), "{err}");
+
+        let extra_after = concat!(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"function_call\":{\"name\":\"foo\",\"arguments\":\"{}\"}},\"finish_reason\":\"stop\"}]}\n\n",
+        );
+        let err = Decoder::default()
+            .push(extra_after.as_bytes(), false)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("unexpected SSE delta field after finish reason \"stop\""),
+            "{err}"
+        );
+        assert!(err.contains("key=\"function_call\""), "{err}");
     }
 }

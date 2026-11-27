@@ -82,6 +82,7 @@ async fn all_real_adapters_preserve_cancelled_terminal_when_accepted_body_ack_is
             api_key: None,
             timeout_ms: 10_000,
             max_response_bytes: 1024 * 1024,
+            headers: Default::default(),
         })
         .unwrap()
         .with_recording(recorder.clone());
@@ -155,6 +156,7 @@ async fn outer_biased_cancellation_preserves_cancelled_terminal_for_every_adapte
             api_key: None,
             timeout_ms: 10_000,
             max_response_bytes: 1024 * 1024,
+            headers: Default::default(),
         })
         .unwrap()
         .with_recording(recorder.clone())
@@ -241,6 +243,7 @@ async fn all_real_adapters_retain_success_when_terminal_ack_receiver_stalls() {
             api_key: None,
             timeout_ms: 10_000,
             max_response_bytes: 1024 * 1024,
+            headers: Default::default(),
         })
         .unwrap()
         .with_recording(recorder.clone());

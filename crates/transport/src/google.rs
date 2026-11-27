@@ -49,6 +49,7 @@ impl std::fmt::Debug for GoogleConfig {
 #[derive(Clone)]
 pub struct Google {
     auth: crate::AuthMode,
+    headers: Vec<(reqwest::header::HeaderName, reqwest::header::HeaderValue)>,
     config: GoogleConfig,
     function_response_media: bool,
     http: reqwest::Client,
@@ -107,6 +108,7 @@ impl Google {
             .map_err(|_| Error::config("cannot construct provider HTTP client"))?;
         Ok(Self {
             auth: crate::AuthMode::default(),
+            headers: Vec::new(),
             config,
             function_response_media: false,
             http,
@@ -124,6 +126,14 @@ impl Google {
     pub fn with_auth_mode(mut self, auth: crate::AuthMode) -> Self {
         self.auth = auth;
         self
+    }
+
+    pub fn with_headers(
+        mut self,
+        headers: std::collections::BTreeMap<String, String>,
+    ) -> Result<Self, Error> {
+        self.headers = crate::config::parse_custom_headers(&headers)?;
+        Ok(self)
     }
 
     pub fn with_recording(mut self, recording: std::sync::Arc<dyn crate::ModelRecording>) -> Self {
@@ -376,9 +386,8 @@ impl Google {
         stream: bool,
     ) -> Result<Response, Error> {
         let endpoint = resolve_endpoint(&self.config.endpoint, &self.config.model, stream)?;
-        let mut builder = self
-            .http
-            .post(endpoint)
+        let mut builder =
+            crate::config::apply_custom_headers(self.http.post(endpoint), &self.headers)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .header(
                 reqwest::header::ACCEPT,

@@ -1,12 +1,12 @@
-//! Multi-action builtin tool for dynamic Session mounts, Personal Content Library items, and unified reference expansion.
+//! Multi-action builtin tool over the unified `Reference` trait:
+//! `expand`, `add`, `update`, `remove`, `refresh` routed by `id` / `kind` / capabilities.
 use crate::Error;
 use crate::admission::image::{MAX_IMAGE_BYTES, MAX_IMAGES_PER_TOOL_OUTPUT, image_type, validate_image};
 use crate::runtime::execution::MediaAttachment;
 use crate::runtime::tool::{FinalOutput, Tool, ToolContext, ToolOutput};
 use crate::state::reference::{
-    CreateLibraryObject, LocalBlobOrigin, ReferencePayload, ShortcutTarget, UpdateLibraryObject,
-    canonical_mime, detect_mime_from_bytes, inspect_binary_for_storage, normalize_shortcut,
-    valid_library_id,
+    ReferencePatch, ReferencePayload, ReferenceWrite, canonical_mime, detect_mime_from_bytes,
+    inspect_binary_for_storage,
 };
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -15,7 +15,7 @@ use serde_json::{Value, json};
 use std::collections::HashSet;
 
 pub const NAME: &str = "reference";
-pub const MAX_BATCH_IDS: usize = 16;
+pub const MAX_BATCH_IDS: usize = 128;
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Reference;
@@ -24,7 +24,7 @@ impl Reference {
     pub fn definition() -> ToolDefinition {
         ToolDefinition {
             name: NAME.into(),
-            description: "Inspect or manage session-visible references and Personal Content Library shortcuts. Actions: expand (text, images, or binary metadata by 1..16 IDs), add (create literal text/base64 or host/https shortcut and mount to this session), update (edit title, media_type, literal content, or shortcut target), remove (unmount 1..16 ref_ IDs from this session without deleting from global Personal Content Library), refresh (resync dynamic library metadata and projections)."
+            description: "Inspect or manage session-visible references across installed kinds (`references`, `skills`, `media`, etc.) according to each kind's declared capabilities. Actions: expand (directory children, file text/images/binary metadata, or Markdown sections by 1..128 IDs via `ids` or `id`), add (write text/base64 or locator hint to a writable kind or the default writable reference), update (edit an owned writable entry by ID), remove (unmount/remove 1..128 writable IDs via `ids` or `id`), refresh (resync refreshable kinds)."
                 .into(),
             parameters: json!({
                 "type": "object",
@@ -35,6 +35,11 @@ impl Reference {
                         "type": "string",
                         "enum": ["expand", "add", "update", "remove", "refresh"],
                         "description": "Operation to perform."
+                    },
+                    "kind": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "Optional target reference kind for add (defaults to the Session's default writable kind)."
                     },
                     "id": {
                         "oneOf": [
@@ -47,7 +52,15 @@ impl Reference {
                                 "items": { "type": "string", "minLength": 1 }
                             }
                         ],
-                        "description": "Reference ID or list of 1..16 unique IDs (for expand and remove; scalar ref_ ID for update)."
+                        "description": "Reference ID or list of 1..128 unique IDs (for expand and remove; scalar ID for update). Mutually exclusive with `ids`."
+                    },
+                    "ids": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": MAX_BATCH_IDS,
+                        "uniqueItems": true,
+                        "items": { "type": "string", "minLength": 1 },
+                        "description": "Batch selector of 1..128 unique reference IDs for expand or remove. Mutually exclusive with `id`."
                     },
                     "expected_revision": {
                         "type": "string",
@@ -64,25 +77,21 @@ impl Reference {
                         "type": "string",
                         "minLength": 3,
                         "maxLength": 127,
-                        "description": "Canonical lowercase MIME type without parameters (for literal add or update)."
+                        "description": "Canonical lowercase MIME type without parameters (for add or update)."
                     },
-                    "source": {
-                        "type": "object",
-                        "description": "Source specification for add or update: {type: 'literal', content, encoding?: 'utf8'|'base64', media_type?} | {type: 'host_path', path} | {type: 'host_glob', root, pattern} | {type: 'https', url} | {type: 'directory_url', url}.",
-                        "required": ["type"],
-                        "properties": {
-                            "type": {
-                                "type": "string",
-                                "enum": ["literal", "host_path", "host_glob", "https", "directory_url"]
-                            },
-                            "content": { "type": "string" },
-                            "encoding": { "type": "string", "enum": ["utf8", "base64"] },
-                            "media_type": { "type": "string", "minLength": 3, "maxLength": 127 },
-                            "path": { "type": "string", "minLength": 1 },
-                            "root": { "type": "string" },
-                            "pattern": { "type": "string", "minLength": 1 },
-                            "url": { "type": "string", "minLength": 1 }
-                        }
+                    "content": {
+                        "type": "string",
+                        "description": "Payload content string (UTF-8 or base64) for add or update."
+                    },
+                    "encoding": {
+                        "type": "string",
+                        "enum": ["utf8", "base64"],
+                        "description": "Encoding of `content` (defaults to utf8)."
+                    },
+                    "locator": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "Optional external locator hint interpreted by writable implementations that accept external pointers."
                     }
                 }
             }),
@@ -117,14 +126,37 @@ fn validate_inner(arguments: &Value) -> Result<(), Error> {
         .get("action")
         .and_then(Value::as_str)
         .ok_or_else(|| Error::tool("reference action must be a string"))?;
+    for key in object.keys() {
+        if !matches!(
+            key.as_str(),
+            "action"
+                | "kind"
+                | "id"
+                | "ids"
+                | "expected_revision"
+                | "title"
+                | "media_type"
+                | "content"
+                | "encoding"
+                | "locator"
+        ) {
+            return Err(Error::tool_dynamic(format!(
+                "unsupported reference parameter `{key}`"
+            )));
+        }
+    }
     match action {
         "expand" => {
-            parse_id_list(
-                object
-                    .get("id")
-                    .ok_or_else(|| Error::tool("reference expand requires id"))?,
-            )?;
-            for key in ["title", "media_type", "source", "expected_revision"] {
+            select_id_list(object, "expand")?;
+            for key in [
+                "kind",
+                "title",
+                "media_type",
+                "content",
+                "encoding",
+                "locator",
+                "expected_revision",
+            ] {
                 if object.contains_key(key) {
                     return Err(Error::tool_dynamic(format!(
                         "reference expand does not accept `{key}`"
@@ -133,19 +165,16 @@ fn validate_inner(arguments: &Value) -> Result<(), Error> {
             }
         }
         "remove" => {
-            let ids = parse_id_list(
-                object
-                    .get("id")
-                    .ok_or_else(|| Error::tool("reference remove requires id"))?,
-            )?;
-            for id in ids {
-                if !valid_library_id(&id) {
-                    return Err(Error::tool_dynamic(format!(
-                        "reference remove requires dynamic library ref_ IDs, got `{id}`"
-                    )));
-                }
-            }
-            for key in ["title", "media_type", "source", "expected_revision"] {
+            select_id_list(object, "remove")?;
+            for key in [
+                "kind",
+                "title",
+                "media_type",
+                "content",
+                "encoding",
+                "locator",
+                "expected_revision",
+            ] {
                 if object.contains_key(key) {
                     return Err(Error::tool_dynamic(format!(
                         "reference remove does not accept `{key}`"
@@ -154,53 +183,121 @@ fn validate_inner(arguments: &Value) -> Result<(), Error> {
             }
         }
         "add" => {
-            if object.contains_key("id") || object.contains_key("expected_revision") {
+            if object.contains_key("id")
+                || object.contains_key("ids")
+                || object.contains_key("expected_revision")
+            {
                 return Err(Error::tool(
-                    "reference add does not accept id or expected_revision",
+                    "reference add does not accept id, ids, or expected_revision",
                 ));
             }
-            let source = object
-                .get("source")
-                .ok_or_else(|| Error::tool("reference add requires source"))?;
-            let media_hint = object.get("media_type").and_then(Value::as_str);
-            let title = object.get("title").and_then(Value::as_str);
-            if let Some(t) = title {
-                validate_title(t)?;
+            if let Some(kind) = object.get("kind").and_then(Value::as_str)
+                && (kind.is_empty() || kind.contains('\0'))
+            {
+                return Err(Error::tool("kind must be nonempty"));
+            } else if object.contains_key("kind") && !object["kind"].is_string() {
+                return Err(Error::tool("kind must be a string"));
             }
-            let _ = parse_source(source, media_hint)?;
+            if let Some(t) = object.get("title").and_then(Value::as_str) {
+                validate_title(t)?;
+            } else if object.contains_key("title") && !object["title"].is_string() {
+                return Err(Error::tool("title must be a string"));
+            }
+            let has_content = object.contains_key("content");
+            let has_locator = object.contains_key("locator");
+            if !has_content && !has_locator {
+                return Err(Error::tool(
+                    "reference add requires `content` or `locator`",
+                ));
+            }
+            if has_content {
+                let _ = parse_payload_fields(object)?;
+            } else if object.contains_key("encoding") {
+                return Err(Error::tool("encoding requires content"));
+            }
+            if let Some(locator) = object.get("locator") {
+                let text = locator
+                    .as_str()
+                    .ok_or_else(|| Error::tool("locator must be a string"))?;
+                if text.trim().is_empty() || text.contains('\0') {
+                    return Err(Error::tool("locator must be nonempty"));
+                }
+            }
+            if let Some(mime) = object.get("media_type").and_then(Value::as_str) {
+                canonical_mime(mime)?;
+            } else if object.contains_key("media_type") && !object["media_type"].is_string() {
+                return Err(Error::tool("media_type must be a string"));
+            }
         }
         "update" => {
+            if object.contains_key("kind") || object.contains_key("ids") {
+                return Err(Error::tool(
+                    "reference update does not accept `kind` or `ids`",
+                ));
+            }
             let id = object
                 .get("id")
                 .and_then(Value::as_str)
                 .ok_or_else(|| Error::tool("reference update requires scalar string id"))?;
-            if !valid_library_id(id) {
-                return Err(Error::tool(
-                    "reference update requires a valid dynamic ref_ ID",
-                ));
+            if id.is_empty() || id.contains('\0') {
+                return Err(Error::tool("reference id must be nonempty"));
             }
-            let has_title = object.get("title").and_then(Value::as_str).is_some();
-            if let Some(t) = object.get("title").and_then(Value::as_str) {
+            let has_title = if let Some(v) = object.get("title") {
+                let t = v
+                    .as_str()
+                    .ok_or_else(|| Error::tool("title must be a string"))?;
                 validate_title(t)?;
-            }
-            let media_hint = object.get("media_type").and_then(Value::as_str);
-            if let Some(mime) = media_hint {
-                canonical_mime(mime)?;
-            }
-            let has_source = if let Some(source) = object.get("source") {
-                let _ = parse_source(source, media_hint)?;
                 true
             } else {
                 false
             };
-            if !has_title && media_hint.is_none() && !has_source {
+            let media_hint = if let Some(v) = object.get("media_type") {
+                let mime = v
+                    .as_str()
+                    .ok_or_else(|| Error::tool("media_type must be a string"))?;
+                canonical_mime(mime)?;
+                Some(mime)
+            } else {
+                None
+            };
+            let has_content = if object.contains_key("content") {
+                let _ = parse_payload_fields(object)?;
+                true
+            } else {
+                if object.contains_key("encoding") {
+                    return Err(Error::tool("encoding requires content"));
+                }
+                false
+            };
+            let has_locator = if let Some(v) = object.get("locator") {
+                let text = v
+                    .as_str()
+                    .ok_or_else(|| Error::tool("locator must be a string"))?;
+                if text.trim().is_empty() || text.contains('\0') {
+                    return Err(Error::tool("locator must be nonempty"));
+                }
+                true
+            } else {
+                false
+            };
+            if !has_title && media_hint.is_none() && !has_content && !has_locator {
                 return Err(Error::tool(
-                    "reference update requires at least one of title, media_type, or source",
+                    "reference update requires at least one of title, media_type, content, or locator",
                 ));
             }
         }
         "refresh" => {
-            for key in ["id", "title", "media_type", "source", "expected_revision"] {
+            for key in [
+                "kind",
+                "id",
+                "ids",
+                "title",
+                "media_type",
+                "content",
+                "encoding",
+                "locator",
+                "expected_revision",
+            ] {
                 if object.contains_key(key) {
                     return Err(Error::tool_dynamic(format!(
                         "reference refresh does not accept `{key}`"
@@ -225,12 +322,35 @@ fn validate_title(title: &str) -> Result<String, Error> {
     Ok(trimmed.to_owned())
 }
 
+fn select_id_list(
+    object: &serde_json::Map<String, Value>,
+    action: &str,
+) -> Result<Vec<String>, Error> {
+    match (object.get("id"), object.get("ids")) {
+        (Some(_), Some(_)) => Err(Error::tool_dynamic(format!(
+            "reference {action} accepts either `id` or `ids`, not both"
+        ))),
+        (Some(id), None) => parse_id_list(id),
+        (None, Some(ids)) => {
+            if !ids.is_array() {
+                return Err(Error::tool("reference ids must be an array of strings"));
+            }
+            parse_id_list(ids)
+        }
+        (None, None) => Err(Error::tool_dynamic(format!(
+            "reference {action} requires `id` or `ids`"
+        ))),
+    }
+}
+
 fn parse_id_list(value: &Value) -> Result<Vec<String>, Error> {
     let ids = match value {
         Value::String(id) => vec![id.clone()],
         Value::Array(items) => {
             if items.is_empty() || items.len() > MAX_BATCH_IDS {
-                return Err(Error::tool("reference id array must contain 1..=16 entries"));
+                return Err(Error::tool(
+                    "reference id array must contain 1..=128 entries",
+                ));
             }
             items
                 .iter()
@@ -249,168 +369,66 @@ fn parse_id_list(value: &Value) -> Result<Vec<String>, Error> {
             return Err(Error::tool("reference id must be nonempty"));
         }
         if !seen.insert(id.clone()) {
-            return Err(Error::tool("reference id list must contain unique IDs"));
+            return Err(Error::tool("reference id entries must be unique"));
         }
     }
     Ok(ids)
 }
 
-enum ParsedSource {
-    Literal {
-        media_type: String,
-        data: Vec<u8>,
-    },
-    Shortcut(ShortcutTarget),
-}
-
-fn parse_source(source: &Value, outer_media_type: Option<&str>) -> Result<ParsedSource, Error> {
-    let obj = source
-        .as_object()
-        .ok_or_else(|| Error::tool("reference source must be an object"))?;
-    let source_type = obj
-        .get("type")
+fn parse_payload_fields(
+    obj: &serde_json::Map<String, Value>,
+) -> Result<(String, ReferencePayload), Error> {
+    let content = obj
+        .get("content")
         .and_then(Value::as_str)
-        .ok_or_else(|| Error::tool("reference source requires type"))?;
-    match source_type {
-        "literal" => {
-            let allowed = ["type", "content", "encoding", "media_type"];
-            if obj.keys().any(|k| !allowed.contains(&k.as_str())) {
-                return Err(Error::tool("unsupported field in literal source"));
-            }
-            let content = obj
-                .get("content")
-                .and_then(Value::as_str)
-                .ok_or_else(|| Error::tool("literal source requires string content"))?;
-            let encoding = obj
-                .get("encoding")
-                .and_then(Value::as_str)
-                .unwrap_or("utf8");
-            let data = match encoding {
-                "utf8" => content.as_bytes().to_vec(),
-                "base64" => STANDARD
-                    .decode(content.trim())
-                    .map_err(|_| Error::tool("invalid base64 content in literal source"))?,
-                other => {
-                    return Err(Error::tool_dynamic(format!(
-                        "unsupported literal encoding `{other}`"
-                    )));
-                }
-            };
-            let hint = obj
-                .get("media_type")
-                .and_then(Value::as_str)
-                .or(outer_media_type);
-            let mime = match hint {
-                Some(raw) => inspect_binary_for_storage(raw, &data)?.0,
-                None => detect_mime_from_bytes(None, &data),
-            };
-            if encoding == "base64" && image_type(&mime).is_some() {
-                let _ = inspect_binary_for_storage(&mime, &data)?;
-            }
-            Ok(ParsedSource::Literal {
-                media_type: mime,
+        .ok_or_else(|| Error::tool("reference content must be a string"))?;
+    let encoding = obj
+        .get("encoding")
+        .and_then(Value::as_str)
+        .unwrap_or("utf8");
+    let data = match encoding {
+        "utf8" => content.as_bytes().to_vec(),
+        "base64" => STANDARD
+            .decode(content.trim())
+            .map_err(|_| Error::tool("invalid base64 content"))?,
+        other => {
+            return Err(Error::tool_dynamic(format!(
+                "unsupported encoding `{other}`"
+            )));
+        }
+    };
+    let hint = obj.get("media_type").and_then(Value::as_str);
+    let mime = match hint {
+        Some(raw) => inspect_binary_for_storage(raw, &data)?.0,
+        None => detect_mime_from_bytes(None, &data),
+    };
+    let (canonical, width, height) = inspect_binary_for_storage(&mime, &data)?;
+    let payload = if encoding == "utf8" && image_type(&canonical).is_none() {
+        ReferencePayload::Text(content.to_owned())
+    } else if canonical.starts_with("text/") || canonical == "application/json" {
+        if let Ok(text) = String::from_utf8(data.clone()) {
+            ReferencePayload::Text(text)
+        } else {
+            ReferencePayload::Binary {
                 data,
-            })
-        }
-        "host_path" => {
-            let allowed = ["type", "path", "project_id", "host_id", "workspace_id"];
-            if obj.keys().any(|k| !allowed.contains(&k.as_str())) {
-                return Err(Error::tool("unsupported field in host_path source"));
+                width,
+                height,
             }
-            let path = obj
-                .get("path")
-                .and_then(Value::as_str)
-                .ok_or_else(|| Error::tool("host_path source requires path"))?
-                .to_owned();
-            let target = ShortcutTarget::HostPath {
-                path,
-                project_id: obj.get("project_id").and_then(Value::as_str).map(str::to_owned),
-                host_id: obj.get("host_id").and_then(Value::as_str).map(str::to_owned),
-                workspace_id: obj
-                    .get("workspace_id")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned),
-            };
-            normalize_shortcut(&target)?;
-            Ok(ParsedSource::Shortcut(target))
         }
-        "host_glob" => {
-            let allowed = [
-                "type",
-                "root",
-                "pattern",
-                "project_id",
-                "host_id",
-                "workspace_id",
-            ];
-            if obj.keys().any(|k| !allowed.contains(&k.as_str())) {
-                return Err(Error::tool("unsupported field in host_glob source"));
-            }
-            let root = obj
-                .get("root")
-                .and_then(Value::as_str)
-                .unwrap_or(".")
-                .to_owned();
-            let pattern = obj
-                .get("pattern")
-                .and_then(Value::as_str)
-                .ok_or_else(|| Error::tool("host_glob source requires pattern"))?
-                .to_owned();
-            let target = ShortcutTarget::HostGlob {
-                root,
-                pattern,
-                project_id: obj.get("project_id").and_then(Value::as_str).map(str::to_owned),
-                host_id: obj.get("host_id").and_then(Value::as_str).map(str::to_owned),
-                workspace_id: obj
-                    .get("workspace_id")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned),
-            };
-            normalize_shortcut(&target)?;
-            Ok(ParsedSource::Shortcut(target))
+    } else {
+        ReferencePayload::Binary {
+            data,
+            width,
+            height,
         }
-        "https" => {
-            let allowed = ["type", "url"];
-            if obj.keys().any(|k| !allowed.contains(&k.as_str())) {
-                return Err(Error::tool("unsupported field in https source"));
-            }
-            let url = obj
-                .get("url")
-                .and_then(Value::as_str)
-                .ok_or_else(|| Error::tool("https source requires url"))?
-                .to_owned();
-            let target = ShortcutTarget::PublicHttps { url };
-            normalize_shortcut(&target)?;
-            Ok(ParsedSource::Shortcut(target))
-        }
-        "directory_url" => {
-            let allowed = ["type", "url"];
-            if obj.keys().any(|k| !allowed.contains(&k.as_str())) {
-                return Err(Error::tool("unsupported field in directory_url source"));
-            }
-            let url = obj
-                .get("url")
-                .and_then(Value::as_str)
-                .ok_or_else(|| Error::tool("directory_url source requires url"))?
-                .to_owned();
-            let target = ShortcutTarget::DirectoryUrl { url };
-            normalize_shortcut(&target)?;
-            Ok(ParsedSource::Shortcut(target))
-        }
-        other => Err(Error::tool_dynamic(format!(
-            "unsupported reference source type `{other}`"
-        ))),
-    }
+    };
+    Ok((canonical, payload))
 }
 
 #[async_trait]
 impl Tool for Reference {
     fn definition(&self) -> ToolDefinition {
         Self::definition()
-    }
-
-    fn media_output_bytes(&self) -> usize {
-        MAX_IMAGE_BYTES
     }
 
     async fn execute(&self, arguments: Value, context: ToolContext) -> Result<ToolOutput, Error> {
@@ -438,7 +456,7 @@ async fn execute_expand(
     obj: &serde_json::Map<String, Value>,
     context: &ToolContext,
 ) -> Result<ToolOutput, Error> {
-    let ids = parse_id_list(obj.get("id").expect("validate checked id"))?;
+    let ids = select_id_list(obj, "expand")?;
     let limits = context.state.snapshot().limits;
     let max_media_bytes = limits.max_tool_image_bytes.min(MAX_IMAGE_BYTES);
     let mut used_media_bytes: usize = 0;
@@ -524,43 +542,60 @@ async fn execute_add(
     obj: &serde_json::Map<String, Value>,
     context: &ToolContext,
 ) -> Result<ToolOutput, Error> {
-    let media_hint = obj.get("media_type").and_then(Value::as_str);
-    let parsed = parse_source(obj.get("source").expect("validate checked source"), media_hint)?;
-    let title = match obj.get("title").and_then(Value::as_str) {
-        Some(raw) => validate_title(raw)?,
-        None => match &parsed {
-            ParsedSource::Literal { media_type, .. } => format!("literal ({media_type})"),
-            ParsedSource::Shortcut(target) => {
-                let loc = target.location();
-                if loc.chars().count() > 256 {
-                    loc.chars().take(256).collect()
-                } else {
-                    loc
-                }
-            }
-        },
+    let explicit_kind = obj.get("kind").and_then(Value::as_str);
+    let title = obj
+        .get("title")
+        .and_then(Value::as_str)
+        .map(validate_title)
+        .transpose()?;
+    let locator_hint = obj
+        .get("locator")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .map(str::to_owned);
+    let (media_type, payload) = if obj.contains_key("content") {
+        parse_payload_fields(obj)?
+    } else {
+        let hint = obj
+            .get("media_type")
+            .and_then(Value::as_str)
+            .map(canonical_mime)
+            .transpose()?
+            .unwrap_or_else(|| "text/plain".into());
+        (hint, ReferencePayload::Text(String::new()))
     };
-    let request = match parsed {
-        ParsedSource::Literal { media_type, data } => CreateLibraryObject::LocalBlob {
-            id: None,
-            title,
-            media_type,
-            data,
-            origin: LocalBlobOrigin::AgentLiteral,
-            origin_execution_id: context.execution_id.map(|id| id.0.to_string()),
-        },
-        ParsedSource::Shortcut(target) => CreateLibraryObject::Shortcut { title, target },
+    let target_kind = explicit_kind.or_else(|| {
+        if let ReferencePayload::Binary { .. } = &payload
+            && image_type(&media_type).is_some()
+            && context
+                .state
+                .snapshot()
+                .references
+                .get("media")
+                .is_some_and(|r| r.capabilities().add)
+        {
+            Some("media")
+        } else {
+            None
+        }
+    });
+    let write = ReferenceWrite {
+        title,
+        media_type,
+        payload,
+        locator_hint,
     };
-    let library = context.state.reference_library();
-    let summary = library.add(request, context.cancellation.clone()).await?;
-    let quota = library.quota().await?;
-    context
+    let entry = context
         .state
-        .sync_library_projection(context.cancellation.clone())
+        .add_reference(target_kind, write, context.cancellation.clone())
+        .await?;
+    let quota = context
+        .state
+        .reference_quota(target_kind, context.cancellation.clone())
         .await?;
     Ok(ToolOutput::text(serde_json::to_string(&json!({
         "action": "add",
-        "reference": summary,
+        "reference": entry,
         "quota": quota,
     }))?))
 }
@@ -578,40 +613,38 @@ async fn execute_update(
         .and_then(Value::as_str)
         .map(validate_title)
         .transpose()?;
-    let media_hint = obj.get("media_type").and_then(Value::as_str);
-    let mut update = UpdateLibraryObject {
+    let (media_type, payload) = if obj.contains_key("content") {
+        let (mime, payload) = parse_payload_fields(obj)?;
+        (Some(mime), Some(payload))
+    } else {
+        let mime = obj
+            .get("media_type")
+            .and_then(Value::as_str)
+            .map(canonical_mime)
+            .transpose()?;
+        (mime, None)
+    };
+    let patch = ReferencePatch {
         expected_revision: obj
             .get("expected_revision")
             .and_then(Value::as_str)
             .map(str::to_owned),
         title,
-        media_type: media_hint.map(canonical_mime).transpose()?,
-        data: None,
-        target: None,
+        media_type,
+        payload,
+        locator_hint: obj
+            .get("locator")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .map(str::to_owned),
     };
-    if let Some(source) = obj.get("source") {
-        match parse_source(source, media_hint)? {
-            ParsedSource::Literal { media_type, data } => {
-                update.media_type = Some(media_type);
-                update.data = Some(data);
-            }
-            ParsedSource::Shortcut(target) => {
-                update.target = Some(target);
-            }
-        }
-    }
-    let summary = context
+    let entry = context
         .state
-        .reference_library()
-        .update(id, update, context.cancellation.clone())
-        .await?;
-    context
-        .state
-        .sync_library_projection(context.cancellation.clone())
+        .update_reference(id, patch, context.cancellation.clone())
         .await?;
     Ok(ToolOutput::text(serde_json::to_string(&json!({
         "action": "update",
-        "reference": summary,
+        "reference": entry,
     }))?))
 }
 
@@ -619,19 +652,15 @@ async fn execute_remove(
     obj: &serde_json::Map<String, Value>,
     context: &ToolContext,
 ) -> Result<ToolOutput, Error> {
-    let ids = parse_id_list(obj.get("id").expect("validate checked id"))?;
-    let library = context.state.reference_library();
+    let ids = select_id_list(obj, "remove")?;
     let mut results = Vec::with_capacity(ids.len());
     for id in ids {
-        let removed = library
-            .remove_mount(&id, context.cancellation.clone())
+        let removed = context
+            .state
+            .remove_reference(&id, context.cancellation.clone())
             .await?;
         results.push(json!({ "id": id, "removed": removed }));
     }
-    context
-        .state
-        .sync_library_projection(context.cancellation.clone())
-        .await?;
     Ok(ToolOutput::text(serde_json::to_string(&json!({
         "action": "remove",
         "results": results,
@@ -641,11 +670,38 @@ async fn execute_remove(
 async fn execute_refresh(context: &ToolContext) -> Result<ToolOutput, Error> {
     context
         .state
-        .refresh_library(context.cancellation.clone())
+        .refresh_references_async(context.cancellation.clone())
         .await?;
-    let quota = context.state.reference_library().quota().await?;
+    let quota = context
+        .state
+        .reference_quota(None, context.cancellation.clone())
+        .await?;
     Ok(ToolOutput::text(serde_json::to_string(&json!({
         "action": "refresh",
         "quota": quota,
     }))?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn expand_accepts_ids_array_id_selectors_and_up_to_128_entries() {
+        assert!(validate(&json!({"action": "expand", "ids": ["a", "b"]})).is_ok());
+        assert!(validate(&json!({"action": "expand", "id": "a"})).is_ok());
+        assert!(validate(&json!({"action": "expand", "id": ["a", "b"]})).is_ok());
+        assert!(validate(&json!({"action": "remove", "ids": ["a", "b"]})).is_ok());
+
+        let ids_128: Vec<String> = (0..128).map(|i| format!("ref-{i}")).collect();
+        assert!(validate(&json!({"action": "expand", "ids": ids_128})).is_ok());
+
+        let ids_129: Vec<String> = (0..129).map(|i| format!("ref-{i}")).collect();
+        assert!(validate(&json!({"action": "expand", "ids": ids_129})).is_err());
+
+        assert!(validate(&json!({"action": "expand", "id": "a", "ids": ["b"]})).is_err());
+        assert!(validate(&json!({"action": "expand", "ids": "scalar"})).is_err());
+        assert!(validate(&json!({"action": "expand"})).is_err());
+        assert!(validate(&json!({"action": "add", "ids": ["a"], "content": "x"})).is_err());
+    }
 }

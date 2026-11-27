@@ -52,15 +52,9 @@ pub(super) fn allows_ordinary_import(name: &str, item: &ComponentItem, engine: &
                     || (matches!(name, "create" | "append" | "mark-truncated" | "finish" | "attach-guest")
                         && matches!(export.ty, ComponentItem::ComponentFunc(_)))))
         }
-        super::references::INTERFACE => super::references::valid_import(item, engine),
+        super::script::INTERFACE => super::script::valid_import(item, engine),
         super::guest_observation::INTERFACE | super::guest_observation::BROWSER_INTERFACE => {
             super::guest_observation::valid_import(name, item, engine)
-        }
-        super::communication::TYPED_VARIABLES_INTERFACE => {
-            // Permit only admission facts, not access to Session variables.
-            matches!(item, ComponentItem::ComponentInstance(interface)
-                if interface.exports(engine).all(|(name, export)| matches!(export.ty, ComponentItem::Type(_))
-                    || (name == "tool-call-facts" && matches!(export.ty, ComponentItem::ComponentFunc(_)))))
         }
         "tool-output" | "tool-failure" | "driver-step" | "init-result" | "init-error" => {
             matches!(item, ComponentItem::Type(_))

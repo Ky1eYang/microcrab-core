@@ -1,14 +1,13 @@
 //! SQLite-backed owner-isolated Personal Content Library with separate blob and mount tables.
 use super::{
-    LibraryLimits, LibraryObjectRecord, PersonalLibrary, apply_object_update,
-    build_created_summary, validate_owner, validate_target_id,
+    CreateLibraryObject, LibraryLimits, LibraryObjectRecord, LibraryObjectSummary, LibraryQuota,
+    PersonalLibrary, UpdateLibraryObject, apply_object_update, build_created_summary,
+    validate_owner, validate_target_id,
 };
 use crate::sqlite::{failure, open};
 use async_trait::async_trait;
 use microcrab_session::Error;
-use microcrab_session::state::reference::library::{
-    CreateLibraryObject, LibraryObjectSummary, LibraryQuota, UpdateLibraryObject, valid_library_id,
-};
+use microcrab_session::state::reference::valid_library_id;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde_json::Value;
 use std::path::Path;

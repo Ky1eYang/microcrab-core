@@ -54,3 +54,4 @@ microcrab-agent-wit = { path = "crates/agent/wit" }
 
 microcrab-agent-types = { path = "crates/agent/types" }
 tera = { version = "2.4.0", default-features = false, features = ["preserve_order"] }
+rhai = { version = "1.27.0", features = ["sync", "serde", "internals"] }

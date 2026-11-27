@@ -432,9 +432,10 @@ pub trait Host: HostAPI {
     }
 
     /// Read a confined regular file directly into a caller-owned, precharged
-    /// binary allocation. No generic JSON/text carrier, retained source, or
-    /// duplicate raster is allowed. The Host owns the buffer until its actual
-    /// read worker settles, including when the caller drops its future.
+    /// binary allocation. Relative paths resolve against the bound Host root;
+    /// parent traversal (`..`) is rejected. No generic JSON/text carrier, retained
+    /// source, or duplicate raster is allowed. The Host owns the buffer until its
+    /// actual read worker settles, including when the caller drops its future.
     async fn read_private_file(
         &self,
         _path: PathBuf,

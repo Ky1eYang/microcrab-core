@@ -80,6 +80,7 @@ fn test_protocol_parsing_and_dispatch() {
             api_key: Some("secret".into()),
             timeout_ms: 5000,
             max_response_bytes: 65536,
+            headers: Default::default(),
         };
 
         let _client = create_client(config.clone()).unwrap();
@@ -192,4 +193,105 @@ fn test_openai_responses_adapt() {
     assert_eq!(input[3]["name"], "get_weather");
     assert_eq!(input[4]["type"], "function_call_output");
     assert_eq!(input[4]["call_id"], "call_123");
+}
+
+#[tokio::test]
+async fn custom_headers_are_sent_across_all_four_protocol_adapters() {
+    use microcrab_auditor::{EmptyVariableView, NoopAuditor};
+    use microcrab_transport::{Client, Content, ContentItem};
+    use std::collections::BTreeMap;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use tokio_util::sync::CancellationToken;
+
+    let mut headers = BTreeMap::new();
+    headers.insert("User-Agent".into(), "pi".into());
+    headers.insert("X-Client-Profile".into(), "test-header".into());
+
+    for (protocol, body) in [
+        (
+            Protocol::OpenaiCompatible,
+            r#"{"id":"1","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}"#,
+        ),
+        (
+            Protocol::OpenaiResponses,
+            r#"{"id":"1","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}]}"#,
+        ),
+        (
+            Protocol::Anthropic,
+            r#"{"id":"1","type":"message","role":"assistant","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn"}"#,
+        ),
+        (
+            Protocol::Google,
+            r#"{"candidates":[{"content":{"parts":[{"text":"ok"}],"role":"model"},"finishReason":"STOP"}]}"#,
+        ),
+    ] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}/v1", listener.local_addr().unwrap());
+        let body = body.to_owned();
+        let worker = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 8192];
+            let mut raw = Vec::new();
+            loop {
+                let n = socket.read(&mut buf).unwrap();
+                if n == 0 {
+                    break;
+                }
+                raw.extend_from_slice(&buf[..n]);
+                if raw.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let head = String::from_utf8_lossy(&raw).to_ascii_lowercase();
+            write!(
+                socket,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+            head
+        });
+        let client = TransportClient::new(TransportConfig {
+            auth: Default::default(),
+            protocol,
+            endpoint,
+            model: "fixture".into(),
+            api_key: Some("secret".into()),
+            timeout_ms: 5000,
+            max_response_bytes: 65536,
+            headers: headers.clone(),
+        })
+        .unwrap();
+        let res = client
+            .complete(
+                &Content {
+                    epoch: 0,
+                    subagent: None,
+                    system: "sys".into(),
+                    items: vec![ContentItem::User {
+                        envelope: None,
+                        parts: vec![InputPart::Text { text: "hi".into() }],
+                        source: None,
+                    }],
+                    tools: vec![],
+                    max_output_tokens: 64,
+                    max_bytes: 16384,
+                    turn_id: None,
+                    round: None,
+                },
+                &NoopAuditor,
+                &EmptyVariableView,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.content, "ok");
+        let head = worker.join().unwrap();
+        assert!(head.contains("user-agent: pi\r\n"), "{protocol:?}: {head}");
+        assert!(
+            head.contains("x-client-profile: test-header\r\n"),
+            "{protocol:?}: {head}"
+        );
+    }
 }

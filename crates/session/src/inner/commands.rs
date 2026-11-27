@@ -89,8 +89,14 @@ impl SessionInner {
         };
         let _cancel = CancelOnDrop(token.clone());
         if self.started.load(Ordering::SeqCst) {
-            self.load_references(&token).await?;
-            self.state.refresh_reference_projection()
+            let deadline = std::time::Duration::from_millis(self.state().limits.lifecycle_timeout_ms);
+            tokio::select! {
+                biased;
+                _ = token.cancelled() => Err(Error::Cancelled),
+                result = tokio::time::timeout(deadline, self.state.refresh_references_async(token.clone())) => {
+                    result.map_err(|_| Error::lifecycle("reference loading deadline"))?
+                }
+            }
         } else {
             self.initialize(&token).await
         }
@@ -105,7 +111,7 @@ impl SessionInner {
         tokio::select! {
             biased;
             _ = token.cancelled() => Err(Error::Cancelled),
-            result = tokio::time::timeout(deadline, self.state.load_references()) => {
+            result = tokio::time::timeout(deadline, self.state.load_references(token.clone())) => {
                 result.map_err(|_| Error::lifecycle("reference loading deadline"))?
             }
         }
@@ -339,6 +345,10 @@ impl SessionInner {
                 invocation.begin_initialization_cache()?;
                 invocation.turn_id = None;
                 invocation.round_id = None;
+                invocation.tool_description = Some(
+                    "Initialize the registered WASM agent component within its declared host import scope."
+                        .into(),
+                );
                 let request = PermissionRequest {
                     subject: subject.clone(),
                     session_id: invocation.session_id.clone(),

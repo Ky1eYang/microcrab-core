@@ -102,7 +102,10 @@ impl SessionInner {
             parts.kind,
             context.frozen_tools(),
         ));
-        state.install_references(crate::state::reference::References::new(parts.references)?)?;
+        state.install_references_with_default(
+            crate::state::reference::References::new(parts.references)?,
+            parts.default_writable_reference,
+        )?;
         let auditor = Arc::new(crate::observation::hooks::BoundAuditor {
             inner: parts.auditor,
             state: state.clone(),
@@ -206,7 +209,11 @@ impl SessionInner {
         let inner = Arc::new_cyclic(|weak: &std::sync::Weak<Self>| {
             let control: std::sync::Weak<dyn crate::runtime::tool::switch_mode::SessionControl> =
                 weak.clone();
-            parts.runtime.bind_controls(control);
+            parts.runtime.bind_controls(control.clone());
+            state.install_builtin_controls(control);
+            if let Some(executor) = parts.runtime.delegate_executor() {
+                state.install_delegate_executor(Arc::downgrade(&executor));
+            }
             let reply_owner: std::sync::Weak<dyn crate::runtime::tool::DialogueReplyOwner> =
                 weak.clone();
             parts.runtime.bind_dialogue_reply_owner(reply_owner);

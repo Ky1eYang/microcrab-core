@@ -43,7 +43,7 @@ impl crate::inner::SessionInner {
                     }
                     let row = listed
                         .iter()
-                        .find(|row| row.info.id == section_id)
+                        .find(|row| row.entry.id == section_id)
                         .ok_or_else(|| {
                             Error::denied("selected reference is absent from the parent catalog")
                         })?;
@@ -55,11 +55,22 @@ impl crate::inner::SessionInner {
                             "selected reference id is absent from effective parent State",
                         ));
                     }
-                    let content = self.state.read_reference(&section_id)?;
+                    let content = self
+                        .state
+                        .read_reference_async(&section_id, invocation.cancellation.clone())
+                        .await?;
                     let body = content.as_text().ok_or_else(|| {
                         Error::config("focused section reference must be UTF-8 text")
                     })?;
-                    FocusSnapshot::capture(row.info.clone(), body.to_owned())
+                    FocusSnapshot::capture(
+                        ReferenceInfo {
+                            id: row.entry.id.clone(),
+                            title: row.entry.title.clone(),
+                            location: row.entry.location.clone().unwrap_or_default(),
+                            description: row.entry.description.clone().unwrap_or_default(),
+                        },
+                        body.to_owned(),
+                    )
                 }
                 FocusSelection::File { path } => {
                     if path.is_empty() || path.len() > 4096 || path.contains('\0') {

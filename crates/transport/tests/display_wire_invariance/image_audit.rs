@@ -160,6 +160,7 @@ fn fixture(
         api_key: Some(API_KEY.into()),
         timeout_ms: 5000,
         max_response_bytes: 65536,
+        headers: Default::default(),
     })
     .unwrap()
     .with_recording(recorder);

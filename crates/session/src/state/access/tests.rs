@@ -1,11 +1,12 @@
 //! Projection refresh and hook commits are atomic; previews never call user code.
 use super::*;
-use crate::state::reference::{DynReference, Reference, ReferenceContent, ReferenceInfo};
+use crate::state::reference::{
+    DynReference, Reference, ReferenceCapabilities, ReferenceContent, ReferenceEntry, ReferenceError,
+    ReferenceProjection,
+};
+use async_trait::async_trait;
 use std::sync::atomic::{AtomicUsize, Ordering};
-
-#[derive(Debug, thiserror::Error)]
-#[error("projection failed")]
-struct ProjectionError;
+use tokio_util::sync::CancellationToken;
 
 struct Projection {
     kind: &'static str,
@@ -13,26 +14,42 @@ struct Projection {
     fail: Arc<AtomicBool>,
     calls: Arc<AtomicUsize>,
 }
+
+#[async_trait]
 impl Reference for Projection {
-    type Error = ProjectionError;
     fn kind(&self) -> &str {
         self.kind
     }
-    async fn load(&self) -> Result<(), Self::Error> {
+
+    fn capabilities(&self) -> ReferenceCapabilities {
+        ReferenceCapabilities::read_only()
+    }
+
+    async fn load(&self, _cancel: CancellationToken) -> Result<(), ReferenceError> {
         Ok(())
     }
-    fn list(&self) -> Result<Vec<ReferenceInfo>, Self::Error> {
+
+    fn list(&self) -> Result<Vec<ReferenceEntry>, ReferenceError> {
         Ok(vec![])
     }
-    fn read(&self, _: &str) -> Result<Option<ReferenceContent>, Self::Error> {
-        Ok(None)
-    }
-    fn change(&self) -> Result<Option<Value>, Self::Error> {
+
+    fn projections(&self) -> Result<ReferenceProjection, ReferenceError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         if self.fail.load(Ordering::SeqCst) {
-            return Err(ProjectionError);
+            return Err(ReferenceError::failed("projection failed"));
         }
-        Ok(self.value.lock().unwrap().clone())
+        Ok(ReferenceProjection {
+            exact: self.value.lock().unwrap().clone(),
+            short_model: None,
+        })
+    }
+
+    async fn expand(
+        &self,
+        _: &str,
+        _cancel: CancellationToken,
+    ) -> Result<Option<ReferenceContent>, ReferenceError> {
+        Ok(None)
     }
 }
 fn projection(kind: &'static str, value: Value) -> Projection {

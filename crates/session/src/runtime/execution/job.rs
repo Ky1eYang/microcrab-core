@@ -186,6 +186,27 @@ impl Tool for Job {
                 Error::denied_with_private(error.public_reason(), error.to_string())
             }
         })?;
+        execute_parsed(parsed, context).await
+    }
+}
+
+pub(crate) async fn execute_admitted(
+    arguments: Value,
+    context: ToolContext,
+) -> Result<ToolOutput, Error> {
+    let parsed = validate(&arguments)?;
+    if parsed.redirect.is_some() {
+        return Err(Error::denied(
+            "job redirect requires its own admitted tool call; use refs::create directly",
+        ));
+    }
+    execute_parsed(parsed, context).await
+}
+
+async fn execute_parsed(
+    parsed: arguments::Arguments<'_>,
+    context: ToolContext,
+) -> Result<ToolOutput, Error> {
         if let Some(redirect) = parsed.redirect {
             let source = resolve(parsed.ids[0].as_ref(), &context.session_id)?;
             return redirect::execute(source, redirect, context).await;
@@ -225,5 +246,4 @@ impl Tool for Job {
             result
         };
         Ok(ToolOutput::text(serde_json::to_string(&result)?))
-    }
 }

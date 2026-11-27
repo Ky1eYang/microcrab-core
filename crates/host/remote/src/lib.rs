@@ -486,6 +486,28 @@ impl RemoteHost {
             .cloned()
             .collect()
     }
+
+    pub fn markdown_reference(
+        self: &Arc<Self>,
+        kind: impl Into<String>,
+        paths: Vec<std::path::PathBuf>,
+    ) -> Result<microcrab_host_api::DynReference, microcrab_host_api::ReferenceError> {
+        let host: Arc<dyn Host> = self.clone();
+        microcrab_host_api::DynReference::new(
+            microcrab_host_api::HostMarkdownReference::from_host(kind, host, paths),
+        )
+    }
+
+    pub fn skills_reference(
+        self: &Arc<Self>,
+        kind: impl Into<String>,
+        roots: Vec<std::path::PathBuf>,
+    ) -> Result<microcrab_host_api::DynReference, microcrab_host_api::ReferenceError> {
+        let host: Arc<dyn Host> = self.clone();
+        microcrab_host_api::DynReference::new(
+            microcrab_host_api::HostSkillsReference::from_host(kind, host, roots),
+        )
+    }
 }
 impl Drop for RemoteHost {
     fn drop(&mut self) {

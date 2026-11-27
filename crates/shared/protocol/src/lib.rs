@@ -5,9 +5,16 @@ pub use admission::{AdmissionBatch, TransportImpact};
 pub mod diagnostic;
 mod hooks;
 mod provider;
+pub mod reference;
 pub use provider::{AssistantPart, AssistantProviderMetadata, AssistantReplayHint};
 mod types;
 pub use hooks::{HookPayload, Moment};
+pub use reference::{
+    ReferenceCapabilities, ReferenceContent, ReferenceEntry, ReferenceError, ReferenceErrorKind,
+    ReferenceInfo, ReferenceLimitDetails, ReferenceNodeKind, ReferencePatch, ReferencePayload,
+    ReferenceProjection, ReferenceQuota, ReferenceWrite, canonical_mime, detect_mime_from_bytes,
+    is_system_reserved_state_key, valid_library_id, validate_reference_kind,
+};
 pub use types::{
     ImageSource, InputPart, ScopedVariableSet, SessionInput, VariableMetadata, VariablePersistence,
     VariableRole, VariableVisibility, VariablesChange, secret_placeholder, valid_secret_key,

@@ -130,7 +130,10 @@ fn reference_advertises_multi_action_schema() {
         json!({"action":"expand","id":"section"}),
         json!({"action":"expand","id":["a","b"]}),
         json!({"action":"refresh"}),
-        json!({"action":"add","source":{"type":"literal","content":"hi"}}),
+        json!({"action":"add","content":"hi","title":"Note"}),
+        json!({"action":"add","kind":"media","content":"AQID","encoding":"base64","media_type":"image/png"}),
+        json!({"action":"update","id":"ref-1","content":"updated"}),
+        json!({"action":"remove","id":"ref-1"}),
     ] {
         assert!(validator.is_valid(&arguments), "{arguments}");
     }

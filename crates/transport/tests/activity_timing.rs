@@ -147,6 +147,7 @@ async fn complete(
         api_key: None,
         timeout_ms: 5000,
         max_response_bytes: 65536,
+        headers: Default::default(),
     })
     .unwrap();
     let client = if observer {

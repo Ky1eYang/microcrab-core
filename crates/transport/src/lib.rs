@@ -32,7 +32,7 @@ pub(crate) mod sse;
 
 pub use anthropic::{Anthropic, AnthropicConfig};
 pub use client::{Client, ModelAttempt, ModelEvent, ResponseCompletedAt, ResponseOutcome};
-pub use config::{AuthMode, TransportConfig};
+pub use config::{AuthMode, TransportConfig, apply_custom_headers, parse_custom_headers};
 pub use content::{
     AgentExchange, CarrierEnvelopeVersion, Content, ContentItem, ExchangeIntent, ImportantInput,
     StateFrame, UserSource,

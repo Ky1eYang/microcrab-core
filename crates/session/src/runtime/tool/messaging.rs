@@ -47,14 +47,22 @@ impl Tool for SendMessage {
             .ensure_admitted(None)
             .and_then(|()| context.ensure_admitted_arguments(&arguments))
             .map_err(|error| error.into_runtime_error())?;
-        let receipt = context
-            .state
-            .messaging_peer()?
-            .send_message(arguments, context.clone())
-            .await?;
-        result(&context, &receipt)
+        send_message_admitted(arguments, context).await
     }
 }
+
+pub(crate) async fn send_message_admitted(
+    arguments: Value,
+    context: ToolContext,
+) -> Result<ToolOutput, Error> {
+    let receipt = context
+        .state
+        .messaging_peer()?
+        .send_message(arguments, context.clone())
+        .await?;
+    result(&context, &receipt)
+}
+
 #[async_trait::async_trait]
 impl Tool for Escalate {
     fn definition(&self) -> ToolDefinition {
@@ -65,11 +73,18 @@ impl Tool for Escalate {
             .ensure_admitted(None)
             .and_then(|()| context.ensure_admitted_arguments(&arguments))
             .map_err(|error| error.into_runtime_error())?;
-        let receipt = context
-            .state
-            .messaging_peer()?
-            .escalate(arguments, context.clone())
-            .await?;
-        result(&context, &receipt)
+        escalate_admitted(arguments, context).await
     }
+}
+
+pub(crate) async fn escalate_admitted(
+    arguments: Value,
+    context: ToolContext,
+) -> Result<ToolOutput, Error> {
+    let receipt = context
+        .state
+        .messaging_peer()?
+        .escalate(arguments, context.clone())
+        .await?;
+    result(&context, &receipt)
 }

@@ -382,6 +382,50 @@ impl From<microcrab_transport::Error> for Error {
     }
 }
 
+impl From<microcrab_host_api::ReferenceError> for Error {
+    fn from(error: microcrab_host_api::ReferenceError) -> Self {
+        use microcrab_host_api::ReferenceErrorKind;
+        match error.kind {
+            ReferenceErrorKind::Cancelled => Self::Cancelled,
+            ReferenceErrorKind::Denied => Self::Denied(error.message.into()),
+            ReferenceErrorKind::Config => Self::Config(error.message.into()),
+            ReferenceErrorKind::Conflict => Self::Protocol(error.message.into()),
+            ReferenceErrorKind::Limit => {
+                if let Some(details) = error.limit_details {
+                    let kind = match details.kind {
+                        "library_storage_bytes" => crate::LimitKind::LibraryStorageBytes,
+                        "library_storage_entries" => crate::LimitKind::LibraryStorageEntries,
+                        "reference_count" => crate::LimitKind::ReferenceCount,
+                        "reference_bytes" => crate::LimitKind::ReferenceBytes,
+                        _ => crate::LimitKind::Other,
+                    };
+                    if details.budget_bytes > 0 {
+                        return crate::budget::check(
+                            kind,
+                            usize::try_from(details.required_bytes).unwrap_or(usize::MAX),
+                            usize::try_from(details.budget_bytes).unwrap_or(usize::MAX),
+                        )
+                        .unwrap_err();
+                    }
+                    if details.budget_count > 0 {
+                        return crate::budget::check(
+                            kind,
+                            usize::try_from(details.required_count).unwrap_or(usize::MAX),
+                            usize::try_from(details.budget_count).unwrap_or(usize::MAX),
+                        )
+                        .unwrap_err();
+                    }
+                    return crate::budget::reject(kind, error.message);
+                }
+                crate::budget::reject(crate::LimitKind::ReferenceBytes, error.message)
+            }
+            ReferenceErrorKind::NotFound
+            | ReferenceErrorKind::Unavailable
+            | ReferenceErrorKind::Failed => Self::Reference(error.message.into()),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

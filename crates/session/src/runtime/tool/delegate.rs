@@ -135,15 +135,34 @@ pub(crate) async fn execute(
     arguments: &Value,
     invocation: ToolContext,
 ) -> Result<super::ToolOutput, Error> {
+    invocation
+        .ensure_admitted(None)
+        .and_then(|()| invocation.ensure_admitted_arguments(arguments))
+        .map_err(|e| e.into_runtime_error())?;
+    invocation
+        .begin_dispatch(None)
+        .map_err(|e| e.into_runtime_error())?;
+    execute_inner(executor, arguments, invocation).await
+}
+
+pub(crate) async fn execute_admitted(
+    executor: Option<&dyn DelegateExecutor>,
+    arguments: &Value,
+    invocation: ToolContext,
+) -> Result<super::ToolOutput, Error> {
+    execute_inner(executor, arguments, invocation).await
+}
+
+async fn execute_inner(
+    executor: Option<&dyn DelegateExecutor>,
+    arguments: &Value,
+    invocation: ToolContext,
+) -> Result<super::ToolOutput, Error> {
     let target = arguments
         .get("target")
         .and_then(Value::as_str)
         .filter(|s| !s.trim().is_empty())
         .ok_or_else(|| Error::tool("delegate requires target"))?;
-    invocation
-        .ensure_admitted(None)
-        .and_then(|()| invocation.ensure_admitted_arguments(arguments))
-        .map_err(|e| e.into_runtime_error())?;
     let snapshot = invocation.state.snapshot();
     if matches!(
         snapshot.session_kind,
@@ -157,9 +176,6 @@ pub(crate) async fn execute(
             "only a root conversational Session may delegate",
         ));
     }
-    invocation
-        .begin_dispatch(None)
-        .map_err(|e| e.into_runtime_error())?;
     let action = arguments
         .get("action")
         .and_then(Value::as_str)

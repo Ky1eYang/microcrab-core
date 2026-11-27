@@ -5,9 +5,8 @@ pub use secrets::PreparedSecretWrite;
 mod tests;
 use super::endpoint::VariableEndpoint;
 use super::reference::{
-    self, CreateLibraryObject, InMemoryReferenceLibrary, LibraryObjectSummary,
-    LibraryRedirectDestination, ListedReference, LocalBlobOrigin, ReferenceContent,
-    ReferenceLibrary, References,
+    self, ListedReference, ReferenceContent, ReferenceEntry, ReferencePatch, ReferenceQuota,
+    ReferenceRedirectDestination, ReferenceWrite, References,
 };
 use super::{Limits, SessionState, Variables};
 use crate::admission::variables::is_reserved_key;
@@ -59,6 +58,8 @@ pub struct State {
     // Independent of LiveState so registry callbacks never reenter its lock.
     notice_inbox: Arc<Mutex<Weak<crate::admission::inbox::Inbox>>>,
     messaging: Arc<Mutex<Option<Weak<dyn crate::runtime::messaging::AgentPeer>>>>,
+    control: Arc<Mutex<Option<Weak<dyn crate::runtime::tool::switch_mode::SessionControl>>>>,
+    delegate: Arc<Mutex<Option<Weak<dyn crate::runtime::tool::delegate::DelegateExecutor>>>>,
 }
 #[derive(Clone)]
 enum Writer {
@@ -68,9 +69,6 @@ enum Writer {
 #[derive(Clone)]
 struct LiveState {
     snapshot: SessionState,
-    default_library: Arc<super::reference::InMemoryReferenceLibrary>,
-    library: Option<Arc<dyn super::reference::ReferenceLibrary>>,
-    library_projection: Option<super::reference::ReferenceProjection>,
     host: Option<Arc<dyn microcrab_host_api::Host>>,
     #[cfg(feature = "wasm")]
     file_versions: Option<Arc<crate::runtime::wasm::FileVersionOwner>>,
@@ -86,6 +84,8 @@ struct LiveState {
     references_installed: bool,
     references_revision: u64,
     references_loaded: bool,
+    dynamic_mounts_applied: bool,
+    default_writable_reference: Option<String>,
     catalog: Vec<microcrab_agent_types::AgentInfo>,
     agent: Option<microcrab_agent_types::AgentInfo>,
     is_main: bool,
@@ -161,9 +161,6 @@ impl State {
                 permission: None,
                 permission_model_names: None,
                 snapshot,
-                default_library: Arc::new(InMemoryReferenceLibrary::default()),
-                library: None,
-                library_projection: None,
                 host: None,
                 #[cfg(feature = "wasm")]
                 file_versions: None,
@@ -174,6 +171,8 @@ impl State {
                 references_installed: false,
                 references_revision: 0,
                 references_loaded: false,
+                dynamic_mounts_applied: false,
+                default_writable_reference: None,
                 catalog: Vec::new(),
                 agent: None,
                 is_main: true,
@@ -188,6 +187,8 @@ impl State {
             writer: Writer::Detached,
             actor: VariableRole::Client,
             messaging: Default::default(),
+            control: Default::default(),
+            delegate: Default::default(),
             notice_inbox: Arc::new(Mutex::new(Weak::new())),
         }
     }
@@ -200,6 +201,8 @@ impl State {
             writer: Writer::Detached,
             actor: self.actor,
             messaging: Default::default(),
+            control: Default::default(),
+            delegate: Default::default(),
             notice_inbox: Arc::new(Mutex::new(Weak::new())),
         }
     }
@@ -236,71 +239,205 @@ impl State {
     }
 
     pub(crate) fn install_host(&self, host: Option<Arc<dyn microcrab_host_api::Host>>) {
-        let default_library = {
-            let mut live = self.inner.lock().unwrap_or_else(|error| error.into_inner());
-            live.host = host.clone();
-            live.default_library.clone()
-        };
-        default_library.set_host(host);
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn host(&self) -> Option<Arc<dyn microcrab_host_api::Host>> {
         self.inner
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .host
-            .clone()
+            .host = host;
     }
 
-    pub fn install_reference_library(&self, library: Arc<dyn ReferenceLibrary>) {
-        self.inner
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .library = Some(library);
-    }
-
-    pub fn reference_library(&self) -> Arc<dyn ReferenceLibrary> {
+    pub(crate) fn writable_reference(
+        &self,
+        kind: Option<&str>,
+    ) -> Result<super::reference::DynReference, Error> {
         let live = self.inner.lock().unwrap_or_else(|error| error.into_inner());
-        live.library
+        let target_kind = match kind {
+            Some(kind) => kind,
+            None => live.default_writable_reference.as_deref().ok_or_else(|| {
+                Error::denied("no default writable reference implementation is configured")
+            })?,
+        };
+        let reference = live
+            .snapshot
+            .references
+            .get(target_kind)
+            .cloned()
+            .ok_or_else(|| {
+                Error::config_with_private(
+                    "requested reference kind is not installed",
+                    format!("reference kind `{target_kind}` is not installed"),
+                )
+            })?;
+        if !reference.capabilities().add {
+            return Err(Error::denied_with_private(
+                "target reference kind is read-only",
+                format!("reference kind `{target_kind}` does not allow writes"),
+            ));
+        }
+        Ok(reference)
+    }
+
+    pub(crate) fn default_writable_kind(&self) -> Option<String> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .default_writable_reference
             .clone()
-            .unwrap_or_else(|| live.default_library.clone())
     }
 
-    pub(crate) async fn sync_library_projection(
+    pub(crate) async fn refresh_references_async(
         &self,
         cancel: tokio_util::sync::CancellationToken,
     ) -> Result<(), Error> {
-        let projection = self.reference_library().projections(cancel).await?;
-        self.inner
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .library_projection =
-            if projection.exact.is_none() && projection.short_model.is_none() {
-                None
-            } else {
-                Some(projection)
-            };
+        let references = self.snapshot().references.clone();
+        for reference in references.iter() {
+            if cancel.is_cancelled() {
+                return Err(Error::Cancelled);
+            }
+            if reference.capabilities().refresh {
+                reference.refresh(cancel.clone()).await?;
+            }
+        }
+        self.refresh_reference_projection()?;
         Ok(())
     }
 
-    pub(crate) async fn refresh_library(
+    /// Refresh only writable reference kinds (such as external personal library / media)
+    /// at turn/round admission without rescanning read-only host/git sources on ordinary turns.
+    pub(crate) async fn refresh_writable_references(
         &self,
         cancel: tokio_util::sync::CancellationToken,
     ) -> Result<(), Error> {
-        let library = self.reference_library();
-        library.refresh(cancel.clone()).await?;
-        let projection = library.projections(cancel).await?;
-        self.inner
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .library_projection =
+        let references = {
+            let live = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+            if !live.references_loaded {
+                return Ok(());
+            }
+            live.snapshot.references.clone()
+        };
+        let mut refreshed = Vec::new();
+        for reference in references.iter() {
+            if cancel.is_cancelled() {
+                return Err(Error::Cancelled);
+            }
+            let caps = reference.capabilities();
+            if caps.refresh && (caps.add || caps.update || caps.remove) {
+                if let Some(composite) = reference.as_composite() {
+                    composite.refresh_writable(cancel.clone()).await?;
+                } else {
+                    reference.refresh(cancel.clone()).await?;
+                }
+                refreshed.push(reference);
+            }
+        }
+        if refreshed.is_empty() {
+            return Ok(());
+        }
+        let mut updates = Vec::with_capacity(refreshed.len());
+        for reference in refreshed {
+            let projection = reference.projections()?;
+            updates.push((reference.kind().to_owned(), projection));
+        }
+        let mut live = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        for (kind, projection) in updates {
             if projection.exact.is_none() && projection.short_model.is_none() {
-                None
+                live.reference_projection.retain(|(existing, _)| existing != &kind);
+            } else if let Some((_, slot)) = live
+                .reference_projection
+                .iter_mut()
+                .find(|(existing, _)| existing == &kind)
+            {
+                *slot = projection;
             } else {
-                Some(projection)
-            };
+                live.reference_projection.push((kind, projection));
+            }
+        }
         Ok(())
+    }
+
+    pub(crate) async fn add_reference(
+        &self,
+        kind: Option<&str>,
+        write: ReferenceWrite,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<ReferenceEntry, Error> {
+        let target = self.writable_reference(kind)?;
+        let entry = target.add(write, cancel).await?;
+        let _ = self.refresh_reference_projection();
+        Ok(entry)
+    }
+
+    pub(crate) async fn update_reference(
+        &self,
+        id: &str,
+        patch: ReferencePatch,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<ReferenceEntry, Error> {
+        let references = self.snapshot().references.clone();
+        let owner = reference::owner_of_id(&references, id, cancel.clone())
+            .await?
+            .ok_or_else(|| {
+                Error::reference_with_private(
+                    "requested reference was not found",
+                    format!("reference `{id}` was not found"),
+                )
+            })?;
+        let entry = owner.update(id, patch, cancel).await?;
+        let _ = self.refresh_reference_projection();
+        Ok(entry)
+    }
+
+    pub(crate) async fn remove_reference(
+        &self,
+        id: &str,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<bool, Error> {
+        let references = self.snapshot().references.clone();
+        let owner = reference::owner_of_id(&references, id, cancel.clone())
+            .await?
+            .ok_or_else(|| {
+                Error::reference_with_private(
+                    "requested reference was not found",
+                    format!("reference `{id}` was not found"),
+                )
+            })?;
+        let removed = owner.remove(id, cancel).await?;
+        let _ = self.refresh_reference_projection();
+        Ok(removed)
+    }
+
+    pub(crate) async fn reference_quota(
+        &self,
+        kind: Option<&str>,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<Option<ReferenceQuota>, Error> {
+        if let Some(target_kind) = kind
+            && let Some(reference) = self.snapshot().references.get(target_kind).cloned()
+            && reference.capabilities().quota
+        {
+            return Ok(reference.quota(cancel).await?);
+        }
+        if let Some(default_kind) = self.default_writable_kind()
+            && let Some(reference) = self.snapshot().references.get(&default_kind).cloned()
+            && reference.capabilities().quota
+        {
+            return Ok(reference.quota(cancel).await?);
+        }
+        for reference in self.snapshot().references.iter() {
+            if reference.capabilities().quota
+                && let Some(quota) = reference.quota(cancel.clone()).await?
+            {
+                return Ok(Some(quota));
+            }
+        }
+        Ok(None)
+    }
+
+    pub async fn expand_reference(
+        &self,
+        id: &str,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<ReferenceContent, Error> {
+        self.read_reference_async(id, cancel).await
     }
 
     pub(crate) async fn read_reference_async(
@@ -308,17 +445,15 @@ impl State {
         id: &str,
         cancel: tokio_util::sync::CancellationToken,
     ) -> Result<ReferenceContent, Error> {
-        if let Some(content) = self.reference_library().read(id, cancel).await? {
-            return Ok(content);
-        }
-        reference::read_id(&self.snapshot().references, id)
+        let references = self.snapshot().references.clone();
+        reference::expand_id(&references, id, cancel).await
     }
 
     pub(crate) fn prepare_library_redirect(
         &self,
         expected_mime: &str,
         title: Option<&str>,
-    ) -> Result<LibraryRedirectDestination, Error> {
+    ) -> Result<ReferenceRedirectDestination, Error> {
         let expected_mime = reference::canonical_mime(expected_mime)?;
         let title = match title {
             Some(raw) => {
@@ -335,7 +470,7 @@ impl State {
             }
             None => "job stdout".to_owned(),
         };
-        Ok(LibraryRedirectDestination {
+        Ok(ReferenceRedirectDestination {
             expected_mime,
             title,
         })
@@ -343,40 +478,40 @@ impl State {
 
     pub(crate) async fn commit_library_redirect(
         &self,
-        destination: LibraryRedirectDestination,
+        destination: ReferenceRedirectDestination,
         lease: crate::runtime::execution::PrivateOutputLease,
         operation: crate::runtime::execution::ExecutionId,
         cancel: &tokio_util::sync::CancellationToken,
-    ) -> Result<LibraryObjectSummary, Error> {
+    ) -> Result<ReferenceEntry, Error> {
         if lease.media_type() != destination.expected_mime {
             return Err(Error::config("redirected output media type mismatch"));
         }
         let data = lease.as_bytes().to_vec();
-        let (media_type, _, _) =
+        let (media_type, width, height) =
             reference::inspect_binary_for_storage(&destination.expected_mime, &data)?;
-        if media_type.starts_with("text/") && std::str::from_utf8(&data).is_err() {
-            return Err(Error::config(
-                "redirected stdout is not valid UTF-8 for declared text media type",
-            ));
-        }
-        let summary = self
-            .reference_library()
-            .add(
-                CreateLibraryObject::LocalBlob {
-                    id: None,
-                    title: destination.title,
-                    media_type,
-                    data,
-                    origin: LocalBlobOrigin::JobRedirect,
-                    origin_execution_id: Some(operation.0.to_string()),
-                },
-                cancel.clone(),
-            )
-            .await?;
-        let _ = self
-            .sync_library_projection(tokio_util::sync::CancellationToken::new())
-            .await;
-        Ok(summary)
+        let payload = if media_type.starts_with("text/") || media_type == "application/json" {
+            let text = String::from_utf8(data).map_err(|_| {
+                Error::config("redirected stdout is not valid UTF-8 for declared text media type")
+            })?;
+            super::reference::ReferencePayload::Text(text)
+        } else {
+            super::reference::ReferencePayload::Binary {
+                data,
+                width,
+                height,
+            }
+        };
+        self.add_reference(
+            None,
+            ReferenceWrite {
+                title: Some(destination.title),
+                media_type,
+                payload,
+                locator_hint: Some(format!("job_redirect:{}", operation.0)),
+            },
+            cancel.clone(),
+        )
+        .await
     }
 
     pub(crate) fn install_inbox(&self, inbox: Weak<crate::admission::inbox::Inbox>) {
@@ -448,6 +583,8 @@ impl State {
             writer: Writer::Detached,
             actor: self.actor,
             messaging: self.messaging.clone(),
+            control: self.control.clone(),
+            delegate: self.delegate.clone(),
             notice_inbox: self.notice_inbox.clone(),
         };
         let endpoint = VariableEndpoint::new(detached, closed, faulted);
@@ -456,6 +593,8 @@ impl State {
             writer: Writer::Session(Arc::downgrade(&endpoint)),
             actor: self.actor,
             messaging: self.messaging.clone(),
+            control: self.control.clone(),
+            delegate: self.delegate.clone(),
             notice_inbox: self.notice_inbox.clone(),
         };
         (attached, endpoint)
@@ -499,7 +638,66 @@ impl State {
             .and_then(Weak::upgrade)
             .ok_or_else(|| Error::denied("Session communication endpoint is unavailable"))
     }
+    pub(crate) fn install_builtin_controls(
+        &self,
+        control: Weak<dyn crate::runtime::tool::switch_mode::SessionControl>,
+    ) {
+        *self
+            .control
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(control);
+    }
+    pub(crate) fn builtin_control(
+        &self,
+    ) -> Option<Arc<dyn crate::runtime::tool::switch_mode::SessionControl>> {
+        self.control
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+            .and_then(Weak::upgrade)
+    }
+    pub(crate) fn install_delegate_executor(
+        &self,
+        executor: Weak<dyn crate::runtime::tool::delegate::DelegateExecutor>,
+    ) {
+        *self
+            .delegate
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(executor);
+    }
+    pub(crate) fn delegate_executor(
+        &self,
+    ) -> Option<Arc<dyn crate::runtime::tool::delegate::DelegateExecutor>> {
+        self.delegate
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+            .and_then(Weak::upgrade)
+    }
+    #[cfg(test)]
     pub(crate) fn install_references(&self, references: References) -> Result<(), Error> {
+        self.install_references_with_default(references, None)
+    }
+
+    pub(crate) fn install_references_with_default(
+        &self,
+        references: References,
+        default_writable_reference: Option<String>,
+    ) -> Result<(), Error> {
+        if let Some(kind) = &default_writable_reference {
+            let target = references.get(kind).ok_or_else(|| {
+                Error::config_with_private(
+                    "default writable reference kind is not installed",
+                    format!("default writable reference kind `{kind}` is not installed"),
+                )
+            })?;
+            if !target.capabilities().add {
+                return Err(Error::config_with_private(
+                    "default writable reference kind does not support writes",
+                    format!("default writable reference kind `{kind}` does not allow add"),
+                ));
+            }
+        }
         let mut state = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if state.references_installed {
             return Err(Error::config("references are already installed"));
@@ -511,8 +709,10 @@ impl State {
             )
         })?;
         state.snapshot.references = references;
+        state.default_writable_reference = default_writable_reference;
         state.references_revision = revision;
         state.references_installed = true;
+        state.dynamic_mounts_applied = false;
         Ok(())
     }
 
@@ -528,6 +728,7 @@ impl State {
         let mut state = self.inner.lock().unwrap_or_else(|error| error.into_inner());
         references.validate_variables(&state.snapshot.variables)?;
         state.snapshot.references = references;
+        state.default_writable_reference = None;
         state.reference_projection.clear();
         state.references_loaded = false;
         state.references_revision = state.references_revision.checked_add(1).ok_or_else(|| {
@@ -540,10 +741,17 @@ impl State {
         Ok(())
     }
     /// Load every installed kind. The state lock is not held across the await.
-    pub(crate) async fn load_references(&self) -> Result<(), Error> {
+    pub(crate) async fn load_references(
+        &self,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<(), Error> {
+        self.restore_dynamic_references()?;
         let references = self.snapshot().references.clone();
         for reference in references.iter() {
-            reference.load().await?;
+            if cancel.is_cancelled() {
+                return Err(Error::Cancelled);
+            }
+            reference.load(cancel.clone()).await?;
         }
         self.inner
             .lock()
@@ -552,12 +760,80 @@ impl State {
         Ok(())
     }
 
-    pub fn list_references(&self) -> Result<Vec<ListedReference>, Error> {
-        reference::list_all(&self.snapshot().references)
+    /// Mount dynamic Host or Session-inline references (e.g. from WASM `init` or Rhai scripting),
+    /// persist their recovery specs in `SessionState`, load them, and refresh State projections.
+    pub(crate) async fn mount_dynamic_references(
+        &self,
+        mounts: Vec<reference::DynamicReferenceMount>,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<(), Error> {
+        if mounts.is_empty() {
+            return Ok(());
+        }
+        let grouped = {
+            let mut state = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            let host = state.host.clone();
+            let grouped = build_dynamic_reference_members(host.as_ref(), &mounts)?;
+            for (target_kind, members) in &grouped {
+                if state.snapshot.variables.get_all(target_kind).is_some() {
+                    return Err(Error::config_with_private(
+                        "reference kind collides with custom variable",
+                        format!("reference kind `{target_kind}` collides with custom variable"),
+                    ));
+                }
+                attach_reference_members_locked(&mut state, target_kind, members.clone())?;
+            }
+            for mount in mounts {
+                if !state.snapshot.dynamic_reference_mounts.contains(&mount) {
+                    state.snapshot.dynamic_reference_mounts.push(mount);
+                }
+            }
+            state.references_installed = true;
+            state.dynamic_mounts_applied = true;
+            state.references_revision = state.references_revision.checked_add(1).ok_or_else(|| {
+                crate::budget::reject(
+                    crate::LimitKind::Arithmetic,
+                    "reference generation overflow",
+                )
+            })?;
+            grouped
+        };
+        for (_, members) in grouped {
+            for member in members {
+                if cancel.is_cancelled() {
+                    return Err(Error::Cancelled);
+                }
+                member.load(cancel.clone()).await?;
+            }
+        }
+        let _ = self.refresh_reference_projection();
+        Ok(())
     }
 
-    pub fn read_reference(&self, id: &str) -> Result<ReferenceContent, Error> {
-        reference::read_id(&self.snapshot().references, id)
+    fn restore_dynamic_references(&self) -> Result<(), Error> {
+        let mut state = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if state.dynamic_mounts_applied || state.snapshot.dynamic_reference_mounts.is_empty() {
+            state.dynamic_mounts_applied = true;
+            return Ok(());
+        }
+        let mounts = state.snapshot.dynamic_reference_mounts.clone();
+        let host = state.host.clone();
+        let grouped = build_dynamic_reference_members(host.as_ref(), &mounts)?;
+        for (target_kind, members) in grouped {
+            if state.snapshot.variables.get_all(&target_kind).is_some() {
+                return Err(Error::config_with_private(
+                    "custom variable key collides with mounted reference kind",
+                    format!("custom variable key `{target_kind}` collides with mounted reference kind"),
+                ));
+            }
+            attach_reference_members_locked(&mut state, &target_kind, members)?;
+        }
+        state.dynamic_mounts_applied = true;
+        Ok(())
+    }
+
+    pub fn list_references(&self) -> Result<Vec<ListedReference>, Error> {
+        reference::list_all(&self.snapshot().references)
     }
 
     /// Replace counters and variables while the caller holds the variable fence.
@@ -586,10 +862,10 @@ impl State {
             state.variables_revision = 0;
         }
         state.snapshot = snapshot;
-        state.library_projection = None;
         state.builtins.clear();
         state.reference_projection.clear();
         state.references_loaded = false;
+        state.dynamic_mounts_applied = false;
     }
     /// Only numeric facts are read here: do not clone payloads or invoke
     /// execution-source capability callbacks under the observation fence.
@@ -958,7 +1234,7 @@ impl State {
         let mut live = self.inner.lock().unwrap_or_else(|error| error.into_inner());
         live.snapshot.variables.clear_ephemeral();
     }
-    pub(super) fn wasm_extract(&self, key: &str) -> Result<Option<Value>, Error> {
+    pub(crate) fn wasm_extract(&self, key: &str) -> Result<Option<Value>, Error> {
         let Writer::Session(owner) = &self.writer else {
             return Err(Error::Closed);
         };
@@ -1161,11 +1437,12 @@ impl State {
     /// The caller owns foreground and the variable fence. User reference code
     /// runs before the State lock; validation failure preserves both wiring and
     /// the committed projection, and never changes historical Context frames.
+    #[cfg(test)]
     pub(crate) fn replace_reference(
         &self,
         reference: super::reference::DynReference,
     ) -> Result<(), Error> {
-        validate_custom_key(reference.kind())?;
+        microcrab_protocol::validate_reference_kind(reference.kind())?;
         let projection = reference.projections()?;
         let original = self
             .inner
@@ -1328,7 +1605,7 @@ fn capture_reference_projections(
                 None
             }
             Ok(projection) => Some(Ok((reference.kind().to_owned(), projection))),
-            Err(error) => Some(Err(error)),
+            Err(error) => Some(Err(Error::from(error))),
         })
         .collect()
 }
@@ -1404,12 +1681,6 @@ fn current_projection(
                     .map(|value| (kind.clone(), value.clone()))
             }),
     );
-    values.remove("references");
-    if let Some(projection) = &live.library_projection
-        && let Some(value) = projection.value(short_model)
-    {
-        values.insert("references".into(), value.clone());
-    }
     for key in ["tool_tasks", "jobs", "subagents"] {
         values.remove(key);
     }
@@ -1608,4 +1879,111 @@ impl std::fmt::Debug for State {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("State").finish_non_exhaustive()
     }
+}
+
+fn attach_reference_members_locked(
+    state: &mut LiveState,
+    target_kind: &str,
+    members: Vec<reference::DynReference>,
+) -> Result<(), Error> {
+    if members.is_empty() {
+        return Ok(());
+    }
+    match state.snapshot.references.get(target_kind) {
+        None => {
+            let composite = reference::DynReference::new(
+                reference::CompositeReference::new(target_kind, members),
+            )?;
+            state.snapshot.references.upsert(composite);
+        }
+        Some(existing) => {
+            if let Some(composite) = existing.as_composite() {
+                composite.append_members(members);
+            } else {
+                let mut combined = vec![existing.clone()];
+                combined.extend(members);
+                let composite = reference::DynReference::new(
+                    reference::CompositeReference::new(target_kind, combined),
+                )?;
+                state.snapshot.references.upsert(composite);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn build_dynamic_reference_members(
+    host: Option<&Arc<dyn microcrab_host_api::Host>>,
+    mounts: &[reference::DynamicReferenceMount],
+) -> Result<Vec<(String, Vec<reference::DynReference>)>, Error> {
+    use reference::{DynReference, DynamicReferenceMount, HostMarkdownReference, HostReferenceSpec};
+    use sha2::{Digest, Sha256};
+    let mut host_groups: BTreeMap<String, Vec<HostReferenceSpec>> = BTreeMap::new();
+    let mut inline_groups: BTreeMap<String, Vec<(HostReferenceSpec, String)>> = BTreeMap::new();
+    for mount in mounts {
+        match mount {
+            DynamicReferenceMount::Host {
+                target_kind,
+                path,
+                title,
+                plain_text,
+            } => {
+                host_groups
+                    .entry(target_kind.clone())
+                    .or_default()
+                    .push(HostReferenceSpec {
+                        path: path.clone(),
+                        title: title.clone(),
+                        plain_text: *plain_text,
+                    });
+            }
+            DynamicReferenceMount::Inline {
+                target_kind,
+                title,
+                media_type,
+                content,
+                plain_text,
+            } => {
+                let mut hasher = Sha256::new();
+                hasher.update(title.as_bytes());
+                hasher.update(b"\0");
+                hasher.update(media_type.as_bytes());
+                hasher.update(b"\0");
+                hasher.update(content.as_bytes());
+                let digest = format!("{:x}", hasher.finalize());
+                let synthetic_path = format!("inline/{}", &digest[..16]);
+                inline_groups
+                    .entry(target_kind.clone())
+                    .or_default()
+                    .push((
+                        HostReferenceSpec {
+                            path: synthetic_path,
+                            title: Some(title.clone()),
+                            plain_text: *plain_text,
+                        },
+                        content.clone(),
+                    ));
+            }
+        }
+    }
+    let mut by_kind: BTreeMap<String, Vec<DynReference>> = BTreeMap::new();
+    for (target_kind, specs) in host_groups {
+        let host = host.ok_or_else(|| {
+            Error::tool("Host is unavailable for mounting workspace references")
+        })?;
+        let member = DynReference::new(HostMarkdownReference::from_host_specs(
+            "host_markdown",
+            host.clone(),
+            specs,
+        ))?;
+        by_kind.entry(target_kind).or_default().push(member);
+    }
+    for (target_kind, specs) in inline_groups {
+        let member = DynReference::new(HostMarkdownReference::from_memory_specs(
+            "session_inline",
+            specs,
+        ))?;
+        by_kind.entry(target_kind).or_default().push(member);
+    }
+    Ok(by_kind.into_iter().collect())
 }

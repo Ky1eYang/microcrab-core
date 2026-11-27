@@ -79,6 +79,7 @@ fn incomplete_client(endpoint: String, protocol: Protocol) -> RetryingClient {
             api_key: None,
             timeout_ms: 200,
             max_response_bytes: 4096,
+            headers: Default::default(),
         },
         RetryPolicy {
             attempts: 6,
@@ -168,6 +169,7 @@ async fn incomplete_success_bodies_keep_network_errors_for_all_protocols() {
                 api_key: None,
                 timeout_ms: 200,
                 max_response_bytes: 4096,
+                headers: Default::default(),
             })
             .unwrap();
             let result = client
@@ -252,6 +254,7 @@ fn protocol_client(endpoint: String, protocol: Protocol) -> RetryingClient {
             api_key: None,
             timeout_ms: 1000,
             max_response_bytes: 4096,
+            headers: Default::default(),
         },
         RetryPolicy {
             attempts: 6,

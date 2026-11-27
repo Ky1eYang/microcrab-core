@@ -83,6 +83,14 @@ impl AgentLifecycle {
             .state
             .is_attached()
             .then(|| SessionBinding::from_state(invocation.state.clone()));
+        let ingress = if compiled.session_script {
+            Some(references::Ingress::new(&invocation, &cancellation).await?)
+        } else {
+            None
+        };
+        let commit_context = ingress.as_ref().map(|_| invocation.clone());
+        let commit_runtime = runtime.clone();
+        let commit_cancel_root = cancellation.clone();
         let dispatch = tracing::dispatcher::get_default(Clone::clone);
         tokio::task::spawn_blocking(move || {
             tracing::dispatcher::with_default(&dispatch, || {
@@ -94,10 +102,11 @@ impl AgentLifecycle {
                         // invoke. It never repeats the initialization export.
                         return Ok(());
                     }
+                    let mut staged_refs = None;
                     let result = compiled.run(
                         cached,
                         cancellation,
-                        epoch,
+                        epoch.clone(),
                         Some(runtime),
                         binding,
                         Some(invocation),
@@ -106,11 +115,19 @@ impl AgentLifecycle {
                             store.data_mut().guest_observation = compiled
                                 .observation_scope(Phase::Init, None)
                                 .map(|scope| (scope, Phase::Init));
+                            store.data_mut().references = ingress.clone();
                             let result = bindings.call_init(&mut *store).map_err(|error| {
                                 compiled.execution_failure(boundary, error, Phase::Init)
                             })?;
                             match result {
-                                InitResult::Ready => Ok(()),
+                                InitResult::Ready => {
+                                    staged_refs = store
+                                        .data_mut()
+                                        .references
+                                        .as_mut()
+                                        .and_then(references::Ingress::take);
+                                    Ok(())
+                                }
                                 InitResult::Failed(error) => {
                                     let failure = crate::runtime::execution::ToolFailure::failed(
                                         error.code,
@@ -122,6 +139,27 @@ impl AgentLifecycle {
                             }
                         },
                     );
+                    let result = match (result, staged_refs) {
+                        (Ok(()), Some(staged)) => {
+                            if let Some(context) = commit_context.as_ref() {
+                                let commit_cancel = commit_cancel_root.child_token();
+                                commit_runtime.block_on(async {
+                                    let commit = staged.commit(context, &commit_cancel);
+                                    tokio::pin!(commit);
+                                    tokio::select! { biased;
+                                        _ = epoch.cancelled() => {
+                                            commit_cancel.cancel();
+                                            commit.await.map(|_| ())
+                                        }
+                                        res = &mut commit => res.map(|_| ()),
+                                    }
+                                })
+                            } else {
+                                Err(Error::denied("references admission missing"))
+                            }
+                        }
+                        (other, _) => other,
+                    };
                     if let Some(instance) = cached.as_mut() {
                         instance.init_ready = result.is_ok();
                         // Guest-reported failure is terminal too. A later tool must

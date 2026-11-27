@@ -3,10 +3,13 @@ mod cache;
 mod facade;
 mod files;
 pub mod filesystem;
+pub mod host_reference;
+pub mod markdown;
 mod mutation;
 pub mod net;
 mod paths;
 pub mod process;
+pub mod reference;
 pub use paths::{
     UNRESTRICTED_FILESYSTEM_DESCRIPTION, is_normalized_cache_path, is_normalized_file_path,
     is_portable_file_name,
@@ -20,6 +23,13 @@ pub mod web_transport;
 pub use bytes::Bytes;
 pub use cache::{CachePointRequest, FileCachePoint, MAX_CACHE_POINT_BYTES};
 pub use facade::HostAPI;
+pub use host_reference::{HostMarkdownReference, HostReferenceSpec, HostSkillsReference};
+pub use microcrab_protocol::{
+    ReferenceCapabilities, ReferenceContent, ReferenceEntry, ReferenceError, ReferenceErrorKind,
+    ReferenceInfo, ReferenceLimitDetails, ReferenceNodeKind, ReferencePatch, ReferencePayload,
+    ReferenceProjection, ReferenceQuota, ReferenceWrite,
+};
+pub use reference::{CompositeReference, DynReference, Reference};
 pub use files::{
     GlobEntry, GlobEntryKind, GlobIgnoreRuleFile, GlobIgnoreSnapshot, GlobOutput, GlobRequest,
     GlobScanIncomplete, GlobScanReason, GrepMatch, GrepOutput, GrepRequest,

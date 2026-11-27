@@ -1,13 +1,12 @@
 //! File-backed owner-isolated Personal Content Library with atomic index & blob commits.
 use super::{
-    LibraryLimits, LibraryObjectRecord, PersonalLibrary, RECORD_VERSION, apply_object_update,
+    CreateLibraryObject, LibraryLimits, LibraryObjectRecord, LibraryObjectSummary, LibraryQuota,
+    PersonalLibrary, RECORD_VERSION, UpdateLibraryObject, apply_object_update,
     build_created_summary, validate_owner, validate_target_id,
 };
 use async_trait::async_trait;
 use microcrab_session::Error;
-use microcrab_session::state::reference::library::{
-    CreateLibraryObject, LibraryObjectSummary, LibraryQuota, UpdateLibraryObject, valid_library_id,
-};
+use microcrab_session::state::reference::valid_library_id;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};

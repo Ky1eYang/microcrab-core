@@ -16,7 +16,7 @@ world runtime {
   import microcrab:host/glob-ignore@0.1.0;
   import microcrab:host/grep@0.1.0;
   import microcrab:host/shell@0.1.0;
-  import variables;
+  import microcrab:session/session@0.4.0;
   import file-versions;
   import microcrab:session/observation@0.2.2;
   import microcrab:session/browser-observation@0.2.3;

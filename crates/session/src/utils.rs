@@ -1,3 +1,3 @@
 //! Small shared primitives; feature policy and resource ownership stay local.
 pub(crate) mod cancel;
-pub mod markdown;
+pub use microcrab_host_api::markdown;

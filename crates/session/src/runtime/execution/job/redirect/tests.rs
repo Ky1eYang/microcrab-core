@@ -29,6 +29,20 @@ fn setup() -> (
         Arc::new(AtomicBool::new(false)),
         Arc::new(AtomicBool::new(false)),
     );
+    let mem = crate::state::reference::DynReference::new(
+        crate::state::reference::test_memory::InMemoryTestReference::new(
+            "references",
+            1024 * 1024,
+            64,
+        ),
+    )
+    .unwrap();
+    state
+        .install_references_with_default(
+            crate::state::reference::References::new(vec![mem]).unwrap(),
+            Some("references".into()),
+        )
+        .unwrap();
     state.update(|live| live.session_kind = Some(SessionKind::Interactive));
     let context = ToolContext::new(
         state.clone(),
@@ -177,10 +191,8 @@ async fn admitted_redirect_mounts_library_reference_and_source_release_is_indepe
     owner.release(id, CancellationToken::new()).await.unwrap();
     assert!(owner.private_output(id, "owner", "stdout", MIME).is_err());
     let stored = state
-        .reference_library()
-        .read(&ref_id, CancellationToken::new())
+        .read_reference_async(&ref_id, CancellationToken::new())
         .await
-        .unwrap()
         .unwrap();
     assert_eq!(stored.media_type, MIME);
     assert_eq!(stored.as_bytes(), RAW);
@@ -194,13 +206,16 @@ async fn library_quota_limit_blocks_overflow_without_lru() {
         ..Default::default()
     };
     let state = State::new(limits);
-    let library = Arc::new(crate::state::reference::InMemoryReferenceLibrary::new(
-        1024,
-        2,
-        1024,
-        None,
-    ));
-    state.install_reference_library(library);
+    let mem = crate::state::reference::DynReference::new(
+        crate::state::reference::test_memory::InMemoryTestReference::new("references", 1024, 2),
+    )
+    .unwrap();
+    state
+        .install_references_with_default(
+            crate::state::reference::References::new(vec![mem]).unwrap(),
+            Some("references".into()),
+        )
+        .unwrap();
     let registry = state.executions();
     let id = source(&state).await.unwrap();
     let lease = registry.private_output(id, "owner", "stdout", MIME).unwrap();
@@ -239,12 +254,9 @@ async fn redirect_reserves_its_full_receipt_budget_before_publication() {
     ));
     assert!(
         state
-            .reference_library()
-            .projections(CancellationToken::new())
-            .await
+            .list_references()
             .unwrap()
-            .exact
-            .is_none()
+            .is_empty()
     );
     state.executions().close().await.unwrap();
 }

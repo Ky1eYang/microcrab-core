@@ -912,7 +912,10 @@ fn budget_error() -> Error {
 mod tests {
     use super::*;
     use crate::Limits;
-    use crate::state::reference::{CreateLibraryObject, LocalBlobOrigin};
+    use crate::state::reference::{
+        DynReference, ReferencePayload, ReferenceWrite, References,
+        test_memory::InMemoryTestReference,
+    };
     use std::sync::atomic::AtomicBool;
 
     fn view_with(visible: Value, invisible: &[&str], secret: &[&str]) -> InjectionView {
@@ -1103,30 +1106,41 @@ mod tests {
     async fn ref_injection_supports_conversions_and_16mb_limit_error() {
         let state = crate::State::new(Limits::default());
         let cancel = CancellationToken::new();
-        let library = state.reference_library();
-        let json_ref = library
-            .add(
-                CreateLibraryObject::LocalBlob {
-                    id: None,
-                    title: "cfg".into(),
+        let mem = DynReference::new(InMemoryTestReference::new("references", 64 * 1024 * 1024, 16))
+            .unwrap();
+        state
+            .install_references_with_default(
+                References::new(vec![mem]).unwrap(),
+                Some("references".into()),
+            )
+            .unwrap();
+        let json_ref = state
+            .add_reference(
+                None,
+                ReferenceWrite {
+                    title: Some("cfg".into()),
                     media_type: "application/json".into(),
-                    data: br#"{"name":"ada","count":3,"secret":"{{secret:tok}}"}"#.to_vec(),
-                    origin: LocalBlobOrigin::Upload,
-                    origin_execution_id: None,
+                    payload: ReferencePayload::Text(
+                        r#"{"name":"ada","count":3,"secret":"{{secret:tok}}"}"#.into(),
+                    ),
+                    locator_hint: None,
                 },
                 cancel.clone(),
             )
             .await
             .unwrap();
-        let bin_ref = library
-            .add(
-                CreateLibraryObject::LocalBlob {
-                    id: None,
-                    title: "blob".into(),
+        let bin_ref = state
+            .add_reference(
+                None,
+                ReferenceWrite {
+                    title: Some("blob".into()),
                     media_type: "application/octet-stream".into(),
-                    data: vec![1, 2, 3],
-                    origin: LocalBlobOrigin::Upload,
-                    origin_execution_id: None,
+                    payload: ReferencePayload::Binary {
+                        data: vec![1, 2, 3],
+                        width: None,
+                        height: None,
+                    },
+                    locator_hint: None,
                 },
                 cancel.clone(),
             )
@@ -1149,15 +1163,18 @@ mod tests {
         assert_eq!(out["url"], "pre data:application/octet-stream;base64,AQID");
         assert!(mask.covers("/cfg/secret"));
 
-        let huge_ref = library
-            .add(
-                CreateLibraryObject::LocalBlob {
-                    id: None,
-                    title: "huge".into(),
+        let huge_ref = state
+            .add_reference(
+                None,
+                ReferenceWrite {
+                    title: Some("huge".into()),
                     media_type: "application/octet-stream".into(),
-                    data: vec![7; 13 * 1024 * 1024],
-                    origin: LocalBlobOrigin::Upload,
-                    origin_execution_id: None,
+                    payload: ReferencePayload::Binary {
+                        data: vec![7; 13 * 1024 * 1024],
+                        width: None,
+                        height: None,
+                    },
+                    locator_hint: None,
                 },
                 cancel.clone(),
             )

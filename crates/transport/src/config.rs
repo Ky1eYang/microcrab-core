@@ -2,6 +2,70 @@
 use crate::error::Error;
 use crate::protocol::Protocol;
 use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, HashSet};
+
+pub const MAX_CUSTOM_HEADERS: usize = 64;
+pub const MAX_CUSTOM_HEADER_VALUE_BYTES: usize = 8192;
+
+fn is_reserved_header(name: &reqwest::header::HeaderName) -> bool {
+    matches!(
+        name.as_str(),
+        "host"
+            | "content-length"
+            | "transfer-encoding"
+            | "connection"
+            | "content-type"
+            | "accept"
+            | "authorization"
+            | "x-api-key"
+            | "x-goog-api-key"
+            | "anthropic-version"
+    )
+}
+
+pub fn parse_custom_headers(
+    headers: &BTreeMap<String, String>,
+) -> Result<Vec<(reqwest::header::HeaderName, reqwest::header::HeaderValue)>, Error> {
+    if headers.len() > MAX_CUSTOM_HEADERS {
+        return Err(Error::config("provider custom header count exceeds 64"));
+    }
+    let mut parsed = Vec::with_capacity(headers.len());
+    let mut seen = HashSet::with_capacity(headers.len());
+    for (raw_name, raw_value) in headers {
+        if raw_name.is_empty() || raw_name != raw_name.trim() {
+            return Err(Error::config("invalid custom provider header name"));
+        }
+        let name = reqwest::header::HeaderName::from_bytes(raw_name.as_bytes())
+            .map_err(|_| Error::config("invalid custom provider header name"))?;
+        if is_reserved_header(&name) {
+            return Err(Error::config(
+                "custom provider headers cannot override reserved protocol or auth headers",
+            ));
+        }
+        if !seen.insert(name.clone()) {
+            return Err(Error::config(
+                "duplicate custom provider header name (header names are case-insensitive)",
+            ));
+        }
+        if raw_value.is_empty() || raw_value.len() > MAX_CUSTOM_HEADER_VALUE_BYTES {
+            return Err(Error::config("invalid custom provider header value"));
+        }
+        let value = reqwest::header::HeaderValue::from_str(raw_value)
+            .map_err(|_| Error::config("invalid custom provider header value"))?;
+        parsed.push((name, value));
+    }
+    Ok(parsed)
+}
+
+pub fn apply_custom_headers(
+    mut builder: reqwest::RequestBuilder,
+    headers: &[(reqwest::header::HeaderName, reqwest::header::HeaderValue)],
+) -> reqwest::RequestBuilder {
+    for (name, value) in headers {
+        builder = builder.header(name, value);
+    }
+    builder
+}
 
 /// Credential placement is independent of the gateway's wire protocol.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -50,6 +114,9 @@ pub struct TransportConfig {
     /// warned, not rejected. Ordinary large responses are accepted.
     #[serde(default = "default_max_response_bytes")]
     pub max_response_bytes: usize,
+    /// Optional validated custom HTTP request headers applied before protocol/auth headers.
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
 }
 
 fn default_protocol() -> Protocol {
@@ -74,6 +141,10 @@ impl std::fmt::Debug for TransportConfig {
             .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
             .field("timeout_ms", &self.timeout_ms)
             .field("max_response_bytes", &self.max_response_bytes)
+            .field(
+                "headers",
+                &self.headers.keys().map(String::as_str).collect::<Vec<_>>(),
+            )
             .finish()
     }
 }
@@ -157,6 +228,7 @@ impl TransportConfig {
                 "provider response byte budget must be positive",
             ));
         }
+        parse_custom_headers(&self.headers)?;
         Ok(())
     }
 }
@@ -174,7 +246,40 @@ mod tests {
             api_key: None,
             timeout_ms: 1000,
             max_response_bytes: 1024,
+            headers: BTreeMap::new(),
         }
+    }
+
+    #[test]
+    fn custom_headers_validate_reserved_case_duplicates_and_redacted_debug() {
+        let mut ok = config(Protocol::OpenaiCompatible, "https://gateway.invalid/v1");
+        ok.headers.insert("User-Agent".into(), "pi".into());
+        ok.headers.insert("X-Custom-Tag".into(), "alpha".into());
+        ok.validate().unwrap();
+        let debug = format!("{ok:?}");
+        assert!(debug.contains("User-Agent"));
+        assert!(!debug.contains("alpha"));
+
+        for (name, value) in [
+            ("Authorization", "Bearer leaked"),
+            ("host", "evil.invalid"),
+            ("Content-Type", "text/plain"),
+            ("x-api-key", "k"),
+            ("x-goog-api-key", "k"),
+            ("anthropic-version", "2024-01-01"),
+            ("Bad Header", "v"),
+            ("X-Test", "line\r\ninjection"),
+            ("X-Empty", ""),
+        ] {
+            let mut bad = config(Protocol::OpenaiCompatible, "https://gateway.invalid/v1");
+            bad.headers.insert(name.into(), value.into());
+            assert!(bad.validate().is_err(), "{name}");
+        }
+
+        let mut dup = config(Protocol::OpenaiCompatible, "https://gateway.invalid/v1");
+        dup.headers.insert("User-Agent".into(), "pi".into());
+        dup.headers.insert("user-agent".into(), "other".into());
+        assert!(dup.validate().is_err());
     }
 
     #[test]

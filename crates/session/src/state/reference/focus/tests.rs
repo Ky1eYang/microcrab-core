@@ -1,5 +1,6 @@
 use super::*;
 use serde_json::json;
+
 fn snapshot(id: &str, body: &str) -> FocusSnapshot {
     FocusSnapshot::capture(
         ReferenceInfo {
@@ -11,22 +12,36 @@ fn snapshot(id: &str, body: &str) -> FocusSnapshot {
         body.into(),
     )
 }
-#[test]
-fn recorded_body_and_digest_restore_without_reopening_source() {
+
+#[tokio::test]
+async fn recorded_body_and_digest_restore_without_reopening_source() {
     let frozen = FocusedReferences(vec![snapshot("section-a", "original\n完整")]);
     let encoded = serde_json::to_vec(&frozen.0).unwrap();
     let restored = FocusedReferences(serde_json::from_slice(&encoded).unwrap());
     validate_snapshots(&restored.0).unwrap();
     assert_eq!(
-        restored.read("section-a").unwrap().unwrap().as_text().unwrap(),
+        restored
+            .expand("section-a", CancellationToken::new())
+            .await
+            .unwrap()
+            .unwrap()
+            .as_text()
+            .unwrap(),
         "original\n完整"
     );
-    assert!(restored.read("unselected").unwrap().is_none());
+    assert!(
+        restored
+            .expand("unselected", CancellationToken::new())
+            .await
+            .unwrap()
+            .is_none()
+    );
     assert_eq!(restored.list().unwrap().len(), 1);
     let mut tampered = restored.0;
     tampered[0].body = "changed".into();
     assert!(validate_snapshots(&tampered).is_err());
 }
+
 #[test]
 fn focus_capacity_and_selector_ambiguity_fail_closed() {
     assert!(
@@ -47,8 +62,9 @@ fn focus_capacity_and_selector_ambiguity_fail_closed() {
         validate_snapshots(&[snapshot("oversized", &"x".repeat(MAX_FOCUS_BYTES + 1))]).is_err()
     );
 }
-#[test]
-fn child_catalog_contains_only_snapshot_and_recovery_reinstalls_it() {
+
+#[tokio::test]
+async fn child_catalog_contains_only_snapshot_and_recovery_reinstalls_it() {
     let state = crate::State::new(crate::Limits::default());
     state
         .install_focused_references(vec![snapshot("chosen", "frozen")])
@@ -58,7 +74,7 @@ fn child_catalog_contains_only_snapshot_and_recovery_reinstalls_it() {
             .list_references()
             .unwrap()
             .iter()
-            .map(|row| row.info.id.as_str())
+            .map(|row| row.entry.id.as_str())
             .collect::<Vec<_>>(),
         vec!["chosen"]
     );
@@ -73,8 +89,17 @@ fn child_catalog_contains_only_snapshot_and_recovery_reinstalls_it() {
     let fresh = crate::State::new(crate::Limits::default());
     fresh.install_focused_references(recovered.focus).unwrap();
     assert_eq!(
-        fresh.read_reference("chosen").unwrap().as_text(),
+        fresh
+            .read_reference_async("chosen", CancellationToken::new())
+            .await
+            .unwrap()
+            .as_text(),
         Some("frozen")
     );
-    assert!(fresh.read_reference("other").is_err());
+    assert!(
+        fresh
+            .read_reference_async("other", CancellationToken::new())
+            .await
+            .is_err()
+    );
 }

@@ -514,6 +514,7 @@ pub(super) mod tests {
             operation_scope: invoked.then(|| ("read".into(), json!({"path": "allowed"}))),
             web: None,
             references: None,
+            script_profile: crate::runtime::wasm::script::ScriptProfile::Standard,
             guest_observation: None,
             confinement_diagnostic: None,
             operation_cancelled: false,

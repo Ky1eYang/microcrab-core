@@ -92,22 +92,26 @@ async fn server(body: String, media_type: &str) -> (String, tokio::task::JoinHan
 #[tokio::test]
 async fn fragmented_interleaved_sse_returns_validated_tools_trailing_usage_and_exact_audit() {
     let body = ": heartbeat\r\n\r\n".to_owned()
-        + &chunk(json!({"role":"assistant","content":"你"}), Value::Null)
-        + &chunk(
+        + chunk(json!({"role":"assistant","content":"你"}), Value::Null).as_str()
+        + chunk(
             json!({"tool_calls":[{"index":1,"id":"two","type":"function","function":{"name":"echo","arguments":"{\"b\":"}},{"index":0,"id":"one","type":"function","function":{"name":"echo","arguments":"{\"a\":"}}]}),
             Value::Null,
         )
-        + &chunk(
+        .as_str()
+        + chunk(
             json!({"content":"好","tool_calls":[{"index":0,"id":"","function":{"name":"","arguments":"1}"}},{"index":1,"id":"","function":{"name":"","arguments":"2}"}}]}),
             Value::Null,
         )
-        + &chunk(json!({}), json!("tool_calls"))
-        + &event(
+        .as_str()
+        + chunk(json!({}), json!("tool_calls")).as_str()
+        + event(
             json!({"choices":[],"usage":{"prompt_tokens":3,"completion_tokens":5,"earlier_only":{"retained":true}}}),
         )
-        + &event(
+        .as_str()
+        + event(
             json!({"choices":[],"usage":{"prompt_tokens":7,"completion_tokens":11,"prompt_tokens_details":{"cached_tokens":2,"cache_write_tokens":1},"completion_tokens_details":{"reasoning_tokens":4},"vendor_only":9}}),
         )
+        .as_str()
         + "data: [DONE]\r\n\r\n";
     let (endpoint, task) = server(body.clone(), "text/event-stream; charset=utf-8").await;
     let client = OpenAiCompatible::new(config(endpoint)).unwrap();
@@ -197,9 +201,10 @@ async fn fragmented_interleaved_sse_returns_validated_tools_trailing_usage_and_e
 #[tokio::test]
 async fn gateway_text_done_with_usage_completes_without_inventing_finish_reason() {
     let body = chunk(json!({"role":"assistant","content":"你好"}), Value::Null)
-        + &event(
+        + event(
             json!({"choices":[],"usage":{"prompt_tokens":46588,"completion_tokens":1488,"total_tokens":48076}}),
         )
+        .as_str()
         + "data: [DONE]\r\n\r\n";
     let (endpoint, task) = server(body.clone(), "text/event-stream").await;
     let client = OpenAiCompatible::new(config(endpoint)).unwrap();
@@ -262,12 +267,12 @@ async fn stream_rejects_terminal_and_tool_errors_without_finished_event() {
         chunk(json!({"content":"partial"}), json!("content_filter")) + "data: [DONE]\n\n",
         stop.clone() + "data: [DONE]\n\ndata: [DONE]\n\n",
         stop.clone()
-            + &event(json!({"choices":[],"usage":{"prompt_tokens":-1}}))
-            + &event(json!({"choices":[],"usage":{"prompt_tokens":3}}))
+            + event(json!({"choices":[],"usage":{"prompt_tokens":-1}})).as_str()
+            + event(json!({"choices":[],"usage":{"prompt_tokens":3}})).as_str()
             + "data: [DONE]\n\n",
         tool("echo", "{") + "data: [DONE]\n\n",
         tool("unknown", "{}") + "data: [DONE]\n\n",
-        stop + &chunk(json!({"content":"late"}), Value::Null) + "data: [DONE]\n\n",
+        stop + chunk(json!({"content":"late"}), Value::Null).as_str() + "data: [DONE]\n\n",
     ];
     for (index, body) in cases.into_iter().enumerate() {
         let (endpoint, task) = server(body.clone(), "text/event-stream").await;
@@ -351,8 +356,8 @@ async fn json_fallback_is_explicit_and_still_sends_stream_true() {
 async fn cancellation_and_dropping_backpressured_stream_emit_one_terminal_audit() {
     for drop_future in [false, true] {
         let body = chunk(json!({"content":"one"}), Value::Null)
-            + &chunk(json!({"content":"two"}), Value::Null)
-            + &chunk(json!({}), json!("stop"))
+            + chunk(json!({"content":"two"}), Value::Null).as_str()
+            + chunk(json!({}), json!("stop")).as_str()
             + "data: [DONE]\n\n";
         let (endpoint, task) = server(body, "text/event-stream").await;
         let client = OpenAiCompatible::new(config(endpoint)).unwrap();

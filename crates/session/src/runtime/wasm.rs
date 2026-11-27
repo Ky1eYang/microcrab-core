@@ -28,6 +28,7 @@ pub use lifecycle::AgentLifecycle;
 mod operations;
 mod output;
 mod resources;
+mod script;
 #[cfg(test)]
 pub(crate) mod test_admission;
 mod web_transport;
@@ -40,7 +41,7 @@ use crate::observation::wasm::{EvidenceBoundary, FailureEvidence, Phase};
 use crate::state::wasm::SessionBinding;
 use crate::utils::cancel::CancelOnDrop;
 use async_trait::async_trait;
-use communication::{TYPED_VARIABLES_INTERFACE, host_info_import};
+use communication::host_info_import;
 use microcrab_agent_types::AgentInfo;
 use microcrab_host_api::Host;
 use microcrab_protocol::ToolDefinition;
@@ -132,7 +133,8 @@ struct Compiled {
     host: Option<Arc<dyn Host>>,
     host_info_json: Result<String, String>,
     file_versions: bool,
-    references: bool,
+    session_script: bool,
+    script_profile: script::ScriptProfile,
     observes: bool,
     evidence_component: String,
     // Unique registered component/Host binding; code hashes are descriptive only.
@@ -312,11 +314,10 @@ fn load_agent(bytes: &[u8], limits: WasmLimits, host: Arc<dyn Host>) -> Result<W
                 None
             }
             "buffer" if matches!(&import.ty, ComponentItem::Resource(_)) => None,
-            references::INTERFACE if references::valid_import(&import.ty, &engine) => None,
+            script::INTERFACE if script::valid_import(&import.ty, &engine) => None,
             guest_observation::INTERFACE | guest_observation::BROWSER_INTERFACE
                 if guest_observation::valid_import(name, &import.ty, &engine) => None,
             HOST_INTERFACE
-            | TYPED_VARIABLES_INTERFACE
             | "microcrab:host/types@0.1.0"
             | "microcrab:host/tool-types@0.1.0"
             | "microcrab:host/cache-points@0.1.0"
@@ -473,7 +474,14 @@ fn load_agent(bytes: &[u8], limits: WasmLimits, host: Arc<dyn Host>) -> Result<W
             value.checked_add(1)
         })
         .map_err(|_| Error::wasm("component admission identities exhausted"))?;
-    let references = component_type.imports(&engine).any(|(name, _)| name == references::INTERFACE);
+    let session_script = component_type
+        .imports(&engine)
+        .any(|(name, _)| name == script::INTERFACE);
+    let script_profile = if required_capabilities.contains(&ComponentCapability::WebTransport) {
+        script::ScriptProfile::WebTransport
+    } else {
+        script::ScriptProfile::Standard
+    };
     let observes = component_type.imports(&engine).any(|(name, _)| {
         matches!(name, guest_observation::INTERFACE | guest_observation::BROWSER_INTERFACE)
     });
@@ -487,7 +495,8 @@ fn load_agent(bytes: &[u8], limits: WasmLimits, host: Arc<dyn Host>) -> Result<W
         host: Some(host),
         host_info_json,
         file_versions,
-        references,
+        session_script,
+        script_profile,
         observes,
         evidence_component,
         admission_identity: format!("wasm-instance:{admission_id}"),
@@ -691,6 +700,7 @@ struct RuntimeState {
     // Present only during the admitted invoke export, never init, describe or drive.
     web: Option<web_transport::Invocation>,
     references: Option<references::Ingress>,
+    script_profile: script::ScriptProfile,
     guest_observation: Option<(Arc<guest_observation::Scope>, Phase)>,
     // Handles minted by the current authorized process execution only.
     borrowed_processes: HashSet<u64>,
@@ -967,6 +977,7 @@ impl Compiled {
                 operation_scope: None,
                 web: None,
                 references: None,
+                script_profile: self.script_profile,
                 guest_observation: self.observation_scope(Phase::Instantiate, None).map(|scope| (scope, Phase::Instantiate)),
                 borrowed_processes: HashSet::new(),
                 admitted_process_scope: None,
@@ -1015,8 +1026,8 @@ impl Compiled {
         if self.observes {
             guest_observation::link(&mut linker).map_err(|error| boundary.failure(error, Phase::Instantiate))?;
         }
-        if self.references {
-            references::link(&mut linker).map_err(|error| boundary.failure(error, Phase::Instantiate))?;
+        if self.session_script {
+            script::link(&mut linker).map_err(|error| boundary.failure(error, Phase::Instantiate))?;
         }
         if self.host.is_some() {
             linker
@@ -1038,9 +1049,6 @@ impl Compiled {
                 .map_err(|error| {
                     boundary.failure(error, crate::observation::wasm::Phase::Instantiate)
                 })?;
-            communication::add_typed_to_linker(&mut linker).map_err(|error| {
-                boundary.failure(error, crate::observation::wasm::Phase::Instantiate)
-            })?;
             linker
                 .instance("microcrab:host/text-read@0.1.0")
                 .map_err(|error| {
@@ -1585,7 +1593,7 @@ impl WasmTool {
             None
         };
         self.bindings.bind_exact(&invocation, &effective_arguments)?;
-        let ingress = if compiled.references {
+        let ingress = if compiled.session_script {
             Some(references::Ingress::new(&invocation, &cancellation).await?)
         } else {
             None

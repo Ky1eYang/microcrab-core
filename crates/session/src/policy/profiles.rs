@@ -51,16 +51,26 @@ pub(super) fn native(tools: &[(String, ToolOrigin)], _agent: &str, _mode: &str) 
                     });
                     rules.push(allow);
                 }
-                let mut add_literal = rule(name, Action::Allow);
-                add_literal.args.push(super::ArgumentPredicate {
+                let mut add_inline = rule(name, Action::Allow);
+                add_inline.args.push(super::ArgumentPredicate {
                     pointer: "/action".into(),
                     matcher: Matcher::Exact("add".into()),
                 });
-                add_literal.args.push(super::ArgumentPredicate {
-                    pointer: "/source/type".into(),
-                    matcher: Matcher::Exact("literal".into()),
+                add_inline.args.push(super::ArgumentPredicate {
+                    pointer: "/content".into(),
+                    matcher: Matcher::Glob("*".into()),
                 });
-                rules.push(add_literal);
+                rules.push(add_inline);
+                let mut add_locator = rule(name, Action::Ask);
+                add_locator.args.push(super::ArgumentPredicate {
+                    pointer: "/action".into(),
+                    matcher: Matcher::Exact("add".into()),
+                });
+                add_locator.args.push(super::ArgumentPredicate {
+                    pointer: "/locator".into(),
+                    matcher: Matcher::Glob("*".into()),
+                });
+                rules.push(add_locator);
                 return rules;
             }
             vec![rule(
@@ -129,16 +139,16 @@ mod tests {
         assert_eq!(
             microcrab_permission::evaluate_compiled(
                 &compiled,
-                &serde_json::json!({"action": "add", "source": {"type": "literal", "content": "hi"}})
+                &serde_json::json!({"action": "add", "content": "hi"})
             )
             .unwrap(),
             Action::Allow
         );
-        for shortcut in ["host_path", "host_glob", "https", "directory_url"] {
+        for locator in ["AGENTS.md", "skills/**/SKILL.md", "https://example.com"] {
             assert_eq!(
                 microcrab_permission::evaluate_compiled(
                     &compiled,
-                    &serde_json::json!({"action": "add", "source": {"type": shortcut}})
+                    &serde_json::json!({"action": "add", "locator": locator})
                 )
                 .unwrap(),
                 Action::Ask

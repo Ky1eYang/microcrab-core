@@ -1,12 +1,16 @@
 //! Owner-isolated Personal Content Library persistence (metadata, blobs, and session/project mounts).
+pub mod types;
+pub use types::{
+    CreateLibraryObject, DEFAULT_MAX_OBJECT_BYTES, DEFAULT_MAX_USER_BYTES,
+    DEFAULT_MAX_USER_ENTRIES, LibraryObjectSummary, LibraryQuota, LibrarySource, LocalBlobOrigin,
+    ShortcutTarget, UpdateLibraryObject, normalize_shortcut,
+};
+
 use async_trait::async_trait;
 use microcrab_session::Error;
 use microcrab_session::budget::{LimitKind, check, reject};
-use microcrab_session::state::reference::library::{
-    CreateLibraryObject, DEFAULT_MAX_OBJECT_BYTES, DEFAULT_MAX_USER_BYTES,
-    DEFAULT_MAX_USER_ENTRIES, LibraryObjectSummary, LibraryQuota, LibrarySource, LocalBlobOrigin,
-    UpdateLibraryObject, canonical_mime, inspect_binary_for_storage, normalize_shortcut,
-    valid_library_id,
+use microcrab_session::state::reference::{
+    canonical_mime, inspect_binary_for_storage, valid_library_id,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;

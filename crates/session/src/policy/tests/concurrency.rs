@@ -97,6 +97,7 @@ async fn resolve(adapter: Arc<dyn SessionPermission>, action: Action) -> (Action
         .resolve_ask(
             &policy,
             &request,
+            None,
             &state,
             &issuer(),
             &CancellationToken::new(),
@@ -179,6 +180,7 @@ async fn missing_executor_prevents_even_valid_reviewer_from_starting() {
             .resolve_ask(
                 &p,
                 &request(&owner, &context, json!({})),
+                None,
                 &context.state,
                 &issuer(),
                 &context.cancellation

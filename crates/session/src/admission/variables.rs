@@ -7,29 +7,7 @@ pub(crate) const EXECUTION_CAPACITY_KEY: &str = "execution_capacity";
 /// Protected model namespaces. `host` and `agent` remain compatibility guards:
 /// HostInfo and SYSTEM's agent namespace carry those facts, not derived State.
 pub(crate) fn is_reserved_key(key: &str) -> bool {
-    matches!(
-        key,
-        "time"
-            | "notices"
-            | "session"
-            | "host"
-            | "agent"
-            | "agent_init"
-            | "agent_initialization_pending"
-            | "mode"
-            | "jobs"
-            | "permission"
-            | "subagents"
-            | "delegatable_agents"
-            | "correspondents"
-            | "external_speakers"
-            | "mode_prompt"
-            | "switchable_modes"
-            | "executions"
-            | EXECUTION_CAPACITY_KEY
-            | "tool_tasks"
-            | "references"
-    )
+    microcrab_protocol::is_system_reserved_state_key(key) || key == "references"
 }
 
 pub(crate) fn validate_custom_key(key: &str) -> Result<(), Error> {

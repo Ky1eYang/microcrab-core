@@ -1,7 +1,0 @@
-package microcrab:session@0.3.0;
-
-/// Session-scoped ingress for adding an item to the active user's Personal Content Library
-/// and mounting it into the current Session.
-interface references {
-  create: func(title: string, media-type: string, data: list<u8>) -> result<string, string>;
-}

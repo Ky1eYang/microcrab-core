@@ -145,7 +145,7 @@ pub struct SessionBuilder {
     journal: Arc<dyn Journal>,
     host: Option<Arc<dyn microcrab_host_api::Host>>,
     references: Vec<DynReference>,
-    reference_sources: Vec<(String, Vec<crate::state::reference::ReferenceSource>)>,
+    default_writable_reference: Option<String>,
     session_id: String,
     processes_parent: Option<Arc<dyn crate::runtime::execution::process::ProcessControl>>,
     catalog: Vec<microcrab_agent_types::AgentInfo>,
@@ -219,7 +219,7 @@ impl Session {
             journal: Arc::new(MemoryJournal::new()),
             host: None,
             references: Vec::new(),
-            reference_sources: Vec::new(),
+            default_writable_reference: None,
             session_id: format!(
                 "session-{}",
                 NEXT_SESSION_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -487,19 +487,6 @@ impl Session {
         policy: crate::context::AutoCompactionPolicy,
     ) -> Result<(), Error> {
         self.inner.set_auto_compaction(policy).await
-    }
-    pub async fn replace_markdown_references(
-        &self,
-        kind: String,
-        sources: Vec<crate::state::reference::ReferenceSource>,
-        limits: crate::state::reference::ReferenceLimits,
-    ) -> Result<(), Error> {
-        self.inner
-            .replace_markdown_references(kind, sources, limits)
-            .await
-    }
-    pub async fn refresh_reference_library(&self) -> Result<(), Error> {
-        self.inner.refresh_reference_library().await
     }
     /// Observe actually applied Runtime permissions without starting model admission.
     /// A successful list is a presentation snapshot, never an admission token.
@@ -1061,8 +1048,12 @@ impl Session {
         {
             recover.state.agent_initialization_pending = false;
         }
-        if builder.references.is_empty() && builder.reference_sources.is_empty() {
+        if builder.references.is_empty() {
             builder.references = recover.state.references.iter().cloned().collect();
+            if builder.default_writable_reference.is_none() {
+                builder.default_writable_reference =
+                    self.inner.state_handle().default_writable_kind();
+            }
         }
         let session = Self::restore(builder, recover).await?;
         #[cfg(feature = "wasm")]
@@ -1237,15 +1228,9 @@ impl SessionBuilder {
         self.references = references;
         self
     }
-    /// Load bounded Markdown catalogs from explicit Host paths/globs or HTTP(S)
-    /// URLs. `kind` owns a State array key, e.g. references, skills or memory.
-    /// Host is captured at build, so host()/markdown_references() order is irrelevant.
-    pub fn markdown_references(
-        mut self,
-        kind: impl Into<String>,
-        sources: Vec<crate::state::reference::ReferenceSource>,
-    ) -> Self {
-        self.reference_sources.push((kind.into(), sources));
+    /// Designate the default writable reference `kind` (e.g. `references`) for writes without an explicit target kind.
+    pub fn default_writable_reference(mut self, kind: impl Into<String>) -> Self {
+        self.default_writable_reference = Some(kind.into());
         self
     }
     pub fn catalog(mut self, catalog: Vec<microcrab_agent_types::AgentInfo>) -> Self {
@@ -1256,12 +1241,7 @@ impl SessionBuilder {
         self.is_main = Some(is_main);
         self
     }
-    pub fn build(mut self) -> Result<Session, Error> {
-        for (kind, sources) in self.reference_sources.drain(..) {
-            self.references.push(DynReference::new(
-                crate::state::reference::MarkdownReferences::new(kind, sources, self.host.clone()),
-            )?);
-        }
+    pub fn build(self) -> Result<Session, Error> {
         let is_main =
             self.is_main
                 .unwrap_or(self.kind.map_or(self.processes_parent.is_none(), |kind| {
@@ -1344,6 +1324,7 @@ impl SessionBuilder {
                 journal: self.journal,
                 host: self.host,
                 references: self.references,
+                default_writable_reference: self.default_writable_reference,
                 session_id: self.session_id,
                 processes_parent: self.processes_parent,
                 catalog: self.catalog,

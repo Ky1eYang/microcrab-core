@@ -1,12 +1,12 @@
-//! Transfer only a certified registry lease into the user's Personal Content Library.
+//! Transfer only a certified registry lease into the session's default writable Reference.
 use super::{ExecutionId, REDIRECT, ToolContext, ToolOutput, arguments::Redirect};
-use crate::{Error, LimitKind, state::reference::LibraryObjectSummary};
+use crate::{Error, LimitKind, state::reference::ReferenceEntry};
 use serde::Serialize;
 
 #[derive(Serialize)]
 struct Receipt {
     action: &'static str,
-    reference: LibraryObjectSummary,
+    reference: ReferenceEntry,
     /// This operation never releases the source; another admission may do so.
     source_released: bool,
 }

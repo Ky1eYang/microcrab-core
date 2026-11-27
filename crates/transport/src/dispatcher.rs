@@ -26,6 +26,7 @@ impl TransportClient {
     pub fn new(config: TransportConfig) -> Result<Self, Error> {
         config.validate()?;
         let auth = config.auth;
+        let headers = config.headers;
         match config.protocol {
             Protocol::OpenaiCompatible => {
                 let client = OpenAiCompatible::new(OpenAiCompatibleConfig {
@@ -35,7 +36,8 @@ impl TransportClient {
                     timeout_ms: config.timeout_ms,
                     max_response_bytes: config.max_response_bytes,
                 })?
-                .with_auth_mode(auth);
+                .with_auth_mode(auth)
+                .with_headers(headers)?;
                 Ok(Self::OpenAiCompatible(client))
             }
             Protocol::OpenaiResponses => {
@@ -46,7 +48,8 @@ impl TransportClient {
                     timeout_ms: config.timeout_ms,
                     max_response_bytes: config.max_response_bytes,
                 })?
-                .with_auth_mode(auth);
+                .with_auth_mode(auth)
+                .with_headers(headers)?;
                 Ok(Self::OpenAiResponses(client))
             }
             Protocol::Anthropic => {
@@ -57,7 +60,8 @@ impl TransportClient {
                     timeout_ms: config.timeout_ms,
                     max_response_bytes: config.max_response_bytes,
                 })?
-                .with_auth_mode(auth);
+                .with_auth_mode(auth)
+                .with_headers(headers)?;
                 Ok(Self::Anthropic(client))
             }
             Protocol::Google => {
@@ -68,7 +72,8 @@ impl TransportClient {
                     timeout_ms: config.timeout_ms,
                     max_response_bytes: config.max_response_bytes,
                 })?
-                .with_auth_mode(auth);
+                .with_auth_mode(auth)
+                .with_headers(headers)?;
                 Ok(Self::Google(client))
             }
         }

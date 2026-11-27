@@ -65,6 +65,7 @@ impl OpenAiCompatibleRequestOptions {
 #[derive(Clone)]
 pub struct OpenAiCompatible {
     auth: crate::AuthMode,
+    headers: Vec<(reqwest::header::HeaderName, reqwest::header::HeaderValue)>,
     config: OpenAiCompatibleConfig,
     options: OpenAiCompatibleRequestOptions,
     http: reqwest::Client,
@@ -133,6 +134,7 @@ impl OpenAiCompatible {
             .map_err(|_| Error::config("cannot construct provider HTTP client"))?;
         Ok(Self {
             auth: crate::AuthMode::default(),
+            headers: Vec::new(),
             config,
             options: OpenAiCompatibleRequestOptions::default(),
             http,
@@ -153,6 +155,14 @@ impl OpenAiCompatible {
     pub fn with_auth_mode(mut self, auth: crate::AuthMode) -> Self {
         self.auth = auth;
         self
+    }
+
+    pub fn with_headers(
+        mut self,
+        headers: std::collections::BTreeMap<String, String>,
+    ) -> Result<Self, Error> {
+        self.headers = crate::config::parse_custom_headers(&headers)?;
+        Ok(self)
     }
 
     pub fn with_recording(mut self, recording: std::sync::Arc<dyn crate::ModelRecording>) -> Self {
@@ -244,15 +254,16 @@ impl OpenAiCompatible {
         events: Option<tokio::sync::mpsc::Sender<ModelEvent>>,
     ) -> Result<Response, Error> {
         // Serialize once: the audited string is exactly the body the transport sends.
-        let mut builder = self
-            .http
-            .post(&self.config.endpoint)
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .header(
-                reqwest::header::ACCEPT,
-                "text/event-stream, application/json",
-            )
-            .body(wire_request);
+        let mut builder = crate::config::apply_custom_headers(
+            self.http.post(&self.config.endpoint),
+            &self.headers,
+        )
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .header(
+            reqwest::header::ACCEPT,
+            "text/event-stream, application/json",
+        )
+        .body(wire_request);
         builder = self.auth.apply(
             builder,
             crate::Protocol::OpenaiCompatible,

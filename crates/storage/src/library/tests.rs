@@ -1,5 +1,5 @@
 use super::*;
-use microcrab_session::state::reference::library::{LocalBlobOrigin, ShortcutTarget};
+use super::types::{LocalBlobOrigin, ShortcutTarget};
 
 fn png_bytes() -> Vec<u8> {
     let mut data = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();

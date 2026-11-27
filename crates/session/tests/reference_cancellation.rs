@@ -7,10 +7,9 @@ use microcrab_session::runtime::{
     tool::DenyAll,
 };
 use microcrab_session::{
-    Auditor, Client, DynReference, Error, Limits, Reference, ReferenceContent, ReferenceInfo,
-    Session,
+    Auditor, Client, DynReference, Error, Limits, Reference, ReferenceCapabilities,
+    ReferenceContent, ReferenceEntry, ReferenceError, ReferenceProjection, Session,
 };
-use serde_json::Value;
 use std::{
     sync::{
         Arc,
@@ -27,25 +26,32 @@ struct Pending {
     entered: Notify,
 }
 struct PendingReference(Arc<Pending>);
+#[async_trait::async_trait]
 impl Reference for PendingReference {
-    type Error = std::io::Error;
     fn kind(&self) -> &str {
         "pending_reference"
     }
-    async fn load(&self) -> Result<(), Self::Error> {
+    fn capabilities(&self) -> ReferenceCapabilities {
+        ReferenceCapabilities::read_only()
+    }
+    async fn load(&self, _cancel: CancellationToken) -> Result<(), ReferenceError> {
         if self.0.blocked.load(Ordering::SeqCst) {
             self.0.entered.notify_one();
             std::future::pending::<()>().await;
         }
         Ok(())
     }
-    fn list(&self) -> Result<Vec<ReferenceInfo>, Self::Error> {
+    fn list(&self) -> Result<Vec<ReferenceEntry>, ReferenceError> {
         Ok(vec![])
     }
-    fn read(&self, _: &str) -> Result<Option<ReferenceContent>, Self::Error> {
-        Ok(None)
+    fn projections(&self) -> Result<ReferenceProjection, ReferenceError> {
+        Ok(ReferenceProjection::empty())
     }
-    fn change(&self) -> Result<Option<Value>, Self::Error> {
+    async fn expand(
+        &self,
+        _: &str,
+        _cancel: CancellationToken,
+    ) -> Result<Option<ReferenceContent>, ReferenceError> {
         Ok(None)
     }
 }

@@ -18,6 +18,7 @@ pub(crate) const BINDINGS: &[&str] = &[
     "user_input",
     "tool",
     "tool_name",
+    "tool_description",
     "tool_args",
     "operation_kind",
     "mode",
@@ -26,9 +27,10 @@ pub(crate) const BINDINGS: &[&str] = &[
 
 // Exact previously shipped default bytes only. Keep compatibility without carrying
 // the retired prompt assets or rewriting any saved custom configuration.
-const LEGACY_DEFAULT_SHA256: [&str; 2] = [
+const LEGACY_DEFAULT_SHA256: [&str; 3] = [
     "29d89e6b445812fdbbc43ce6a5fecc53238c1d6ff26987108cfab7f5b05a0abc",
     "8d11b97ef87ff2db01f622ba5504b72903be0af97cc909514067c72c5df11cd3",
+    "360ab615c5daf31468adb9537151d16c400cb8a7a5b5a285705e698b5466082a",
 ];
 
 fn is_legacy_default(markdown: &str) -> bool {
@@ -65,7 +67,7 @@ pub(super) fn prepare_review(
     let escaped = bindings
         .iter()
         .map(|(name, value)| {
-            if matches!(*name, "user_input" | "mode_prompt") {
+            if matches!(*name, "user_input" | "mode_prompt" | "tool_description") {
                 escape_review_data(value, issuer.max_bytes).map(Some)
             } else {
                 Ok(None)
@@ -155,7 +157,7 @@ fn review_arguments(
 
 #[expect(
     clippy::too_many_arguments,
-    reason = "Model preview and grant-validation evidence are separate"
+    reason = "Model preview, tool description, and grant-validation evidence are separate"
 )]
 pub(crate) async fn run(
     executor: &dyn super::OneShotExecutor,
@@ -164,6 +166,7 @@ pub(crate) async fn run(
     state: &State,
     issuer: &Content,
     permission: &PermissionRequest,
+    tool_description: Option<&str>,
     preview: Option<&serde_json::Value>,
     cancellation: &CancellationToken,
 ) -> Result<ReviewResult, PermissionError> {
@@ -179,6 +182,11 @@ pub(crate) async fn run(
     } else {
         "agent_init"
     };
+    let description = tool_description.unwrap_or(if permission.subject.is_tool() {
+        ""
+    } else {
+        "Initialize the registered WASM agent component within its declared host import scope."
+    });
     let request = prepare_review(
         issuer,
         &executor.prompt_config().action_review_template,
@@ -186,6 +194,7 @@ pub(crate) async fn run(
             ("user_input", &user_input),
             ("tool", &permission.tool),
             ("tool_name", &permission.tool),
+            ("tool_description", description),
             ("tool_args", &tool_args),
             ("operation_kind", operation_kind),
             ("mode", &mode),
@@ -333,6 +342,7 @@ mod tests {
         let bindings = [
             ("user_input", "intent {{ mode }}"),
             ("tool_name", "write"),
+            ("tool_description", "Write <safe> UTF-8 file."),
             ("tool_args", "{}"),
             ("operation_kind", "tool"),
             ("mode", "plan"),
@@ -340,6 +350,11 @@ mod tests {
         ];
         let current = prepare_review(&issuer, BUILTIN.prompt, &bindings).unwrap();
         assert!(current.system.contains("Read {{ literally }}"));
+        assert!(
+            current
+                .system
+                .contains("<untrusted_tool_description>\nWrite &lt;safe&gt; UTF-8 file.\n</untrusted_tool_description>")
+        );
         assert!(
             current
                 .system

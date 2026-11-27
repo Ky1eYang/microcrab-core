@@ -45,6 +45,22 @@ pub(crate) fn execute(
     invocation
         .begin_dispatch(None)
         .map_err(|e| e.into_runtime_error())?;
+    execute_inner(control, arguments, &invocation)
+}
+
+pub(crate) fn execute_admitted(
+    control: Option<&dyn SessionControl>,
+    arguments: &Value,
+    invocation: &ToolContext,
+) -> Result<ToolOutput, Error> {
+    execute_inner(control, arguments, invocation)
+}
+
+fn execute_inner(
+    control: Option<&dyn SessionControl>,
+    arguments: &Value,
+    invocation: &ToolContext,
+) -> Result<ToolOutput, Error> {
     let mode = arguments
         .get("mode")
         .and_then(Value::as_str)
@@ -52,6 +68,6 @@ pub(crate) fn execute(
         .ok_or_else(|| Error::tool("switch_mode requires a nonempty mode"))?;
     let receipt = control
         .ok_or_else(|| Error::tool("Session mode control is unavailable"))?
-        .request_mode(mode, &invocation)?;
+        .request_mode(mode, invocation)?;
     Ok(ToolOutput::text(receipt.to_string()))
 }

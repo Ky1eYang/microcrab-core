@@ -84,6 +84,7 @@ fn session(
         journal,
         host: None,
         references: vec![],
+        default_writable_reference: None,
         session_id: "command-close".into(),
         processes_parent: None,
         catalog: vec![],
@@ -336,29 +337,39 @@ struct ModePublicationGap {
     controller: Arc<crate::policy::PermissionController>,
     armed: Arc<AtomicBool>,
 }
+#[async_trait::async_trait]
 impl crate::Reference for ModePublicationGap {
-    type Error = std::io::Error;
     fn kind(&self) -> &str {
         "skills"
     }
-    async fn load(&self) -> Result<(), Self::Error> {
+    fn capabilities(&self) -> crate::ReferenceCapabilities {
+        crate::ReferenceCapabilities::read_only()
+    }
+    async fn load(&self, _cancel: CancellationToken) -> Result<(), crate::ReferenceError> {
         Ok(())
     }
-    fn list(&self) -> Result<Vec<crate::ReferenceInfo>, Self::Error> {
+    fn list(&self) -> Result<Vec<crate::ReferenceEntry>, crate::ReferenceError> {
         Ok(vec![])
     }
-    fn read(&self, _: &str) -> Result<Option<crate::ReferenceContent>, Self::Error> {
-        Ok(None)
-    }
-    fn change(&self) -> Result<Option<Value>, Self::Error> {
+    fn projections(&self) -> Result<crate::ReferenceProjection, crate::ReferenceError> {
         if self.armed.swap(false, Ordering::SeqCst) {
             // Pause a real mode publication after policy commit but before its
             // State name commit, exactly while candidate reference refresh runs.
             self.controller
                 .configure_mode("input-fixture", "build", &[])
-                .map_err(|error| std::io::Error::other(error.to_string()))?;
+                .map_err(|error| crate::ReferenceError::failed(error.to_string()))?;
         }
-        Ok(Some(serde_json::json!([])))
+        Ok(crate::ReferenceProjection {
+            exact: Some(serde_json::json!([])),
+            short_model: None,
+        })
+    }
+    async fn expand(
+        &self,
+        _: &str,
+        _cancel: CancellationToken,
+    ) -> Result<Option<crate::ReferenceContent>, crate::ReferenceError> {
+        Ok(None)
     }
 }
 

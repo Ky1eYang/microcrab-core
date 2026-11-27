@@ -5,7 +5,7 @@ mod context;
 pub mod delegate;
 mod dialogue_reply;
 pub(crate) mod injection;
-mod messaging;
+pub(crate) mod messaging;
 pub mod reference;
 pub(crate) mod secret;
 pub mod sleep;
@@ -38,6 +38,7 @@ pub struct ToolContext {
     pub(crate) observation_interrupt: Option<CancellationToken>,
     pub call_id: String,
     pub tool: String,
+    pub(crate) tool_description: Option<String>,
     pub session_id: String,
     pub agent: String,
     pub mode: Option<String>,
@@ -49,7 +50,7 @@ pub struct ToolContext {
     pub execution_progress: Option<super::execution::ExecutionProgress>,
     resolved_arguments: Option<Arc<secret::ResolvedArguments>>,
     pub(crate) literal_mask: injection::LiteralMask,
-    pub(crate) redirect_destination: Option<crate::state::reference::LibraryRedirectDestination>,
+    pub(crate) redirect_destination: Option<crate::state::reference::ReferenceRedirectDestination>,
     pub(crate) file_version_policy_arguments: Option<Arc<Value>>,
     redaction: super::execution::InvocationRedaction,
     cache_scope: Option<super::cache::Scope>,

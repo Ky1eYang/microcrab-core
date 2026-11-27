@@ -3,6 +3,29 @@ use super::reference::References;
 use super::{Limits, Variables};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+/// Persisted descriptor for dynamic Host or inline references mounted after Session construction
+/// (for example during `agent wasm init` or Rhai scripting), restored automatically on Recovery.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DynamicReferenceMount {
+    Host {
+        target_kind: String,
+        path: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+        #[serde(default)]
+        plain_text: bool,
+    },
+    Inline {
+        target_kind: String,
+        title: String,
+        media_type: String,
+        content: String,
+        #[serde(default)]
+        plain_text: bool,
+    },
+}
+
 /// Runtime-owned state exposed immutably to lifecycle plugins.
 ///
 /// Mutation is serialized by the session owner. Cloning captures runtime state,
@@ -35,6 +58,7 @@ pub struct SessionState {
     /// Last allocated turn within the selected epoch; restored with that history.
     pub(crate) last_turn_id: u64,
     pub(crate) references: References,
+    pub(crate) dynamic_reference_mounts: Vec<DynamicReferenceMount>,
     // Immutable decoded history keeps its original limit keys for content hashes.
     // Live activation clears this marker; changing effective limits also retires it.
     historical_limits: Option<(serde_json::Value, Limits)>,
@@ -82,6 +106,8 @@ impl Serialize for SessionState {
             #[serde(skip_serializing_if = "Option::is_none")]
             tool_tasks: &'a Option<serde_json::Value>,
             last_turn_id: u64,
+            #[serde(skip_serializing_if = "Vec::is_empty")]
+            dynamic_reference_mounts: &'a Vec<DynamicReferenceMount>,
         }
         let limits = match &self.historical_limits {
             Some((raw, decoded)) if decoded == &self.limits => LimitsEncoding::Historical(raw),
@@ -105,6 +131,7 @@ impl Serialize for SessionState {
             agent_initialization_pending: self.agent_initialization_pending,
             tool_tasks: &self.tool_tasks,
             last_turn_id: self.last_turn_id,
+            dynamic_reference_mounts: &self.dynamic_reference_mounts,
         }
         .serialize(serializer)
     }
@@ -142,6 +169,8 @@ impl<'de> Deserialize<'de> for SessionState {
             #[serde(default)]
             tool_tasks: Option<serde_json::Value>,
             last_turn_id: u64,
+            #[serde(default)]
+            dynamic_reference_mounts: Vec<DynamicReferenceMount>,
         }
         let mut wire = Wire::deserialize(deserializer)?;
         wire.variables
@@ -177,6 +206,7 @@ impl<'de> Deserialize<'de> for SessionState {
             tool_tasks: wire.tool_tasks,
             last_turn_id: wire.last_turn_id,
             references: References::default(),
+            dynamic_reference_mounts: wire.dynamic_reference_mounts,
             historical_limits,
         })
     }
@@ -212,6 +242,7 @@ impl SessionState {
             tool_tasks: None,
             last_turn_id: 0,
             references: References::default(),
+            dynamic_reference_mounts: Vec::new(),
             historical_limits: None,
         }
     }

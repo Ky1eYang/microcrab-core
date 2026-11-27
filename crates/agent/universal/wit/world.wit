@@ -4,5 +4,5 @@ world universal {
   import microcrab:host/shell@0.1.0;
   import microcrab:host/process@0.1.0;
   // For explicit guest use only; the shell does not call this interface.
-  import microcrab:session/variables@0.2.0;
+  import microcrab:session/session@0.4.0;
 }

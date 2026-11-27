@@ -99,6 +99,7 @@ fn source_discovery_is_exclusive_and_wrong_paths_fail() {
                         ("user_input", "task"),
                         ("tool", "shell"),
                         ("tool_name", "shell"),
+                        ("tool_description", "Run shell command"),
                         ("tool_args", "{}"),
                         ("operation_kind", "tool"),
                         ("mode", "plan"),
@@ -297,6 +298,7 @@ fn action_review_loads_its_template_with_declared_literal_request_data() {
         ("user_input", input),
         ("tool", "write"),
         ("tool_name", "write"),
+        ("tool_description", "Write files safely <xml>"),
         ("tool_args", args),
         ("operation_kind", "tool"),
         ("mode", "plan"),
@@ -307,6 +309,11 @@ fn action_review_loads_its_template_with_declared_literal_request_data() {
         prepared
             .system
             .contains("Operation kind: tool\nCurrent mode: plan")
+    );
+    assert!(
+        prepared.system.contains(
+            "<untrusted_tool_description>\nWrite files safely &lt;xml&gt;\n</untrusted_tool_description>"
+        )
     );
     assert!(
         prepared.system.contains(

@@ -190,6 +190,7 @@ pub(crate) struct SessionParts {
     pub journal: Arc<dyn crate::runtime::journal::Journal>,
     pub host: Option<Arc<dyn microcrab_host_api::Host>>,
     pub references: Vec<crate::DynReference>,
+    pub default_writable_reference: Option<String>,
     pub session_id: String,
     pub processes_parent: Option<Arc<dyn crate::runtime::execution::process::ProcessControl>>,
     pub catalog: Vec<AgentInfo>,

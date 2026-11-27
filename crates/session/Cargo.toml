@@ -35,6 +35,7 @@ microcrab-auditor.workspace = true
 microcrab-transport.workspace = true
 microcrab-agent-types.workspace = true
 tera.workspace = true
+rhai.workspace = true
 microcrab-host-api.workspace = true
 async-trait.workspace = true
 tracing.workspace = true

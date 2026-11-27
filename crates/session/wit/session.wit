@@ -1,0 +1,24 @@
+package microcrab:session@0.4.0;
+
+/// Unified Session / SessionState Builtin scripting boundary (Rhai).
+interface session {
+  enum error-code {
+    absent,
+    unavailable,
+    denied,
+    invalid-argument,
+    limit,
+    cancelled,
+    script-error,
+  }
+
+  record session-error {
+    code: error-code,
+    message: string,
+  }
+
+  /// Evaluate a Rhai script against SessionState and Session Builtin capabilities.
+  /// `args-json` (if present) is decoded and bound as `args` in the script scope.
+  /// Returns the script return value encoded as JSON text.
+  eval: func(script: string, args-json: option<string>) -> result<string, session-error>;
+}

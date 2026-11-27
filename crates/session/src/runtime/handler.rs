@@ -219,6 +219,7 @@ impl Runtime {
             .await
             .map_err(|e| PermissionError::InvalidConfiguration(e.diagnostic_reason()))?;
         let snapshot = self.permission.snapshot()?;
+        invocation.tool_description = registry.tool_description(&call.name).map(str::to_owned);
         let request = PermissionRequest {
             subject: invocation.subject.clone(),
             session_id: invocation.session_id.clone(),
@@ -307,6 +308,10 @@ impl Runtime {
             ));
         }
         let snapshot = self.permission.snapshot()?;
+        invocation.tool_description = Some(
+            "Initialize the registered WASM agent component within its declared host import scope."
+                .into(),
+        );
         let request = PermissionRequest {
             subject: invocation.subject.clone(),
             session_id: invocation.session_id.clone(),
@@ -364,6 +369,11 @@ impl Runtime {
         control: std::sync::Weak<dyn super::tool::switch_mode::SessionControl>,
     ) {
         *self.controls.write().unwrap_or_else(|e| e.into_inner()) = Some(control);
+    }
+    pub(crate) fn delegate_executor(
+        &self,
+    ) -> Option<Arc<dyn super::tool::delegate::DelegateExecutor>> {
+        self.delegate.clone()
     }
     pub(crate) fn bind_dialogue_reply_owner(&self, owner: std::sync::Weak<dyn DialogueReplyOwner>) {
         // Runtime is moved into a single Session; there is no public rebinding path.
@@ -465,7 +475,7 @@ impl Runtime {
         super::execution::job::require_current_definition(context.frozen_tools())?;
         let turn = cancellation.child_token();
         let _cancel = CancelOnDrop(turn.clone());
-        state.refresh_library(turn.clone()).await?;
+        state.refresh_writable_references(turn.clone()).await?;
         self.run_turn(
             state,
             context,
@@ -1292,6 +1302,8 @@ impl Runtime {
                     .permission
                     .snapshot()
                     .map_err(|e| Error::config_with_private(e.public_reason(), e.to_string()))?;
+                invocation.tool_description =
+                    tool_registry.tool_description(&call.name).map(str::to_owned);
                 let request = PermissionRequest {
                     subject: invocation.subject.clone(),
                     session_id: invocation.session_id.clone(),

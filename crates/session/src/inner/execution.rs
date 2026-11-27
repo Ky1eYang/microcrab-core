@@ -704,7 +704,7 @@ impl SessionInner {
             if route_changed {
                 preview_context.prepare_protocol_epoch()?;
             }
-            self.state.refresh_library(cancellation.clone()).await?;
+            self.state.refresh_writable_references(cancellation.clone()).await?;
             let preview = self.state.preview();
             preview.set_short_model_refs(crate::runtime::tool::short_model_refs(
                 preview_context.frozen_tools(),

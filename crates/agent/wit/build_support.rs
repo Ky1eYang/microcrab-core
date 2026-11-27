@@ -34,14 +34,9 @@ pub fn stage(manifest: &Path, world: &str, runtime: bool) -> io::Result<PathBuf>
         &root.join("crates/host/wit/host.wit"),
         &out.join("deps/host/host.wit"),
     )?;
-    let variables = if runtime {
-        out.join("scoped-variables.wit")
-    } else {
-        out.join("deps/session/scoped-variables.wit")
-    };
     copy(
-        &root.join("crates/session/wit/scoped-variables.wit"),
-        &variables,
+        &root.join("crates/session/wit/session.wit"),
+        &out.join("deps/session-api/session.wit"),
     )?;
     if runtime {
         copy(

@@ -575,6 +575,7 @@ impl PermissionController {
         &self,
         snapshot: &PolicySnapshot,
         request: &PermissionRequest,
+        tool_description: Option<&str>,
         state: &crate::State,
         issuer: &crate::context::Content,
         cancellation: &CancellationToken,
@@ -643,6 +644,7 @@ impl PermissionController {
                     state,
                     issuer,
                     request,
+                    tool_description,
                     None,
                     &review_cancellation,
                 )

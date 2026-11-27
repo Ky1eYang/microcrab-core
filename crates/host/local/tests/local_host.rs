@@ -3,6 +3,7 @@
 mod cache;
 mod file;
 mod filesystem_scope;
+mod host_reference;
 mod info;
 mod jobs;
 mod mutations;

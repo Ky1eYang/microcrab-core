@@ -1,237 +1,82 @@
-//! Reference kinds written into the model-facing state projection.
+//! Session-owned reference wiring over the unified `Reference` trait.
 //!
-//! skills, important reference(like **/AGENTS.md), and memory share this trait. The embedder supplies the
-//! concrete kinds at session construction; this module does not discover files.
-//!
-//! The list is runtime wiring. It is shared by `Arc` across state clones, skipped
-//! by recovery serialization, and preserved when a recovered snapshot replaces
-//! counters and variables. Each kind synchronizes its own catalog. `load` and
-//! `change` run without the state lock so a kind cannot deadlock on `State`.
-
+//! Concrete implementations live closest to their content origins (Core Host
+//! and Server) and are assembled uniformly by Creator. Session runtime only
+//! inspects `DynReference` capabilities, projects per-kind arrays into `State`,
+//! and routes `expand` / `add` / `update` / `remove` / `refresh` by `id` or
+//! designated default writable kind.
 pub mod focus;
-pub mod library;
-pub mod markdown;
-pub use library::{
-    CreateLibraryObject, DEFAULT_MAX_OBJECT_BYTES, DEFAULT_MAX_USER_BYTES,
-    DEFAULT_MAX_USER_ENTRIES, InMemoryReferenceLibrary, LibraryObjectSummary, LibraryQuota,
-    LibraryRedirectDestination, LibrarySource, LocalBlobOrigin, ReferenceLibrary,
-    ShortcutTarget, UpdateLibraryObject, canonical_mime, content_from_bytes,
-    detect_mime_from_bytes, inspect_binary_for_storage, normalize_shortcut,
-    resolve_shortcut_content, valid_library_id,
+#[cfg(test)]
+pub(crate) mod test_memory;
+
+pub use super::session::DynamicReferenceMount;
+pub use microcrab_host_api::{
+    CompositeReference, DynReference, HostMarkdownReference, HostReferenceSpec, Reference,
+    ReferenceCapabilities, ReferenceContent, ReferenceEntry, ReferenceError, ReferenceErrorKind,
+    ReferenceInfo, ReferenceLimitDetails, ReferenceNodeKind, ReferencePatch, ReferencePayload,
+    ReferenceProjection, ReferenceQuota, ReferenceWrite,
 };
-pub use markdown::{MarkdownReferences, ReferenceLimits, ReferenceSource};
+pub use microcrab_protocol::{canonical_mime, detect_mime_from_bytes, valid_library_id};
 
 use crate::Error;
-use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
-use std::future::Future;
-use std::sync::Arc;
+use crate::admission::image::{image_type, signature_type, validate_image};
+use tokio_util::sync::CancellationToken;
 
-/// One listed entry. `id` is the key later passed to [`Reference::read`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ReferenceInfo {
-    pub id: String,
+/// Literal redirect destination bound prior to permission/execution.
+#[derive(Clone, Debug)]
+pub struct ReferenceRedirectDestination {
+    pub expected_mime: String,
     pub title: String,
-    pub location: String,
-    pub description: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ReferencePayload {
-    Text(String),
-    Binary {
-        data: Vec<u8>,
-        width: Option<u32>,
-        height: Option<u32>,
-    },
+pub fn inspect_binary_for_storage(
+    declared_mime: &str,
+    data: &[u8],
+) -> Result<(String, Option<u32>, Option<u32>), Error> {
+    let mime = canonical_mime(declared_mime)?;
+    if data.is_empty() {
+        return Err(Error::config("reference content must be nonempty"));
+    }
+    if image_type(&mime).is_some() {
+        let detected = signature_type(data)?;
+        if detected != mime {
+            return Err(Error::config(
+                "image data signature does not match declared MIME type",
+            ));
+        }
+        let info = validate_image(&mime, data)?;
+        return Ok((mime, Some(info.width), Some(info.height)));
+    }
+    Ok((mime, None, None))
 }
 
-/// Body returned for one owned id. Absence is `Ok(None)`, not an error.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ReferenceContent {
-    pub id: String,
-    pub media_type: String,
-    pub payload: ReferencePayload,
-}
-
-impl ReferenceContent {
-    pub fn text(id: impl Into<String>, body: impl Into<String>) -> Self {
-        Self {
+pub fn content_from_bytes(
+    id: impl Into<String>,
+    declared_or_path: Option<&str>,
+    data: Vec<u8>,
+) -> Result<ReferenceContent, Error> {
+    let mime = detect_mime_from_bytes(declared_or_path, &data);
+    if image_type(&mime).is_some() {
+        let detected = signature_type(&data)?;
+        let info = validate_image(detected, &data)?;
+        return Ok(ReferenceContent::binary(
+            id,
+            detected,
+            data,
+            Some(info.width),
+            Some(info.height),
+        ));
+    }
+    if (mime.starts_with("text/") || mime == "application/json")
+        && let Ok(text) = String::from_utf8(data.clone())
+    {
+        return Ok(ReferenceContent {
             id: id.into(),
-            media_type: "text/plain".into(),
-            payload: ReferencePayload::Text(body.into()),
-        }
+            media_type: mime,
+            payload: ReferencePayload::Text(text),
+        });
     }
-
-    pub fn binary(
-        id: impl Into<String>,
-        media_type: impl Into<String>,
-        data: Vec<u8>,
-        width: Option<u32>,
-        height: Option<u32>,
-    ) -> Self {
-        Self {
-            id: id.into(),
-            media_type: media_type.into(),
-            payload: ReferencePayload::Binary {
-                data,
-                width,
-                height,
-            },
-        }
-    }
-
-    pub fn as_text(&self) -> Option<&str> {
-        match &self.payload {
-            ReferencePayload::Text(text) => Some(text.as_str()),
-            ReferencePayload::Binary { .. } => None,
-        }
-    }
-
-    pub fn as_bytes(&self) -> &[u8] {
-        match &self.payload {
-            ReferencePayload::Text(text) => text.as_bytes(),
-            ReferencePayload::Binary { data, .. } => data.as_slice(),
-        }
-    }
-}
-
-/// A reference kind installed into [`super::SessionState`].
-///
-/// `Error` belongs to the kind. The session erases it when the kind is placed
-/// in the dynamic list. `load` runs before the first lifecycle boundary and is
-/// repeated after workspace reconciliation on initial or live recovery. It must
-/// tolerate retries. `change` returns the full current projection for this kind;
-/// `None` removes its key. It must be a pure, repeatable read, never consume a
-/// pending delta: state clones share the same kind. Admission previews use the
-/// frozen projection without calling `change` again.
-/// Returning unchanged JSON produces no model diff. A projection error fails
-/// the boundary while preserving the previous projection.
-///
-/// Entry ids are globally unique, non-empty, and contain no NUL. A kind may
-/// prefix its ids but the runtime does not require a namespace. Implementors
-/// keep `list` and `read` consistent: each listed id belongs to that kind, and
-/// each returned body has the requested id. Catalog freshness and synchronization
-/// belong to the kind; reads do not enumerate all catalogs to prove membership.
-pub trait Reference: Send + Sync + 'static {
-    type Error: std::error::Error + Send + Sync + 'static;
-
-    /// Stable projection key, such as `skills`, `agents`, or `memory`.
-    fn kind(&self) -> &str;
-
-    fn load(&self) -> impl Future<Output = Result<(), Self::Error>> + Send;
-
-    fn list(&self) -> Result<Vec<ReferenceInfo>, Self::Error>;
-
-    /// `Ok(None)` means this kind does not own `id`.
-    fn read(&self, id: &str) -> Result<Option<ReferenceContent>, Self::Error>;
-
-    fn change(&self) -> Result<Option<Value>, Self::Error>;
-
-    /// Capture the owner/legacy projection and an optional model-only override
-    /// from the same catalog observation. Custom references keep their exact data.
-    fn projections(&self) -> Result<ReferenceProjection, Self::Error> {
-        Ok(ReferenceProjection {
-            exact: self.change()?,
-            short_model: None,
-        })
-    }
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct ReferenceProjection {
-    pub exact: Option<Value>,
-    pub short_model: Option<Value>,
-}
-
-impl ReferenceProjection {
-    pub(crate) fn value(&self, short_model: bool) -> Option<&Value> {
-        if short_model && let Some(value) = &self.short_model {
-            return Some(value);
-        }
-        self.exact.as_ref()
-    }
-}
-
-#[async_trait]
-trait ErasedReference: Send + Sync {
-    async fn load(&self) -> Result<(), Error>;
-    fn list(&self) -> Result<Vec<ReferenceInfo>, Error>;
-    fn read(&self, id: &str) -> Result<Option<ReferenceContent>, Error>;
-    fn projections(&self) -> Result<ReferenceProjection, Error>;
-}
-
-struct Erased<R: Reference>(R);
-
-#[async_trait]
-impl<R: Reference> ErasedReference for Erased<R> {
-    async fn load(&self) -> Result<(), Error> {
-        self.0.load().await.map_err(reference_error)
-    }
-
-    fn list(&self) -> Result<Vec<ReferenceInfo>, Error> {
-        self.0.list().map_err(reference_error)
-    }
-
-    fn read(&self, id: &str) -> Result<Option<ReferenceContent>, Error> {
-        self.0.read(id).map_err(reference_error)
-    }
-
-    fn projections(&self) -> Result<ReferenceProjection, Error> {
-        self.0.projections().map_err(reference_error)
-    }
-}
-
-fn reference_error(error: impl std::error::Error) -> Error {
-    Error::Reference(error.to_string().into())
-}
-
-/// One installed kind. The projection key is fixed at construction.
-#[derive(Clone)]
-pub struct DynReference {
-    kind: String,
-    inner: Arc<dyn ErasedReference>,
-}
-
-impl std::fmt::Debug for DynReference {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("DynReference")
-            .field("kind", &self.kind)
-            .finish_non_exhaustive()
-    }
-}
-
-impl DynReference {
-    pub fn new<R: Reference>(reference: R) -> Result<Self, Error> {
-        let kind = reference.kind().to_owned();
-        super::access::validate_custom_key(&kind)?;
-        Ok(Self {
-            kind,
-            inner: Arc::new(Erased(reference)),
-        })
-    }
-
-    pub fn kind(&self) -> &str {
-        &self.kind
-    }
-
-    pub(crate) async fn load(&self) -> Result<(), Error> {
-        self.inner.load().await
-    }
-
-    pub(crate) fn list(&self) -> Result<Vec<ReferenceInfo>, Error> {
-        self.inner.list()
-    }
-
-    pub(crate) fn read(&self, id: &str) -> Result<Option<ReferenceContent>, Error> {
-        self.inner.read(id)
-    }
-
-    pub(crate) fn projections(&self) -> Result<ReferenceProjection, Error> {
-        self.inner.projections()
-    }
+    Ok(ReferenceContent::binary(id, mime, data, None, None))
 }
 
 /// Session-owned reference list. Cloning shares the kinds; it does not copy catalogs.
@@ -260,6 +105,10 @@ impl References {
         self.inner.iter()
     }
 
+    pub(crate) fn get(&self, kind: &str) -> Option<&DynReference> {
+        self.inner.iter().find(|reference| reference.kind() == kind)
+    }
+
     pub(crate) fn kinds(&self) -> Vec<String> {
         self.inner
             .iter()
@@ -269,6 +118,18 @@ impl References {
 
     pub(crate) fn owns(&self, key: &str) -> bool {
         self.inner.iter().any(|reference| reference.kind() == key)
+    }
+
+    pub(crate) fn upsert(&mut self, reference: DynReference) {
+        if let Some(slot) = self
+            .inner
+            .iter_mut()
+            .find(|existing| existing.kind() == reference.kind())
+        {
+            *slot = reference;
+        } else {
+            self.inner.push(reference);
+        }
     }
 
     /// Validate restored custom variables before recovery performs side effects.
@@ -290,7 +151,7 @@ impl References {
     fn validate(&self) -> Result<(), Error> {
         let mut seen = std::collections::HashSet::new();
         for reference in &self.inner {
-            super::access::validate_custom_key(reference.kind())?;
+            microcrab_protocol::validate_reference_kind(reference.kind())?;
             if !seen.insert(reference.kind().to_owned()) {
                 return Err(Error::config_with_private(
                     "duplicate reference kind",
@@ -306,34 +167,34 @@ impl References {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ListedReference {
     pub kind: String,
-    pub info: ReferenceInfo,
+    pub entry: ReferenceEntry,
 }
 
 pub(crate) fn list_all(references: &References) -> Result<Vec<ListedReference>, Error> {
     let mut listed = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for reference in references.iter() {
-        for info in reference.list()? {
-            validate_id(&info.id)?;
-            if !seen.insert(info.id.clone()) {
+        for entry in reference.list()? {
+            validate_id(&entry.id)?;
+            if !seen.insert(entry.id.clone()) {
                 return Err(Error::reference_with_private(
                     "duplicate listed reference id; ids must be globally unique",
                     format!(
                         "duplicate listed reference id `{}`; ids must be globally unique",
-                        info.id
+                        entry.id
                     ),
                 ));
             }
             listed.push(ListedReference {
                 kind: reference.kind().to_owned(),
-                info,
+                entry,
             });
         }
     }
     Ok(listed)
 }
 
-fn validate_id(id: &str) -> Result<(), Error> {
+pub(crate) fn validate_id(id: &str) -> Result<(), Error> {
     if id.is_empty() {
         return Err(Error::reference("reference id is empty"));
     }
@@ -343,11 +204,36 @@ fn validate_id(id: &str) -> Result<(), Error> {
     Ok(())
 }
 
-pub(crate) fn read_id(references: &References, id: &str) -> Result<ReferenceContent, Error> {
+pub(crate) async fn owner_of_id(
+    references: &References,
+    id: &str,
+    cancel: CancellationToken,
+) -> Result<Option<DynReference>, Error> {
+    validate_id(id)?;
+    let mut owner = None;
+    for reference in references.iter() {
+        if reference.owns(id, cancel.clone()).await? {
+            if owner.is_some() {
+                return Err(Error::reference_with_private(
+                    "reference id is owned by more than one kind",
+                    format!("reference id `{id}` is owned by more than one kind"),
+                ));
+            }
+            owner = Some(reference.clone());
+        }
+    }
+    Ok(owner)
+}
+
+pub(crate) async fn expand_id(
+    references: &References,
+    id: &str,
+    cancel: CancellationToken,
+) -> Result<ReferenceContent, Error> {
     validate_id(id)?;
     let mut found = None;
     for reference in references.iter() {
-        if let Some(content) = reference.read(id)? {
+        if let Some(content) = reference.expand(id, cancel.clone()).await? {
             if content.id != id {
                 return Err(Error::reference_with_private(
                     "reference body id does not match the requested id",
@@ -379,13 +265,10 @@ mod tests {
     use super::*;
     use crate::boundary::Boundary;
     use crate::{Limits, State, VariablesChange};
+    use async_trait::async_trait;
     use serde_json::{Map, Value, json};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
-
-    #[derive(Debug, thiserror::Error)]
-    #[error("sample reference failed")]
-    struct SampleError;
 
     struct Sample {
         kind: &'static str,
@@ -394,42 +277,59 @@ mod tests {
         projection: Mutex<Option<Value>>,
     }
 
+    #[async_trait]
     impl Reference for Sample {
-        type Error = SampleError;
-
         fn kind(&self) -> &str {
             self.kind
         }
 
-        fn load(&self) -> impl Future<Output = Result<(), Self::Error>> + Send {
-            self.loads.fetch_add(1, Ordering::SeqCst);
-            async { Ok(()) }
+        fn capabilities(&self) -> ReferenceCapabilities {
+            ReferenceCapabilities::read_only()
         }
 
-        fn list(&self) -> Result<Vec<ReferenceInfo>, Self::Error> {
-            Ok(vec![ReferenceInfo {
+        async fn load(&self, _cancel: CancellationToken) -> Result<(), ReferenceError> {
+            self.loads.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn list(&self) -> Result<Vec<ReferenceEntry>, ReferenceError> {
+            Ok(vec![ReferenceEntry {
                 id: "skill#demo".into(),
+                node_kind: ReferenceNodeKind::Section,
+                parent_id: None,
                 title: "Demo".into(),
-                location: ".crab/skills/demo".into(),
-                description: "example".into(),
+                location: Some(".crab/skills/demo".into()),
+                description: Some("example".into()),
+                media_type: Some("text/markdown".into()),
+                revision: "rev1".into(),
+                writable: false,
+                metadata: None,
             }])
         }
 
-        fn read(&self, id: &str) -> Result<Option<ReferenceContent>, Self::Error> {
+        fn projections(&self) -> Result<ReferenceProjection, ReferenceError> {
+            self.changes.fetch_add(1, Ordering::SeqCst);
+            let value = self
+                .projection
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .clone();
+            Ok(ReferenceProjection {
+                exact: value,
+                short_model: None,
+            })
+        }
+
+        async fn expand(
+            &self,
+            id: &str,
+            _cancel: CancellationToken,
+        ) -> Result<Option<ReferenceContent>, ReferenceError> {
             if id == "skill#demo" {
                 Ok(Some(ReferenceContent::text(id, "skill body")))
             } else {
                 Ok(None)
             }
-        }
-
-        fn change(&self) -> Result<Option<Value>, Self::Error> {
-            self.changes.fetch_add(1, Ordering::SeqCst);
-            Ok(self
-                .projection
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .clone())
         }
     }
 
@@ -454,8 +354,8 @@ mod tests {
         None,
         Load,
         List,
-        Read,
-        Change,
+        Expand,
+        Projection,
     }
 
     struct Catalog {
@@ -465,51 +365,68 @@ mod tests {
         failure: Failure,
     }
 
+    #[async_trait]
     impl Reference for Catalog {
-        type Error = SampleError;
-
         fn kind(&self) -> &str {
             self.kind
         }
 
-        async fn load(&self) -> Result<(), Self::Error> {
+        fn capabilities(&self) -> ReferenceCapabilities {
+            ReferenceCapabilities::read_only()
+        }
+
+        async fn load(&self, _cancel: CancellationToken) -> Result<(), ReferenceError> {
             if self.failure == Failure::Load {
-                return Err(SampleError);
+                return Err(ReferenceError::failed("sample reference failed"));
             }
             Ok(())
         }
 
-        fn list(&self) -> Result<Vec<ReferenceInfo>, Self::Error> {
+        fn list(&self) -> Result<Vec<ReferenceEntry>, ReferenceError> {
             if self.failure == Failure::List {
-                return Err(SampleError);
+                return Err(ReferenceError::failed("sample reference failed"));
             }
             Ok(self
                 .ids
                 .iter()
-                .map(|id| ReferenceInfo {
+                .map(|id| ReferenceEntry {
                     id: (*id).into(),
+                    node_kind: ReferenceNodeKind::File,
+                    parent_id: None,
                     title: "entry".into(),
-                    location: String::new(),
-                    description: String::new(),
+                    location: None,
+                    description: None,
+                    media_type: Some("text/plain".into()),
+                    revision: "rev1".into(),
+                    writable: false,
+                    metadata: None,
                 })
                 .collect())
         }
 
-        fn read(&self, id: &str) -> Result<Option<ReferenceContent>, Self::Error> {
-            if self.failure == Failure::Read {
-                return Err(SampleError);
+        fn projections(&self) -> Result<ReferenceProjection, ReferenceError> {
+            if self.failure == Failure::Projection {
+                return Err(ReferenceError::failed("sample reference failed"));
+            }
+            Ok(ReferenceProjection::empty())
+        }
+
+        async fn owns(&self, id: &str, _cancel: CancellationToken) -> Result<bool, ReferenceError> {
+            Ok(self.ids.contains(&id))
+        }
+
+        async fn expand(
+            &self,
+            id: &str,
+            _cancel: CancellationToken,
+        ) -> Result<Option<ReferenceContent>, ReferenceError> {
+            if self.failure == Failure::Expand {
+                return Err(ReferenceError::failed("sample reference failed"));
             }
             Ok(self
                 .ids
                 .contains(&id)
                 .then(|| ReferenceContent::text(self.body_id.unwrap_or(id), "private body")))
-        }
-
-        fn change(&self) -> Result<Option<Value>, Self::Error> {
-            if self.failure == Failure::Change {
-                return Err(SampleError);
-            }
-            Ok(None)
         }
     }
 
@@ -545,7 +462,7 @@ mod tests {
             catalogs(vec![catalog("skills", vec!["shared", "shared"])]),
             catalogs(vec![
                 catalog("skills", vec!["shared"]),
-                catalog("memory", vec!["shared"]),
+                catalog("references", vec!["shared"]),
             ]),
         ] {
             assert_eq!(
@@ -555,11 +472,10 @@ mod tests {
         }
     }
 
-    #[test]
-    fn list_and_read_reject_empty_and_nul_ids() {
-        // An invalid request must fail validation before reaching a kind callback.
+    #[tokio::test]
+    async fn list_and_expand_reject_empty_and_nul_ids() {
         let mut failing = catalog("skills", vec![]);
-        failing.failure = Failure::Read;
+        failing.failure = Failure::Expand;
         let references = catalogs(vec![failing]);
         for (id, message) in [
             ("", "reference id is empty"),
@@ -567,16 +483,21 @@ mod tests {
         ] {
             let listed = catalogs(vec![catalog("skills", vec![id])]);
             assert_eq!(reference_message(list_all(&listed)), message);
-            assert_eq!(reference_message(read_id(&references, id)), message);
+            assert_eq!(
+                reference_message(expand_id(&references, id, CancellationToken::new()).await),
+                message
+            );
         }
     }
 
-    #[test]
-    fn read_rejects_mismatched_body_without_disclosing_it() {
+    #[tokio::test]
+    async fn expand_rejects_mismatched_body_without_disclosing_it() {
         let mut inconsistent = catalog("skills", vec!["requested"]);
         inconsistent.body_id = Some("unexpected");
         let references = catalogs(vec![inconsistent]);
-        let message = reference_message(read_id(&references, "requested"));
+        let message = reference_message(
+            expand_id(&references, "requested", CancellationToken::new()).await,
+        );
         assert!(message.contains("skills"));
         assert!(message.contains("requested"));
         assert!(message.contains("does not match"));
@@ -584,58 +505,78 @@ mod tests {
         assert!(!message.contains("private body"));
     }
 
-    #[test]
-    fn read_requires_exactly_one_owner_and_accepts_unprefixed_ids() {
+    #[tokio::test]
+    async fn expand_requires_exactly_one_owner_and_accepts_unprefixed_ids() {
         let references = catalogs(vec![
             catalog("skills", vec!["shared"]),
-            catalog("memory", vec!["shared"]),
+            catalog("references", vec!["shared"]),
         ]);
         assert_eq!(
-            reference_message(read_id(&references, "shared")),
+            reference_message(expand_id(&references, "shared", CancellationToken::new()).await),
             "reference id `shared` is owned by more than one kind"
         );
         assert_eq!(
-            reference_message(read_id(&references, "unknown")),
+            reference_message(expand_id(&references, "unknown", CancellationToken::new()).await),
             "reference `unknown` was not found"
         );
         let references = catalogs(vec![
             catalog("skills", vec![]),
-            catalog("memory", vec!["plain"]),
+            catalog("references", vec!["plain"]),
         ]);
         assert_eq!(
-            read_id(&references, "plain").unwrap(),
+            expand_id(&references, "plain", CancellationToken::new())
+                .await
+                .unwrap(),
             ReferenceContent::text("plain", "private body")
         );
     }
 
     #[tokio::test]
     async fn typed_errors_propagate_through_every_erased_method() {
-        for failure in [Failure::Load, Failure::List, Failure::Read, Failure::Change] {
+        for failure in [
+            Failure::Load,
+            Failure::List,
+            Failure::Expand,
+            Failure::Projection,
+        ] {
             let mut kind = catalog("skills", vec!["entry"]);
             kind.failure = failure;
             let reference = DynReference::new(kind).unwrap();
             let message = match failure {
-                Failure::Load => reference_message(reference.load().await),
-                Failure::List => {
-                    reference_message(list_all(&References::new(vec![reference]).unwrap()))
-                }
-                Failure::Read => {
-                    reference_message(read_id(&References::new(vec![reference]).unwrap(), "entry"))
-                }
-                Failure::Change => reference_message(reference.projections()),
+                Failure::Load => reference
+                    .load(CancellationToken::new())
+                    .await
+                    .unwrap_err()
+                    .to_string(),
+                Failure::List => reference_message(list_all(&References::new(vec![reference]).unwrap())),
+                Failure::Expand => reference_message(
+                    expand_id(
+                        &References::new(vec![reference]).unwrap(),
+                        "entry",
+                        CancellationToken::new(),
+                    )
+                    .await,
+                ),
+                Failure::Projection => reference.projections().unwrap_err().to_string(),
                 Failure::None => unreachable!("only failure cases are exercised"),
             };
             assert_eq!(message, "sample reference failed");
         }
     }
 
-    #[test]
-    fn read_does_not_enumerate_catalogs() {
+    #[tokio::test]
+    async fn expand_does_not_enumerate_catalogs() {
         let mut kind = catalog("skills", vec!["entry"]);
         kind.failure = Failure::List;
         let references = catalogs(vec![kind]);
         assert!(list_all(&references).is_err());
-        assert_eq!(read_id(&references, "entry").unwrap().id, "entry");
+        assert_eq!(
+            expand_id(&references, "entry", CancellationToken::new())
+                .await
+                .unwrap()
+                .id,
+            "entry"
+        );
     }
 
     #[test]
@@ -666,7 +607,7 @@ mod tests {
         snapshot.references = References::new(vec![reference]).unwrap();
         let cloned = snapshot.clone();
         for reference in cloned.references.iter() {
-            reference.load().await.unwrap();
+            reference.load(CancellationToken::new()).await.unwrap();
         }
         assert_eq!(loads.load(Ordering::SeqCst), 1);
         let encoded = serde_json::to_value(&snapshot).unwrap();
@@ -675,11 +616,17 @@ mod tests {
         assert!(decoded.references.iter().next().is_none());
         assert!(list_all(&decoded.references).unwrap().is_empty());
         assert_eq!(
-            read_id(&snapshot.references, "skill#demo").unwrap().as_text(),
+            expand_id(&snapshot.references, "skill#demo", CancellationToken::new())
+                .await
+                .unwrap()
+                .as_text(),
             Some("skill body")
         );
         assert_eq!(
-            read_id(&cloned.references, "skill#demo").unwrap().as_text(),
+            expand_id(&cloned.references, "skill#demo", CancellationToken::new())
+                .await
+                .unwrap()
+                .as_text(),
             Some("skill body")
         );
     }
@@ -701,13 +648,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn refresh_calls_change_once_and_projects_it() {
+    async fn refresh_calls_projections_once_and_projects_it() {
         let (reference, loads, changes) = sample("skills", Some(json!({"catalog": "demo"})));
         let state = State::new(Limits::default());
         state
             .install_references(References::new(vec![reference]).unwrap())
             .unwrap();
-        state.load_references().await.unwrap();
+        state.load_references(CancellationToken::new()).await.unwrap();
         assert_eq!(loads.load(Ordering::SeqCst), 1);
         state.refresh(Boundary::SessionCreated).unwrap();
         assert_eq!(
@@ -716,7 +663,11 @@ mod tests {
         );
         assert_eq!(changes.load(Ordering::SeqCst), 1);
         assert_eq!(
-            state.read_reference("skill#demo").unwrap().as_text(),
+            state
+                .read_reference_async("skill#demo", CancellationToken::new())
+                .await
+                .unwrap()
+                .as_text(),
             Some("skill body")
         );
         assert_eq!(state.list_references().unwrap()[0].kind, "skills");
@@ -755,5 +706,105 @@ mod tests {
         assert!(encoded.get("references").is_none());
         let decoded: crate::SessionState = serde_json::from_value(encoded).unwrap();
         assert!(decoded.references.iter().next().is_none());
+    }
+
+    #[tokio::test]
+    async fn refresh_writable_skips_and_isolates_read_only_composite_members() {
+        use microcrab_host_api::{CompositeReference, Reference, ReferenceCapabilities};
+        use microcrab_protocol::{
+            ReferenceContent, ReferenceEntry, ReferenceError, ReferenceProjection, ReferenceWrite,
+        };
+        struct FailingReadOnly(Arc<AtomicUsize>);
+        #[async_trait::async_trait]
+        impl Reference for FailingReadOnly {
+            fn kind(&self) -> &str {
+                "ro"
+            }
+            fn capabilities(&self) -> ReferenceCapabilities {
+                ReferenceCapabilities::read_only()
+            }
+            async fn load(&self, _: CancellationToken) -> Result<(), ReferenceError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Err(ReferenceError::failed("ro load failed"))
+            }
+            fn list(&self) -> Result<Vec<ReferenceEntry>, ReferenceError> {
+                Ok(vec![])
+            }
+            fn projections(&self) -> Result<ReferenceProjection, ReferenceError> {
+                Ok(ReferenceProjection::empty())
+            }
+            async fn expand(
+                &self,
+                _: &str,
+                _: CancellationToken,
+            ) -> Result<Option<ReferenceContent>, ReferenceError> {
+                Ok(None)
+            }
+        }
+        struct Writable(Arc<AtomicUsize>);
+        #[async_trait::async_trait]
+        impl Reference for Writable {
+            fn kind(&self) -> &str {
+                "rw"
+            }
+            fn capabilities(&self) -> ReferenceCapabilities {
+                ReferenceCapabilities::read_write()
+            }
+            async fn load(&self, _: CancellationToken) -> Result<(), ReferenceError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+            fn list(&self) -> Result<Vec<ReferenceEntry>, ReferenceError> {
+                Ok(vec![])
+            }
+            fn projections(&self) -> Result<ReferenceProjection, ReferenceError> {
+                Ok(ReferenceProjection::empty())
+            }
+            async fn expand(
+                &self,
+                _: &str,
+                _: CancellationToken,
+            ) -> Result<Option<ReferenceContent>, ReferenceError> {
+                Ok(None)
+            }
+            async fn add(
+                &self,
+                _: ReferenceWrite,
+                _: CancellationToken,
+            ) -> Result<ReferenceEntry, ReferenceError> {
+                Err(ReferenceError::denied("unused"))
+            }
+        }
+        let ro_loads = Arc::new(AtomicUsize::new(0));
+        let rw_loads = Arc::new(AtomicUsize::new(0));
+        let composite = DynReference::new(CompositeReference::new(
+            "references",
+            vec![
+                DynReference::new(Writable(rw_loads.clone())).unwrap(),
+                DynReference::new(FailingReadOnly(ro_loads.clone())).unwrap(),
+            ],
+        ))
+        .unwrap();
+        let state = State::new(Limits::default());
+        state
+            .install_references(References::new(vec![composite.clone()]).unwrap())
+            .unwrap();
+        state.load_references(CancellationToken::new()).await.unwrap();
+        assert_eq!(rw_loads.load(Ordering::SeqCst), 1);
+        assert_eq!(ro_loads.load(Ordering::SeqCst), 1);
+        // Ordinary turn refresh skips read-only members completely.
+        state
+            .refresh_writable_references(CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(rw_loads.load(Ordering::SeqCst), 2);
+        assert_eq!(ro_loads.load(Ordering::SeqCst), 1);
+        // Explicit full refresh still attempts read-only members but isolates failures.
+        state
+            .refresh_references_async(CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(rw_loads.load(Ordering::SeqCst), 3);
+        assert_eq!(ro_loads.load(Ordering::SeqCst), 2);
     }
 }

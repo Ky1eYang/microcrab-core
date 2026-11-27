@@ -13,8 +13,10 @@ pub use access::{
     VariableWitness,
 };
 pub use reference::{
-    DynReference, ListedReference, Reference, ReferenceContent, ReferenceInfo, ReferenceLibrary,
-    ReferencePayload,
+    CompositeReference, DynReference, ListedReference, Reference, ReferenceCapabilities,
+    ReferenceContent, ReferenceEntry, ReferenceError, ReferenceErrorKind, ReferenceInfo,
+    ReferenceNodeKind, ReferencePatch, ReferencePayload, ReferenceProjection, ReferenceQuota,
+    ReferenceWrite,
 };
 pub use session::SessionState;
 pub use variables::Variables;

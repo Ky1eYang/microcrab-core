@@ -338,6 +338,12 @@ impl ToolRegistry {
         self.entries.keys().map(String::as_str)
     }
 
+    pub(crate) fn tool_description(&self, name: &str) -> Option<&str> {
+        self.entries
+            .get(name)
+            .map(|entry| entry.definition.description.as_str())
+    }
+
     pub(crate) fn tool_descriptions(&self) -> impl Iterator<Item = (&str, &str)> {
         self.entries.values().map(|entry| {
             (

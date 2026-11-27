@@ -6,8 +6,9 @@ use microcrab_session::runtime::Runtime;
 use microcrab_session::runtime::journal::{Journal, MemoryJournal, Recover};
 use microcrab_session::runtime::tool::DenyAll;
 use microcrab_session::{
-    Auditor, Client, DynReference, Error, Limits, Reference, ReferenceContent, ReferenceInfo,
-    Session, SessionInput, State,
+    Auditor, Client, DynReference, Error, Limits, Reference, ReferenceCapabilities,
+    ReferenceContent, ReferenceEntry, ReferenceError, ReferenceProjection, Session, SessionInput,
+    State,
 };
 use microcrab_transport::StateFrame;
 use serde_json::{Value, json};
@@ -35,58 +36,64 @@ struct Probe {
     trace: Mutex<Vec<Call>>,
 }
 
-#[derive(Debug, thiserror::Error)]
-#[error("{0}")]
-struct ReferenceFailure(&'static str);
-
 struct LoadedReference(Arc<Probe>);
+#[async_trait::async_trait]
 impl Reference for LoadedReference {
-    type Error = ReferenceFailure;
-
     fn kind(&self) -> &str {
         "skills"
     }
 
-    async fn load(&self) -> Result<(), Self::Error> {
+    fn capabilities(&self) -> ReferenceCapabilities {
+        ReferenceCapabilities::read_only()
+    }
+
+    async fn load(&self, _cancel: CancellationToken) -> Result<(), ReferenceError> {
         self.0.loads.fetch_add(1, Ordering::SeqCst);
         self.0.trace.lock().unwrap().push(Call::Load);
         if self.0.fail_load.swap(false, Ordering::SeqCst) {
-            return Err(ReferenceFailure("injected reference load failure"));
+            return Err(ReferenceError::failed("injected reference load failure"));
         }
         let writer = self.0.writer.lock().unwrap().clone();
         if let Some(writer) = writer {
             writer
                 .inject("written_during_load", json!(true))
                 .await
-                .map_err(|_| ReferenceFailure("reference variable callback failed"))?;
+                .map_err(|_| ReferenceError::failed("reference variable callback failed"))?;
         }
         self.0.generation.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
 
-    fn list(&self) -> Result<Vec<ReferenceInfo>, Self::Error> {
+    fn list(&self) -> Result<Vec<ReferenceEntry>, ReferenceError> {
         Ok(vec![])
     }
 
-    fn read(&self, _: &str) -> Result<Option<ReferenceContent>, Self::Error> {
-        Ok(None)
-    }
-
-    fn change(&self) -> Result<Option<Value>, Self::Error> {
+    fn projections(&self) -> Result<ReferenceProjection, ReferenceError> {
         self.0.changes.fetch_add(1, Ordering::SeqCst);
         self.0.trace.lock().unwrap().push(Call::Change);
         let generation = self.0.generation.load(Ordering::SeqCst);
         if generation == 0 {
-            return Err(ReferenceFailure("projection requested before load"));
+            return Err(ReferenceError::failed("projection requested before load"));
         }
         if self.0.absent.load(Ordering::SeqCst) {
-            return Ok(None);
+            return Ok(ReferenceProjection::empty());
         }
         // Instrumentation observes calls; reading the full projection never consumes it.
-        Ok(Some(json!({
-            "generation": generation,
-            "revision": self.0.revision.load(Ordering::SeqCst),
-        })))
+        Ok(ReferenceProjection {
+            exact: Some(json!({
+                "generation": generation,
+                "revision": self.0.revision.load(Ordering::SeqCst),
+            })),
+            short_model: None,
+        })
+    }
+
+    async fn expand(
+        &self,
+        _: &str,
+        _cancel: CancellationToken,
+    ) -> Result<Option<ReferenceContent>, ReferenceError> {
+        Ok(None)
     }
 }
 

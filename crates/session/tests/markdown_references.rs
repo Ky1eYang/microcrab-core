@@ -1,4 +1,4 @@
-//! Concrete Markdown references reach State and batch expand through real Session admission.
+//! Host-owned Markdown and Skill references reach State and batch expand through real Session admission.
 use microcrab_protocol::{Response, ToolCall, Usage};
 use microcrab_session::{
     Auditor, Client, Session,
@@ -7,17 +7,18 @@ use microcrab_session::{
         Runtime,
         tool::{DenyAll, builtin_tools},
     },
-    state::reference::ReferenceSource,
 };
 use microcrab_transport::StateFrame;
 use serde_json::{Value, json};
 use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
+
 #[derive(Default)]
 struct Model {
     calls: Mutex<Option<Value>>,
     requests: Mutex<Vec<Content>>,
 }
+
 #[async_trait::async_trait]
 impl Client for Model {
     async fn complete(
@@ -54,6 +55,7 @@ impl Client for Model {
         })
     }
 }
+
 #[tokio::test]
 async fn configured_host_sources_disclose_expand_and_patch_after_explicit_refresh() {
     let root = tempfile::tempdir().unwrap();
@@ -62,25 +64,29 @@ async fn configured_host_sources_disclose_expand_and_patch_after_explicit_refres
     let model = Arc::new(Model::default());
     let host =
         Arc::new(microcrab_host_local::LocalHost::new(root.path(), Default::default()).unwrap());
+    let docs_ref = host
+        .markdown_reference("docs", vec!["SKILL.md".into()])
+        .unwrap();
     let session = Session::builder_arc(
         model.clone(),
         Runtime::new(builtin_tools().into(), Arc::new(DenyAll)).unwrap(),
     )
-    .markdown_references(
-        "docs",
-        vec![ReferenceSource::HostPath {
-            path: "SKILL.md".into(),
-        }],
-    )
+    .references(vec![docs_ref])
     .host(host)
     .build()
     .unwrap();
     session.start().await.unwrap();
-    let listed = session.state_handle().list_references().unwrap();
+    let listed: Vec<_> = session
+        .state_handle()
+        .list_references()
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.entry.node_kind == microcrab_session::ReferenceNodeKind::Section)
+        .collect();
     assert_eq!(listed.len(), 3);
     let ids = listed
         .iter()
-        .map(|entry| entry.info.id.clone())
+        .map(|entry| entry.entry.id.clone())
         .collect::<Vec<_>>();
     *model.calls.lock().unwrap() = Some(json!({"action":"expand","id":ids}));
     session
@@ -115,7 +121,14 @@ async fn configured_host_sources_disclose_expand_and_patch_after_explicit_refres
         .submit("Ordinary snapshots do not scan")
         .await
         .unwrap();
-    assert_eq!(session.state_handle().list_references().unwrap(), listed);
+    let after_unchanged: Vec<_> = session
+        .state_handle()
+        .list_references()
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.entry.node_kind == microcrab_session::ReferenceNodeKind::Section)
+        .collect();
+    assert_eq!(after_unchanged, listed);
     session.refresh_references().await.unwrap();
     assert_eq!(
         serde_json::to_value(&session.messages()[..prefix.len()]).unwrap(),
@@ -141,17 +154,15 @@ async fn default_h2_compact_catalog_uses_short_ids_and_expands_exact_sections() 
     let model = Arc::new(Model::default());
     let host =
         Arc::new(microcrab_host_local::LocalHost::new(root.path(), Default::default()).unwrap());
+    let docs_ref = host
+        .markdown_reference("docs", vec!["AGENTS.md".into()])
+        .unwrap();
     let session = Session::builder_arc(
         model.clone(),
         Runtime::new(builtin_tools().into(), Arc::new(DenyAll)).unwrap(),
     )
     .host(host)
-    .markdown_references(
-        "docs",
-        vec![ReferenceSource::HostPath {
-            path: "AGENTS.md".into(),
-        }],
-    )
+    .references(vec![docs_ref])
     .build()
     .unwrap();
     session.start().await.unwrap();
@@ -167,14 +178,20 @@ async fn default_h2_compact_catalog_uses_short_ids_and_expands_exact_sections() 
     assert_eq!(top["subjects"].as_array().unwrap().len(), 2);
     assert_eq!(top["subjects"][0]["title"], "Workflow");
     assert!(top["subjects"][0].get("subjects").is_none());
-    let listed = session.state_handle().list_references().unwrap();
+    let listed: Vec<_> = session
+        .state_handle()
+        .list_references()
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.entry.node_kind == microcrab_session::ReferenceNodeKind::Section)
+        .collect();
     assert_eq!(listed.len(), 3);
     for entry in &listed {
-        assert!(entry.info.id.starts_with("md-"));
-        assert_eq!(entry.info.id.len(), 27);
+        assert!(entry.entry.id.starts_with("md-"));
+        assert_eq!(entry.entry.id.len(), 27);
     }
     *model.calls.lock().unwrap() =
-        Some(json!({"action":"expand","id":listed.iter().map(|row| &row.info.id).collect::<Vec<_>>()}));
+        Some(json!({"action":"expand","id":listed.iter().map(|row| &row.entry.id).collect::<Vec<_>>()}));
     session
         .submit("Expand the disclosed catalog")
         .await
@@ -229,29 +246,43 @@ async fn same_length_body_refresh_changes_digest_and_patch_without_rewriting_fro
     let model = Arc::new(Model::default());
     let host =
         Arc::new(microcrab_host_local::LocalHost::new(root.path(), Default::default()).unwrap());
+    let docs_ref = host
+        .markdown_reference("docs", vec!["guide.md".into()])
+        .unwrap();
     let session = Session::builder_arc(
         model.clone(),
         Runtime::new(builtin_tools().into(), Arc::new(DenyAll)).unwrap(),
     )
     .host(host)
-    .markdown_references(
-        "docs",
-        vec![ReferenceSource::HostPath {
-            path: "guide.md".into(),
-        }],
-    )
+    .references(vec![docs_ref])
     .build()
     .unwrap();
     session.start().await.unwrap();
     session.submit("Read initial catalog").await.unwrap();
     let before = session.state_view().unwrap()["docs"].clone();
-    let listed = session.state_handle().list_references().unwrap();
+    let listed: Vec<_> = session
+        .state_handle()
+        .list_references()
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.entry.node_kind == microcrab_session::ReferenceNodeKind::Section)
+        .collect();
     let prefix = session.messages();
     let request = model.requests.lock().unwrap()[0].clone();
     std::fs::write(&path, changed).unwrap();
     session.refresh_references().await.unwrap();
     let after = session.state_view().unwrap()["docs"].clone();
-    assert_eq!(session.state_handle().list_references().unwrap(), listed);
+    let after_listed: Vec<_> = session
+        .state_handle()
+        .list_references()
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.entry.node_kind == microcrab_session::ReferenceNodeKind::Section)
+        .collect();
+    assert_eq!(after_listed.len(), listed.len());
+    assert_eq!(after_listed[0].entry.id, listed[0].entry.id);
+    assert_eq!(after_listed[0].entry.title, listed[0].entry.title);
+    assert_ne!(after_listed[0].entry.revision, listed[0].entry.revision);
     assert_eq!(listed.len(), 1, "empty preamble is not an expansion choice");
     assert!(before[0].get("id").is_none());
     assert!(after[0].get("id").is_none());
@@ -261,7 +292,8 @@ async fn same_length_body_refresh_changes_digest_and_patch_without_rewriting_fro
     assert_eq!(
         session
             .state_handle()
-            .read_reference(&listed[0].info.id)
+            .expand_reference(&listed[0].entry.id, CancellationToken::new())
+            .await
             .unwrap()
             .as_text(),
         Some(changed)

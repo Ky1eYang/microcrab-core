@@ -45,6 +45,7 @@ impl RetryingClient {
                 api_key: config.api_key,
                 timeout_ms: config.timeout_ms,
                 max_response_bytes: config.max_response_bytes,
+                headers: Default::default(),
             },
             policy,
         )

@@ -167,7 +167,7 @@ mod tests {
         let config = PromptConfig {
             auto_compact_template: "CUSTOM AUTO".into(),
             action_review_template:
-                "REVIEW {{ tool }}|{{ tool_name }}|{{ tool_args }}|{{ user_input }}".into(),
+                "REVIEW {{ tool }}|{{ tool_name }}|{{ tool_description }}|{{ tool_args }}|{{ user_input }}".into(),
             ..Default::default()
         };
         config.validate().unwrap();
@@ -190,6 +190,7 @@ mod tests {
             &[
                 ("tool", "read"),
                 ("tool_name", "read"),
+                ("tool_description", "Read bounded UTF-8 file."),
                 ("tool_args", "{{ literal }}"),
                 ("user_input", "{% literal %}"),
             ],
@@ -198,7 +199,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             review.system,
-            "REVIEW read|read|{{ literal }}|{% literal %}"
+            "REVIEW read|read|Read bounded UTF-8 file.|{{ literal }}|{% literal %}"
         );
         assert!(review.tools.is_empty());
         assert_eq!(issuer.system, "FROZEN");

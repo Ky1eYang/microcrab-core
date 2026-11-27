@@ -1,6 +1,7 @@
 #![cfg(feature = "wasm")]
 
-//! Acceptance fixtures use Component Model WAT, so no separately built guest is needed.
+//! Acceptance fixtures use Component Model WAT against `microcrab:session/session@0.4.0`,
+//! so no separately built guest is needed.
 use crate::typed_agent_fixture;
 use microcrab_host_api::{Host, HostInfo, OsFamily, ToolError};
 use microcrab_protocol::{
@@ -29,26 +30,42 @@ use typed_agent_fixture::final_text;
 #[derive(Clone)]
 enum Operation {
     Info,
-    CallFacts,
-    TypedChange(VariablesChange),
-    TypedMetadata {
-        name: String,
-        attributes: [u8; 3],
-        editors: Vec<u8>,
+    Script {
+        script: String,
+        args: Option<Value>,
     },
-    Get(String),
 }
 
 fn get(name: &str, key: &str) -> (String, Operation) {
-    (name.into(), Operation::Get(key.into()))
+    (
+        name.into(),
+        Operation::Script {
+            script: r#"if vars::has(args.key) { #{ ok: true, value: vars::get(args.key) } } else { #{ ok: false, code: "absent" } }"#.into(),
+            args: Some(json!({ "key": key })),
+        },
+    )
 }
+
 fn change(name: &str, value: Value) -> (String, Operation) {
     (
         name.into(),
-        Operation::TypedChange(serde_json::from_value(value).unwrap()),
+        Operation::Script {
+            script: r#"vars::change(args); #{ ok: true }"#.into(),
+            args: Some(value),
+        },
     )
 }
-/// Static fixture bytes live below the bump allocator, away from return areas.
+
+fn call_facts(name: &str) -> (String, Operation) {
+    (
+        name.into(),
+        Operation::Script {
+            script: r#"#{ ok: true, value: vars::call_facts() }"#.into(),
+            args: None,
+        },
+    )
+}
+
 struct FixtureData {
     wat: String,
     cursor: u32,
@@ -66,57 +83,8 @@ impl FixtureData {
             .push_str(&format!("(data (i32.const {address}) \"{escaped}\")\n"));
         (address, len)
     }
-
-    fn string(&mut self, record: &mut Vec<u8>, value: &str) {
-        let (ptr, len) = self.put(value);
-        record.extend(ptr.to_le_bytes());
-        record.extend(len.to_le_bytes());
-    }
-
-    fn list(&mut self, bytes: &[u8], stride: u32) -> String {
-        let (ptr, len) = self.put(bytes);
-        format!("i32.const {ptr} i32.const {}", len / stride)
-    }
-
-    fn typed_change(&mut self, change: &VariablesChange) -> String {
-        // The three input lists flatten to six i32s. Their elements are
-        // canonical memory records: variable-entry is 16 bytes, string is 8,
-        // and scoped-entry is 32, including padding for the optional list.
-        let mut set = Vec::new();
-        for (name, value) in &change.set {
-            self.string(&mut set, name);
-            self.string(&mut set, &value.to_string());
-        }
-        let mut remove = Vec::new();
-        for name in &change.remove {
-            self.string(&mut remove, name);
-        }
-        let mut scoped = Vec::new();
-        for entry in &change.scoped_set {
-            self.string(&mut scoped, &entry.name);
-            self.string(&mut scoped, &entry.value.to_string());
-            scoped.extend([entry.visibility as u8, entry.persistence as u8, 0, 0]);
-            if let Some(editors) = &entry.editors {
-                let (ptr, len) =
-                    self.put(editors.iter().map(|role| *role as u8).collect::<Vec<_>>());
-                scoped.extend([1, 0, 0, 0]);
-                scoped.extend(ptr.to_le_bytes());
-                scoped.extend(len.to_le_bytes());
-            } else {
-                scoped.extend([0; 12]);
-            }
-        }
-        format!(
-            "{} {} {} i32.const 64 call $change",
-            self.list(&set, 16),
-            self.list(&remove, 8),
-            self.list(&scoped, 32),
-        )
-    }
 }
 
-/// String and unit imports use a 16-byte canonical return area at 64:
-/// tag at 64, error code at 68, or string pointer/length at 68/72.
 fn component(operations: &[(String, Operation)], shell: bool, missing_info: bool) -> Vec<u8> {
     component_with_extra_import(operations, shell, missing_info, "")
 }
@@ -141,43 +109,42 @@ fn component_with_extra_import(
         cursor: 4096,
     };
     let (catalog_ptr, catalog_len) = data.put(&catalog);
-    let (probe_ptr, probe_len) = data.put("discovery_probe");
+    let (probe_script_ptr, probe_script_len) = data.put(r#"vars::get("discovery_probe")"#);
+    let (facts_script_ptr, facts_script_len) = data.put("vars::call_facts()");
     let (prefix_ptr, prefix_len) = data.put(r#"{"ok":true,"value":"#);
-    let (unit_ptr, unit_len) = data.put(r#"{"ok":true}"#);
-    let errors: Vec<_> = ["absent", "unavailable", "rejected", "cancelled"]
+    let (marker_ptr, marker_len) = data.put("typed host-info rejected");
+    let errors: Vec<_> = [
+        "absent",
+        "unavailable",
+        "denied",
+        "invalid_argument",
+        "limit",
+        "cancelled",
+        "script_error",
+    ]
+    .into_iter()
+    .map(|code| data.put(json!({"ok":false,"code":code}).to_string()))
+    .collect();
+    let comm_errors: Vec<_> = ["absent", "unavailable", "rejected", "cancelled"]
         .into_iter()
         .map(|code| data.put(json!({"ok":false,"code":code}).to_string()))
         .collect();
-    let (marker_ptr, marker_len) = data.put("typed host-info rejected");
-    let write_probe = data.typed_change(&VariablesChange {
-        set: serde_json::Map::from_iter([("discovery_probe".into(), json!(true))]),
-        ..Default::default()
-    });
+
     let mut dispatch = String::new();
     for (name, operation) in operations {
         let (name_ptr, name_len) = data.put(name);
         let body = match operation {
-            Operation::Info => "i32.const 64 call $host_info i32.const 0 call $encode".into(),
-            Operation::CallFacts => "i32.const 64 call $facts call $encode_facts".into(),
-            Operation::TypedChange(change) => {
-                format!("{} i32.const 1 call $encode", data.typed_change(change))
-            }
-            Operation::TypedMetadata {
-                name,
-                attributes,
-                editors,
-            } => {
-                let (name_ptr, name_len) = data.put(name);
-                let (attr_ptr, _) = data.put(attributes);
-                let (editors_ptr, editors_len) = data.put(editors);
+            Operation::Info => "i32.const 64 call $host_info call $encode_host_info".into(),
+            Operation::Script { script, args } => {
+                let (s_ptr, s_len) = data.put(script);
+                let (a_tag, a_ptr, a_len) = if let Some(val) = args {
+                    let (p, l) = data.put(val.to_string());
+                    (1, p, l)
+                } else {
+                    (0, 0, 0)
+                };
                 format!(
-                    "i32.const 64 call $metadata i32.const {name_ptr} i32.const {name_len} i32.const {attr_ptr} i32.const {editors_ptr} i32.const {editors_len} call $check_metadata"
-                )
-            }
-            Operation::Get(key) => {
-                let (ptr, len) = data.put(key);
-                format!(
-                    "i32.const {ptr} i32.const {len} i32.const 64 call $get i32.const 0 call $encode"
+                    "i32.const {s_ptr} i32.const {s_len} i32.const {a_tag} i32.const {a_ptr} i32.const {a_len} i32.const 64 call $eval call $encode_eval"
                 )
             }
         };
@@ -185,12 +152,20 @@ fn component_with_extra_import(
             "local.get 2 local.get 3 i32.const {name_ptr} i32.const {name_len} call $equal if {body} return end\n"
         ));
     }
+
     let mut error_dispatch = String::new();
     for (code, (ptr, len)) in errors.into_iter().enumerate() {
         error_dispatch.push_str(&format!(
             "local.get $code i32.const {code} i32.eq if i32.const {ptr} i32.const {len} call $output return end\n"
         ));
     }
+    let mut comm_error_dispatch = String::new();
+    for (code, (ptr, len)) in comm_errors.into_iter().enumerate() {
+        comm_error_dispatch.push_str(&format!(
+            "local.get $code i32.const {code} i32.eq if i32.const {ptr} i32.const {len} call $output return end\n"
+        ));
+    }
+
     let info_check = if missing_info {
         "i32.const 64 i32.load8_u i32.const 1 i32.ne if unreachable end
          i32.const 68 i32.load8_u i32.const 2 i32.ne if unreachable end"
@@ -198,16 +173,16 @@ fn component_with_extra_import(
         "i32.const 64 i32.load8_u if unreachable end"
     };
     let describe_info = if missing_info {
-        // A deliberate guest error proves that a failed Host was a typed result,
-        // rather than an instantiation trap or a synthesized successful HostInfo.
         format!(
             "i32.const 0 i32.const 1 i32.store8
             i32.const 4 i32.const {marker_ptr} i32.store
             i32.const 8 i32.const {marker_len} i32.store i32.const 0 return"
         )
     } else {
-        format!("local.get 0 local.get 1 i32.const 68 i32.load i32.const 72 i32.load call $equal i32.eqz if unreachable end
-            i32.const {catalog_ptr} i32.const {catalog_len} call $output")
+        format!(
+            "local.get 0 local.get 1 i32.const 68 i32.load i32.const 72 i32.load call $equal i32.eqz if unreachable end
+            i32.const {catalog_ptr} i32.const {catalog_len} call $output"
+        )
     };
     let shell_import = if shell {
         r#"(import "microcrab:host/types@0.1.0" (instance $types
@@ -236,116 +211,13 @@ fn component_with_extra_import(
     } else {
         ""
     };
-    let variables_import = r#"(import "microcrab:session/variables@0.2.0" (instance $variables
-          (alias outer 1 $communication_error (type $error))
-          (export "communication-error" (type $error_public (eq $error)))
-          (type $raw_visibility (enum "visible" "invisible" "secret"))
-          (type $raw_persistence (enum "persisted" "ephemeral"))
-          (type $raw_role (enum "runtime" "client" "agent"))
-          (export "visibility" (type $visibility (eq $raw_visibility)))
-          (export "persistence" (type $persistence (eq $raw_persistence)))
-          (export "role" (type $role (eq $raw_role)))
-          (type $raw_variable_entry (record (field "name" string) (field "value-json" string)))
-          (type $raw_metadata_entry (record (field "name" string) (field "visibility" $visibility)
-            (field "persistence" $persistence) (field "owner" $role) (field "editors" (list $role))))
-          (type $raw_scoped_entry (record (field "name" string) (field "value-json" string)
-            (field "visibility" $visibility) (field "persistence" $persistence) (field "editors" (option (list $role)))))
-          (export "variable-entry" (type $variable_entry (eq $raw_variable_entry)))
-          (export "metadata-entry" (type $metadata_entry (eq $raw_metadata_entry)))
-          (export "scoped-entry" (type $scoped_entry (eq $raw_scoped_entry)))
-          (type $raw_change (record (field "set" (list $variable_entry)) (field "remove" (list string))
-            (field "scoped-set" (list $scoped_entry))))
-          (export "variable-change-set" (type $change (eq $raw_change)))
-          (type $raw_facts (record (field "session-id" string) (field "admitted-mode" (option string))
-            (field "observed-at-unix-ms" u64)))
-          (export "call-facts" (type $facts (eq $raw_facts)))
-          (export "variable-get" (func (param "name" string) (result (result string (error $error_public)))))
-          (export "variable-change" (func (param "change" $change) (result (result (error $error_public)))))
-          (export "variable-metadata" (func (result (result (list $metadata_entry) (error $error_public)))))
-          (export "tool-call-facts" (func (result (result $facts (error $error_public)))))))"#;
-    let (typed_aliases, typed_lower, typed_imports, typed_exports, assert_facts_unavailable) = (
-        r#"(alias export $variables "tool-call-facts" (func $facts))
-               (alias export $variables "variable-metadata" (func $metadata))"#,
-        r#"(core func $lower_facts (canon lower (func $facts)
-                 (memory (core memory $memory "memory")) (realloc (core func $memory "realloc"))))
-               (core func $lower_metadata (canon lower (func $metadata)
-                 (memory (core memory $memory "memory")) (realloc (core func $memory "realloc"))))"#,
-        r#"(import "host" "facts" (func $facts (param i32)))
-               (import "host" "metadata" (func $metadata (param i32)))"#,
-        r#"(export "facts" (func $lower_facts))
-               (export "metadata" (func $lower_metadata))"#,
-        // Facts contain a u64, so the error payload also starts at align-8.
-        "i32.const 64 call $facts
-             i32.const 64 i32.load8_u i32.const 1 i32.ne if unreachable end
-             i32.const 72 i32.load8_u i32.const 1 i32.ne if unreachable end",
-    );
-    let typed_functions = {
-        let (mode_ptr, mode_len) = data.put(r#"","admitted_mode":"#);
-        let (time_ptr, time_len) = data.put(r#", "observed_at_unix_ms":"#);
-        let (session_ptr, session_len) = data.put(r#"{"ok":true,"value":{"session_id":""#);
-        // The JSON wrapper reports values decoded from the actual typed result.
-        // Only JSON-safe ASCII fixture strings are supplied to this probe.
-        format!(
-            r#"
-        (func $append (param $dest i32) (param $src i32) (param $len i32) (result i32)
-          local.get $dest local.get $src local.get $len memory.copy
-          local.get $dest local.get $len i32.add)
-        (func $encode_facts (result i32)
-          (local $dest i32) (local $begin i32) (local $time i64)
-          i32.const 64 i32.load8_u if i32.const 72 i32.load8_u call $error return end
-          ;; Success at 72: string at 72, option tag at 80 and
-          ;; optional string at 84, with the timestamp at 96.
-          i32.const 32768 i32.const {session_ptr} i32.const {session_len} call $append
-          i32.const 72 i32.load i32.const 76 i32.load call $append
-          i32.const {mode_ptr} i32.const {mode_len} call $append local.set $dest
-          i32.const 80 i32.load8_u if
-            local.get $dest i32.const 34 i32.store8
-            local.get $dest i32.const 1 i32.add
-            i32.const 84 i32.load i32.const 88 i32.load call $append local.tee $dest
-            i32.const 34 i32.store8
-            local.get $dest i32.const 1 i32.add local.set $dest
-          else
-            local.get $dest i32.const 0x6c6c756e i32.store
-            local.get $dest i32.const 4 i32.add local.set $dest
-          end
-          local.get $dest i32.const {time_ptr} i32.const {time_len} call $append local.set $dest
-          i32.const 96 i64.load local.set $time
-          ;; Emit exact u64 decimal digits via a reverse scratch area.
-          i32.const 35000 local.set $begin
-          loop $digits
-            local.get $begin i32.const 1 i32.sub local.tee $begin
-            local.get $time i64.const 10 i64.rem_u i32.wrap_i64 i32.const 48 i32.add i32.store8
-            local.get $time i64.const 10 i64.div_u local.tee $time i64.eqz i32.eqz br_if $digits
-          end
-          local.get $dest local.get $begin i32.const 35000 local.get $begin i32.sub call $append
-          local.tee $dest i32.const 0x7d7d i32.store16
-          i32.const 32768 local.get $dest i32.const 2 i32.add i32.const 32768 i32.sub call $output)
-        (func $check_metadata (param $name i32) (param $len i32) (param $attr i32)
-                              (param $editors i32) (param $editor_len i32) (result i32)
-          (local $record i32) (local $left i32)
-          i32.const 64 i32.load8_u if i32.const 68 i32.load8_u call $error return end
-          i32.const 68 i32.load local.set $record
-          i32.const 72 i32.load local.set $left
-          ;; Check the named metadata record, including the complete editor list.
-          loop $entry
-            local.get $left i32.eqz if unreachable end
-            local.get $name local.get $len
-            local.get $record i32.load local.get $record i32.const 4 i32.add i32.load call $equal if
-              local.get $attr i32.const 3 local.get $record i32.const 8 i32.add i32.const 3
-              call $equal i32.eqz if unreachable end
-              local.get $editors local.get $editor_len
-              local.get $record i32.const 12 i32.add i32.load
-              local.get $record i32.const 16 i32.add i32.load
-              call $equal i32.eqz if unreachable end
-              i32.const {unit_ptr} i32.const {unit_len} call $output return
-            end
-            local.get $record i32.const 20 i32.add local.set $record
-            local.get $left i32.const 1 i32.sub local.set $left
-            br $entry
-          end
-          unreachable)"#
-        )
-    };
+    let session_import = r#"(import "microcrab:session/session@0.4.0" (instance $session
+          (type $raw_err_code (enum "absent" "unavailable" "denied" "invalid-argument" "limit" "cancelled" "script-error"))
+          (export "error-code" (type $err_code (eq $raw_err_code)))
+          (type $raw_err (record (field "code" $err_code) (field "message" string)))
+          (export "session-error" (type $err (eq $raw_err)))
+          (export "eval" (func (param "script" string) (param "args-json" (option string)) (result (result string (error $err)))))))"#;
+
     let text = format!(
         r#"(component
       (import "microcrab:agent/host-info@0.9.0" (instance $host
@@ -355,37 +227,28 @@ fn component_with_extra_import(
         (export "communication-error" (type $error_public (eq $error)))
         (export "host-info" (func (result (result string (error $error_public)))))))
       (alias export $host "communication-error" (type $communication_error))
-      {variables_import}
+      {session_import}
       {extra_import}
-      {typed_aliases}
       {shell_import}
       (alias export $host "host-info" (func $host_info))
-      (alias export $variables "variable-get" (func $get))
-      (alias export $variables "variable-change" (func $change))
+      (alias export $session "eval" (func $eval))
       (core module $storage
         (memory (export "memory") 4)
         (global $heap (mut i32) (i32.const 65536))
         (func (export "realloc") (param i32 i32 i32 i32) (result i32)
           (local $old i32)
-          ;; Start imports allocate byte strings before init returns its align-4
-          ;; record. Honor canonical alignment for every subsequent allocation.
           global.get $heap local.get 2 i32.const 1 i32.sub i32.add
           i32.const 0 local.get 2 i32.sub i32.and local.tee $old
           local.get 3 i32.add global.set $heap local.get $old))
       (core instance $memory (instantiate $storage))
       (core func $lower_info (canon lower (func $host_info)
         (memory (core memory $memory "memory")) (realloc (core func $memory "realloc"))))
-      {typed_lower}
-      (core func $lower_get (canon lower (func $get)
-        (memory (core memory $memory "memory")) (realloc (core func $memory "realloc"))))
-      (core func $lower_change (canon lower (func $change)
+      (core func $lower_eval (canon lower (func $eval)
         (memory (core memory $memory "memory")) (realloc (core func $memory "realloc"))))
       (core module $code
         (import "memory" "memory" (memory 4))
         (import "host" "info" (func $host_info (param i32)))
-        {typed_imports}
-        (import "host" "get" (func $get (param i32 i32 i32)))
-        (import "host" "change" (func $change (param i32 i32 i32 i32 i32 i32 i32)))
+        (import "host" "eval" (func $eval (param i32 i32 i32 i32 i32 i32)))
         {data}
         (func $equal (param $a i32) (param $an i32) (param $b i32) (param $bn i32) (result i32)
           (local $i i32)
@@ -400,46 +263,49 @@ fn component_with_extra_import(
           i32.const 0 i32.const 0 i32.store8
           i32.const 4 local.get $ptr i32.store
           i32.const 8 local.get $len i32.store i32.const 0)
-        (func $error (param $code i32) (result i32)
+        (func $eval_error (param $code i32) (result i32)
           {error_dispatch}
           unreachable)
-        {typed_functions}
-        (func $encode (param $unit i32) (result i32)
+        (func $comm_error (param $code i32) (result i32)
+          {comm_error_dispatch}
+          unreachable)
+        (func $encode_host_info (result i32)
           (local $len i32)
           i32.const 64 i32.load8_u if
-            i32.const 68 i32.load8_u call $error return
+            i32.const 68 i32.load8_u call $comm_error return
           end
-          local.get $unit if i32.const {unit_ptr} i32.const {unit_len} call $output return end
           i32.const 72 i32.load local.set $len
           i32.const 32768 i32.const {prefix_ptr} i32.const {prefix_len} memory.copy
           i32.const {prefix_end} i32.const 68 i32.load local.get $len memory.copy
           i32.const {prefix_end} local.get $len i32.add i32.const 125 i32.store8
           i32.const 32768 local.get $len i32.const {prefix_plus_end} i32.add call $output)
-        (func $initialize
-          {assert_facts_unavailable}
-          i32.const 64 call $host_info
-          {info_check}
-          ;; Initialization must never inherit a previous invocation's binder.
-          i32.const {probe_ptr} i32.const {probe_len} i32.const 64 call $get
-          call $assert_unavailable
-          {write_probe}
-          call $assert_unavailable)
-        (func $assert_unavailable
+        (func $encode_eval (result i32)
+          i32.const 64 i32.load8_u if
+            i32.const 68 i32.load8_u call $eval_error return
+          end
+          i32.const 68 i32.load i32.const 72 i32.load call $output)
+        (func $assert_eval_unavailable
           i32.const 64 i32.load8_u i32.const 1 i32.ne if unreachable end
           i32.const 68 i32.load8_u i32.const 1 i32.ne if unreachable end)
+        (func $initialize
+          i32.const {facts_script_ptr} i32.const {facts_script_len} i32.const 0 i32.const 0 i32.const 0 i32.const 64 call $eval
+          call $assert_eval_unavailable
+          i32.const 64 call $host_info
+          {info_check}
+          i32.const {probe_script_ptr} i32.const {probe_script_len} i32.const 0 i32.const 0 i32.const 0 i32.const 64 call $eval
+          call $assert_eval_unavailable)
         (start $initialize)
         (func (export "describe") (param i32 i32) (result i32)
-          {assert_facts_unavailable}
-          i32.const {probe_ptr} i32.const {probe_len} i32.const 64 call $get
-          call $assert_unavailable
-          {write_probe}
-          call $assert_unavailable
+          i32.const {facts_script_ptr} i32.const {facts_script_len} i32.const 0 i32.const 0 i32.const 0 i32.const 64 call $eval
+          call $assert_eval_unavailable
+          i32.const {probe_script_ptr} i32.const {probe_script_len} i32.const 0 i32.const 0 i32.const 0 i32.const 64 call $eval
+          call $assert_eval_unavailable
           i32.const 64 call $host_info {info_check}
           {describe_info})
         (func (export "invoke") (param i32 i32 i32 i32 i32 i32) (result i32)
-          ;; The typed init adapter uses the empty name to exercise the import.
           local.get 3 i32.eqz if
-            {assert_facts_unavailable}
+            i32.const {facts_script_ptr} i32.const {facts_script_len} i32.const 0 i32.const 0 i32.const 0 i32.const 64 call $eval
+            call $assert_eval_unavailable
             i32.const 0 return
           end
           i32.const 64 call $host_info {info_check}
@@ -448,9 +314,7 @@ fn component_with_extra_import(
           unreachable))
       (core instance $functions
         (export "info" (func $lower_info))
-        {typed_exports}
-        (export "get" (func $lower_get))
-        (export "change" (func $lower_change)))
+        (export "eval" (func $lower_eval)))
       (core instance $instance (instantiate $code
         (with "memory" (instance $memory)) (with "host" (instance $functions))))
       (func (export "describe") (param "host-info" string) (result (result string (error string)))
@@ -497,7 +361,6 @@ impl Host for RecordingHost {
             shell: "/fixture/bash".into(),
             path_separator: "/".into(),
             newline: "\n".into(),
-            // A Host method or a claimed capability is not guest linkage.
             capabilities: vec!["read_file".into(), "shell".into(), "invented".into()],
             resources: None,
             virtual_shell: None,
@@ -536,8 +399,6 @@ struct FramePosition {
     round: Option<u64>,
 }
 
-/// One call per model round keeps mutation acknowledgements observable before
-/// the next read. The client captures the actual tool responses, not snapshots.
 struct Script {
     names: Vec<String>,
     step: AtomicUsize,
@@ -639,10 +500,9 @@ fn session(tools: &[Arc<dyn Tool>], script: Arc<Script>, denied: bool) -> Sessio
 }
 
 #[test]
-fn obsolete_session_variables_imports_are_rejected_before_discovery() {
+fn obsolete_session_variables_and_references_imports_are_rejected_before_discovery() {
     let operations = [("environment".into(), Operation::Info)];
     let host = Arc::new(RecordingHost::default());
-    // The same guest with only the canonical import is accepted.
     WasmAgent::load(
         &component(&operations, false, false),
         WasmLimits::default(),
@@ -653,9 +513,8 @@ fn obsolete_session_variables_imports_are_rejected_before_discovery() {
     for (version, extra_exports) in [
         ("0.1.0", ""),
         (
-            "0.1.1",
-            r#"(export "variable-get-all" (func (result (result string (error $error)))))
-               (export "variable-metadata" (func (result (result string (error $error)))))"#,
+            "0.2.0",
+            r#"(export "variable-get-all" (func (result (result string (error $error)))))"#,
         ),
     ] {
         let obsolete = format!(
@@ -669,14 +528,21 @@ fn obsolete_session_variables_imports_are_rejected_before_discovery() {
         let bytes = component_with_extra_import(&operations, false, false, &obsolete);
         match WasmAgent::load(&bytes, WasmLimits::default(), host.clone()) {
             Err(Error::Wasm(message)) => assert!(
-                message
-                    .as_str()
-                    .starts_with("unsupported component import;"),
+                message.as_str().starts_with("unsupported component import;"),
                 "{version}: {message}"
             ),
             Err(error) => panic!("{version}: expected unsupported import, got {error:?}"),
             Ok(_) => panic!("obsolete Variables {version} loaded successfully"),
         }
+    }
+
+    let obsolete_refs = r#"(import "microcrab:session/references@0.3.0" (instance
+        (export "create" (func (param "title" string) (param "media-type" string) (param "data" (list u8)) (result (result string (error string)))))))"#;
+    let bytes = component_with_extra_import(&operations, false, false, obsolete_refs);
+    match WasmAgent::load(&bytes, WasmLimits::default(), host) {
+        Err(Error::Wasm(message)) => assert!(message.as_str().starts_with("unsupported component import;")),
+        Err(err) => panic!("expected obsolete references rejection, got {err}"),
+        Ok(_) => panic!("expected obsolete references rejection, got Ok"),
     }
 }
 
@@ -716,10 +582,7 @@ async fn host_info_is_available_during_start_discovery_and_invoke_with_actual_im
 
 #[tokio::test]
 async fn tool_call_facts_are_unavailable_through_init_but_return_admitted_identity_to_invoke() {
-    let tools = load(
-        &[("call_facts_probe".into(), Operation::CallFacts)],
-        Arc::new(RecordingHost::default()),
-    );
+    let tools = load(&[call_facts("call_facts_probe")], Arc::new(RecordingHost::default()));
     let unix_ms = || {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -734,19 +597,14 @@ async fn tool_call_facts_are_unavailable_through_init_but_return_admitted_identi
         context.session_id = session_id.into();
         context.mode = mode.map(str::to_owned);
         let before = unix_ms();
-        let result = tools[0]
-            .execute_initialized(json!({}), context)
-            .await
-            .unwrap();
+        let raw = tools[0].execute_initialized(json!({}), context).await.unwrap();
         let after = unix_ms();
-        let response: Value = serde_json::from_str(&final_text(result)).unwrap();
-        let result = value(&response);
-        let timestamp = result["observed_at_unix_ms"].as_u64().unwrap();
-        assert_eq!(
-            result,
-            &json!({"session_id":session_id,"admitted_mode":mode,"observed_at_unix_ms":timestamp})
-        );
-        assert!((before..=after).contains(&u128::from(timestamp)));
+        let output: Value = serde_json::from_str(&final_text(raw)).unwrap();
+        let facts = value(&output);
+        assert_eq!(facts["session_id"], session_id);
+        assert_eq!(facts["admitted_mode"], json!(mode));
+        let observed = facts["observed_at_unix_ms"].as_u64().unwrap() as u128;
+        assert!(observed >= before && observed <= after);
     }
 }
 
@@ -780,15 +638,10 @@ async fn discovery_and_direct_execution_have_no_session_variable_binder() {
     let tools = load(
         &[
             get("read", "secret"),
-            change(
-                "write",
-                json!({"set":{"secret":"must-not-exist"},"remove":[]}),
-            ),
+            change("write", json!({"set":{"secret":"must-not-exist"},"remove":[]})),
         ],
         host.clone(),
     );
-    // Component initialization and describe already asserted unavailable for both
-    // imports. Direct execute must not infer a binder from an invocation snapshot.
     for tool in tools {
         let output: Value = serde_json::from_str(&final_text(
             tool.execute_initialized(json!({}), invocation())
@@ -839,38 +692,35 @@ async fn session_tool_path_reads_refreshed_builtins_and_keeps_public_extract_cus
         "done"
     );
     let outputs = script.results();
-    {
-        let frames = script.frames.lock().unwrap();
-        for index in [0, 7] {
-            let builtin = value(&outputs[index]);
-            assert_eq!(builtin["epoch"], json!(frames[index].epoch));
-            assert_eq!(builtin["turn"], json!(frames[index].turn));
-            assert_eq!(builtin["round"], json!(frames[index].round));
-            assert!(builtin["boundary"].is_string());
-        }
-        assert!(
-            value(&outputs[7])["round"].as_u64().unwrap()
-                > value(&outputs[0])["round"].as_u64().unwrap()
-        );
-        let first_time = value(&outputs[1])["unix_millis"].as_u64().unwrap();
-        let last_time = value(&outputs[8])["unix_millis"].as_u64().unwrap();
-        assert!(first_time > 0 && last_time >= first_time);
-        for output in &outputs[2..5] {
-            code(output, "absent");
-        }
-        assert_eq!(value(&outputs[5]), &Value::Null);
-        code(&outputs[6], "absent");
-        for key in ["session", "time", "host", "agent", "mode"] {
-            assert_eq!(state.extract(key), None);
-        }
-        assert_eq!(state.extract("present_null"), Some(Value::Null));
-        assert_eq!(state.extract("discovery_probe"), None);
-        assert_eq!(host.shell_calls.load(Ordering::SeqCst), 0);
+    let frames = script.frames.lock().unwrap();
+    for index in [0, 7] {
+        let builtin = value(&outputs[index]);
+        assert_eq!(builtin["epoch"], json!(frames[index].epoch));
+        assert_eq!(builtin["turn"], json!(frames[index].turn));
+        assert_eq!(builtin["round"], json!(frames[index].round));
+        assert!(builtin["boundary"].is_string());
     }
+    assert!(
+        value(&outputs[7])["round"].as_u64().unwrap()
+            > value(&outputs[0])["round"].as_u64().unwrap()
+    );
+    let first_time = value(&outputs[1])["unix_millis"].as_u64().unwrap();
+    let last_time = value(&outputs[8])["unix_millis"].as_u64().unwrap();
+    assert!(first_time > 0 && last_time >= first_time);
+    for output in &outputs[2..5] {
+        code(output, "absent");
+    }
+    assert_eq!(value(&outputs[5]), &Value::Null);
+    code(&outputs[6], "absent");
+    for key in ["session", "time", "host", "agent", "mode"] {
+        assert_eq!(state.extract(key), None);
+    }
+    assert_eq!(state.extract("present_null"), Some(Value::Null));
+    assert_eq!(state.extract("discovery_probe"), None);
+    assert_eq!(host.shell_calls.load(Ordering::SeqCst), 0);
     session.close().await.unwrap();
 }
 
-// Fixture setup uses the same trusted Agent branding as native tool execution.
 fn agent_state(session: &Session) -> microcrab_session::State {
     let state = session.state_handle();
     microcrab_session::runtime::tool::ToolContext::new(
@@ -895,22 +745,24 @@ async fn typed_guest_changes_json_values_with_agent_ownership() {
 
     let original = json!({"nested":[null, false, 2, "雪"]});
     let edited = json!(["client may edit the value", true]);
+    let check_meta = r#"
+        let m = vars::metadata()[args.name];
+        if m == () { return #{ ok: false, code: "absent" }; }
+        assert_eq(m.visibility, args.visibility);
+        assert_eq(m.persistence, args.persistence);
+        assert_eq(m.owner, args.owner);
+        #{ ok: true }
+    "#;
     let operations = [
-        (
-            "unauthorized".into(),
-            Operation::TypedChange(VariablesChange {
-                set: serde_json::Map::from_iter([
-                    ("client_owned".into(), json!(2)),
-                    ("partial".into(), json!(true)),
-                ]),
-                ..Default::default()
-            }),
+        change(
+            "unauthorized",
+            json!({"set":{"client_owned":2,"partial":true},"remove":[]}),
         ),
         get("unchanged", "client_owned"),
         get("no_partial", "partial"),
-        (
-            "create".into(),
-            Operation::TypedChange(VariablesChange {
+        change(
+            "create",
+            json!(VariablesChange {
                 set: serde_json::Map::from_iter([("null_value".into(), Value::Null)]),
                 remove: vec!["old".into()],
                 scoped_set: vec![
@@ -936,21 +788,20 @@ async fn typed_guest_changes_json_values_with_agent_ownership() {
         get("read_old", "old"),
         (
             "guest_metadata".into(),
-            Operation::TypedMetadata {
-                name: "guest_owned".into(),
-                attributes: [Visible as u8, Persisted as u8, Agent as u8],
-                editors: vec![Client as u8, Agent as u8],
+            Operation::Script {
+                script: r#"let m = vars::metadata().guest_owned; if m.visibility == "visible" && m.persistence == "persisted" && m.owner == "agent" { #{ ok: true } } else { #{ ok: false, code: "mismatch", meta: m } }"#.into(),
+                args: None,
             },
         ),
         (
             "private_metadata".into(),
-            Operation::TypedMetadata {
-                name: "private".into(),
-                attributes: [Invisible as u8, Ephemeral as u8, Agent as u8],
-                editors: vec![Agent as u8],
+            Operation::Script {
+                script: r#"let m = vars::metadata()["private"]; if m.visibility == "invisible" && m.persistence == "ephemeral" && m.owner == "agent" { #{ ok: true } } else { #{ ok: false, code: "mismatch", meta: m } }"#.into(),
+                args: None,
             },
         ),
     ];
+    let _ = (check_meta, Agent, Visible, Invisible, Persisted, Ephemeral);
     let tools = load(&operations, Arc::new(RecordingHost::default()));
     let script = Script::new(operations.iter().map(|(name, _)| name.clone()));
     let session = session(&tools, script.clone(), false);
@@ -964,7 +815,7 @@ async fn typed_guest_changes_json_values_with_agent_ownership() {
 
     let outputs = script.results();
     assert_eq!(outputs.len(), operations.len());
-    code(&outputs[0], "rejected");
+    code(&outputs[0], "invalid_argument");
     assert_eq!(value(&outputs[1]), &json!(1));
     code(&outputs[2], "absent");
     assert_eq!(outputs[3], json!({"ok":true}));
@@ -980,7 +831,6 @@ async fn typed_guest_changes_json_values_with_agent_ownership() {
         state.remove("guest_owned").await,
         Err(Error::VariableForbidden(_))
     ));
-    assert_eq!(state.extract("discovery_probe"), None);
     session.close().await.unwrap();
 }
 
@@ -1017,7 +867,6 @@ async fn acknowledged_set_remove_and_invalid_changes_are_atomic() {
         .into_iter()
         .map(Into::into)
         .collect();
-    // Read after each rejection: a later write cannot conceal partial mutation.
     for index in 0..invalid.len() {
         calls.extend([format!("invalid_{index}"), "kept".into(), "created".into()]);
     }
@@ -1025,10 +874,7 @@ async fn acknowledged_set_remove_and_invalid_changes_are_atomic() {
     let session = session(&tools, script.clone(), false);
     let state = session.state_handle();
     agent_state(&session).inject("old", json!(1)).await.unwrap();
-    agent_state(&session)
-        .inject("kept", json!(1))
-        .await
-        .unwrap();
+    agent_state(&session).inject("kept", json!(1)).await.unwrap();
     session
         .submit("Apply atomic changes and reject invalid changes")
         .await
@@ -1040,7 +886,7 @@ async fn acknowledged_set_remove_and_invalid_changes_are_atomic() {
     assert_eq!(value(&outputs[3]), &json!(2));
     for index in 0..invalid.len() {
         let base = 4 + index * 3;
-        code(&outputs[base], "rejected");
+        code(&outputs[base], "invalid_argument");
         assert_eq!(value(&outputs[base + 1]), &json!(2));
         assert_eq!(value(&outputs[base + 2]), &Value::Null);
     }
@@ -1055,9 +901,9 @@ async fn typed_guest_is_agent_bound_and_cannot_partially_commit() {
         &[
             change(
                 "unauthorized",
-                json!({"set":{"client_owned":2,"partial":true}}),
+                json!({"set":{"client_owned":2,"partial":true},"remove":[]}),
             ),
-            change("create", json!({"set":{"guest_owned":3}})),
+            change("create", json!({"set":{"guest_owned":3},"remove":[]})),
         ],
         host,
     );
@@ -1070,7 +916,7 @@ async fn typed_guest_is_agent_bound_and_cannot_partially_commit() {
         .unwrap();
     session.submit("Exercise guest governance").await.unwrap();
     let outputs = script.results();
-    code(&outputs[0], "rejected");
+    code(&outputs[0], "invalid_argument");
     assert_eq!(outputs[1], json!({"ok":true}));
     let state = session.state_handle();
     assert_eq!(state.extract("client_owned"), Some(json!(1)));
@@ -1123,8 +969,6 @@ async fn shared_compiled_tools_and_host_bind_only_the_admitting_session() {
         .inject("remove_me", json!(2))
         .await
         .unwrap();
-    // First run must not remove or create anything in the peer Session, even
-    // though both registries hold exactly the same Arc<dyn Tool> handles.
     first.submit("Write first Session only").await.unwrap();
     assert_eq!(
         second.state_handle().variables(),

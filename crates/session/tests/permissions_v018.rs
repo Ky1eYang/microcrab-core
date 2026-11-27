@@ -8,8 +8,8 @@ use microcrab_session::runtime::execution::ToolOutput;
 use microcrab_session::runtime::tool::{DenyAll, Tool, ToolContext};
 use microcrab_session::runtime::{BuiltinTool, Runtime, ToolRegistration, builtin_tools};
 use microcrab_session::{
-    Auditor, Client, DelegateExecutor, DynReference, Error, Reference, ReferenceContent,
-    ReferenceInfo, Session, VariableView,
+    Auditor, Client, DelegateExecutor, DynReference, Error, Reference, ReferenceContent, Session,
+    VariableView,
 };
 use serde_json::{Value, json};
 use std::collections::VecDeque;
@@ -135,22 +135,32 @@ impl DelegateExecutor for Executor {
     }
 }
 struct Catalog;
+#[async_trait]
 impl Reference for Catalog {
-    type Error = std::io::Error;
     fn kind(&self) -> &str {
         "skills"
     }
-    async fn load(&self) -> Result<(), Self::Error> {
+    fn capabilities(&self) -> microcrab_session::ReferenceCapabilities {
+        microcrab_session::ReferenceCapabilities::read_only()
+    }
+    async fn load(&self, _cancel: CancellationToken) -> Result<(), microcrab_session::ReferenceError> {
         Ok(())
     }
-    fn list(&self) -> Result<Vec<ReferenceInfo>, Self::Error> {
+    fn list(&self) -> Result<Vec<microcrab_session::ReferenceEntry>, microcrab_session::ReferenceError> {
         Ok(vec![])
     }
-    fn read(&self, id: &str) -> Result<Option<ReferenceContent>, Self::Error> {
-        Ok((id == "sample").then(|| ReferenceContent::text(id, "actual reference body")))
+    fn projections(&self) -> Result<microcrab_session::ReferenceProjection, microcrab_session::ReferenceError> {
+        Ok(microcrab_session::ReferenceProjection {
+            exact: Some(json!([{"id":"sample"}])),
+            short_model: None,
+        })
     }
-    fn change(&self) -> Result<Option<Value>, Self::Error> {
-        Ok(Some(json!([{"id":"sample"}])))
+    async fn expand(
+        &self,
+        id: &str,
+        _cancel: CancellationToken,
+    ) -> Result<Option<ReferenceContent>, microcrab_session::ReferenceError> {
+        Ok((id == "sample").then(|| ReferenceContent::text(id, "actual reference body")))
     }
 }
 #[tokio::test]
@@ -189,7 +199,15 @@ async fn native_builtins_override_guest_defaults_but_user_rules_win_and_expand_r
     assert_eq!(
         evaluate_compiled(
             &reference_policy,
-            &json!({"action":"add","source":{"type":"https","url":"https://example.com"}})
+            &json!({"action":"add","content":"inline text"})
+        )
+        .unwrap(),
+        Action::Allow
+    );
+    assert_eq!(
+        evaluate_compiled(
+            &reference_policy,
+            &json!({"action":"add","locator":"https://example.com"})
         )
         .unwrap(),
         Action::Ask

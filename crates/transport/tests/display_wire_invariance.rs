@@ -146,6 +146,7 @@ async fn two_rounds(
         api_key: None,
         timeout_ms: 10_000,
         max_response_bytes: 4 * 1024 * 1024,
+        headers: Default::default(),
     })
     .unwrap();
     if let Some(recording) = recording {
@@ -308,6 +309,7 @@ async fn rejected_json_response_never_publishes_its_reasoning_as_display_evidenc
             api_key: None,
             timeout_ms: 10_000,
             max_response_bytes: 4 * 1024 * 1024,
+            headers: Default::default(),
         })
         .unwrap()
         .with_recording(recorder.clone());

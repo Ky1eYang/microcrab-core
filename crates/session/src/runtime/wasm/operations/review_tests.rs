@@ -93,6 +93,7 @@ fn store(
             operation_scope: Some(("write".into(), arguments)),
             web: None,
             references: None,
+            script_profile: crate::runtime::wasm::script::ScriptProfile::Standard,
             guest_observation: None,
             confinement_diagnostic: None,
             operation_cancelled: false,
